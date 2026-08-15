@@ -420,8 +420,8 @@ depending on what's being evaluated. Direct links:
 
 Licensed under either of
 
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT license](LICENSE-MIT)
+- [Apache License, Version 2.0](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE-APACHE)
+- [MIT license](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE-MIT)
 
 at your option.
 

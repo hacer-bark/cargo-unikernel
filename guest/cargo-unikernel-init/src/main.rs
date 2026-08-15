@@ -302,7 +302,8 @@ fn install_seccomp_baseline() -> std::io::Result<()> {
 
 /// Checks the embedded app binary is present and makes it read-only + executable.
 ///
-/// Split out of [`spawn_app`] so it runs *before* [`lockdown_filesystem`] seals `PAYLOAD_DIR`
+/// Split out of [`spawn_app`] so it runs *before* [`cargo_unikernel_common::mounts::lockdown_filesystem`]
+/// seals `PAYLOAD_DIR`
 /// read-only — this `chmod` would fail against an already-locked-down mount.
 fn prepare_app_binary() {
     if !std::path::Path::new(APP_PATH).exists() {
