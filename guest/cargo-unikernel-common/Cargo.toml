@@ -1,0 +1,45 @@
+[package]
+name = "cargo-unikernel-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared guest-side PID-1 primitives for cargo-unikernel-init."
+readme = "README.md"
+repository = "https://codeberg.org/hacer-bark/cargo-unikernel"
+keywords = ["unikernel", "sev-snp", "guest", "pid1"]
+categories = ["os", "no-std"]
+
+[dependencies]
+libc = "0.2"
+
+[features]
+default = []
+net-ipv4 = []
+net-ipv6 = []
+hardening-net-spoofing = []
+hardening-icmp = []
+hardening-tcp = []
+hardening-info-leak = []
+hardening-ptrace-bpf = []
+hardening-kexec-fs = []
+danger-allow-write-execute = []
+storage-persistent = []
+
+[lints.rust]
+warnings = "deny"
+future_incompatible = "deny"
+unused = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
+cargo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

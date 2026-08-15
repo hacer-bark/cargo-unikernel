@@ -1,0 +1,133 @@
+# cargo-unikernel config — "casual" profile
+#
+# Not required: `cargo-unikernel build` with no config auto-detects a Rust project and builds
+# this same shape by default. Scaffold this only to change a default. Every field is
+# documented with its type/allowed values and default.
+
+[project]
+# Used for output filenames (dist/<name>.iso etc.). Required.
+name = "my-server"
+
+[profile]
+# "casual"  — no confidential computing; a lean, hardened image. Zero-config default.
+# "sev-snp" — full AMD SEV-SNP stack. See examples/cargo-unikernel.sev-snp.toml.
+kind = "casual"
+
+[app]
+# "source" — compile from source inside the pinned, reproducible build container (below).
+# "binary" — skip compiling; embed an already-built binary via [app.binary] instead.
+mode = "source"
+
+[app.source]
+# Required. Build THIS project directly. "." = the directory this config file lives in.
+path = "."
+
+# "rust" — cargo build, cross-compiled to musl, zero extra config.
+# "generic" — any other language: supply `build_command` + `output_binary` below instead.
+toolchain = "rust"
+# Subdirectory containing the buildable project, relative to `path`. "." = root.
+package_path = "."
+# "rust" only. Cargo profile: "release" (default) or "dev" (faster, not for deployment).
+cargo_profile = "release"
+# "rust" only. Extra `cargo build --features ...` flags. Empty by default.
+features = []
+
+# toolchain = "generic": shell command in the container that must leave a statically-linked
+# binary at `output_binary`. Worked example — a Go server:
+# build_command = "CGO_ENABLED=0 GOOS=linux go build -o app ."
+# output_binary = "app"
+# extra_apt_packages = []                 # apt-get install for a toolchain not already in the build image
+
+# [app.binary]   # only used when [app].mode = "binary" instead of "source"
+# path = "./target/release/my-server"
+
+[app.runtime]
+# Environment variables passed to the app's process at boot. Empty by default.
+env = { PORT = "8000" }
+# uid/gid the app runs as inside the guest (never root). Defaults to 65534:65534.
+uid = 65534
+gid = 65534
+
+# [app.runtime.danger]
+# Mounts /tmp and /var writable+executable. Off by default; only enable if the app needs it.
+# allow_write_execute = true
+
+# [app.runtime.limits]
+# setrlimit ceilings applied before exec. Shown with defaults.
+# max_open_files = 65536   # RLIMIT_NOFILE
+# max_processes = 2048     # RLIMIT_NPROC
+# max_memory_mb = 0        # RLIMIT_AS in MiB; 0 = no cap
+
+[network]
+# "ipv4", "ipv6", "dual", or "none" — compile-time choice; unselected protocols aren't built in.
+mode = "ipv4"
+
+[storage]
+# "ram" (default): /var is wiped every reboot. "persistent": /var lives on a virtio-blk disk;
+# an untrusted/foreign device is wiped and reformatted rather than trusted.
+mode = "ram"
+# size_mib = 4096  # persistent disk image size; only used when mode = "persistent"
+
+[kernel]
+# Linux kernel version to build. Tarball and compiled bzImage are cached by version+config.
+version = "6.18.33"
+# Optional: pin the expected sha256 of the kernel.org tarball. Build fails on mismatch.
+# sha256 = "…"
+
+# [toolchain]
+# Overrides the reproducible-build toolchain this CLI otherwise pins. All optional; see
+# docs/reproducible_builds.md — overriding one means reproducible given that pin, not this
+# CLI version's defaults.
+# apt_snapshot = "20260701T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
+# rust_version = "1.97.0"             # rustup --default-toolchain version
+# limine_version = "12.4.1"           # ISO bootloader release tag
+# limine_sha256 = "…"                 # recommended if limine_version is set
+# e2fsprogs_version = "1.47.4"        # mke2fs release (storage.mode = "persistent" only)
+# e2fsprogs_sha256 = "…"              # recommended if e2fsprogs_version is set
+
+[hardening]
+# Reserved for future presets; every category below defaults to enabled regardless of this.
+level = "default"
+
+[hardening.kernel]
+# Build-time (Kconfig) hardening categories, each true by default — list only what to flip
+# to false. See assets/kernel/kconfig/categories/*.config for the exact CONFIG_* flags.
+disable_legacy_subsystems = true     # strips sound/USB/DRM/wireless/legacy net protocols/most fs drivers
+disable_debug_interfaces = true      # strips debugfs/SysRq/kprobes/ftrace/kernel debug-info
+kernel_self_protection = true        # KSPP baseline: ASLR, hardened allocator, Lockdown LSM, etc.
+exploit_mitigations = true           # SMEP/SMAP/UMIP, PTI, retpoline
+seccomp = true                       # enables seccomp-BPF (app still installs its own filter)
+# fips = true                        # CONFIG_CRYPTO_FIPS capability — off by default, opt in for compliance
+
+[hardening.runtime]
+# Runtime (sysctl) hardening categories, same default-true semantics. See
+# guest/cargo-unikernel-common/src/hardening.rs's `Category` enum for the exact sysctls.
+network_spoofing_protection = true   # rp_filter + ICMP redirect defense
+icmp_hardening = true                # ignore broadcasts/bogus errors and all pings
+tcp_hardening = true                 # SYN cookies, backlog/keepalive tuning for DDoS resilience
+info_leak_restriction = true         # restricts kernel pointer/dmesg/perf-event exposure
+ptrace_and_bpf_restriction = true    # locks ptrace to YAMA scope 3, disables unprivileged BPF
+kexec_and_fs_protection = true       # disables kexec, protects symlinks/hardlinks from TOCTOU
+
+# extra_sysctls = { "/proc/sys/some/other/knob" = "1" }
+# extra_kernel_config = ["CONFIG_DEBUG_INFO=enable"]   # raw escape hatch, applied last
+
+[output]
+# Any subset of "cpio" (+bzImage), "iso" (hybrid BIOS+UEFI), "uki" (.efi), "binary" (raw app
+# binary). Default: cpio, iso, uki.
+formats = ["cpio", "iso", "uki"]
+# Output directory, relative to this config file.
+dir = "dist/"
+
+[release]
+# Assets `cargo-unikernel release` attaches to the GitHub Release; omit to attach everything
+# produced (the default). sev-snp adds "measurement" and "ovmf" to the valid set.
+# assets = ["cpio", "uki", "binary"]
+
+# title = "My App Release"   # defaults to the tag name
+
+# notes = "See CHANGELOG.md for details." # mutually exclusive with notes_file
+# notes_file = "RELEASE_NOTES.md"         # path relative to this config file
+
+# draft = false
+# prerelease = false

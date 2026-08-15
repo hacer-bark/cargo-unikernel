@@ -1,0 +1,148 @@
+FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+
+# Avoid tzdata prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Bootstrap ca-certificates using the base image's own default sources (plain HTTP —
+# archive.ubuntu.com/security.ubuntu.com, whatever the image ships) before switching apt
+# over to an HTTPS-only mirror below. Without this, apt has no CA trust store yet and
+# fails TLS verification against snapshot.ubuntu.com with "Certificate verification
+# failed: ... issuer is unknown" on a bare base image. ca-certificates' own version isn't
+# pinned by this step, but that only affects which root CAs are trusted, not the
+# toolchain packages that actually determine build output — those are pinned below.
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Pin apt itself to a frozen point-in-time mirror (snapshot.ubuntu.com), not the live
+# archive. The base image above is pinned by digest, but `apt-get install` against the
+# live Ubuntu archive resolves to whatever package versions (gcc, binutils, musl-tools,
+# ...) happen to be current *the day the image is built* — which drifts over time and
+# between machines. Two builds from the exact same Dockerfile, weeks apart, can silently
+# link against a different libc/compiler and produce a different bzImage/binary, which
+# breaks reproducibility (and SEV-SNP measurement comparison) even though nothing in this
+# repo changed. Freezing all four suites (release/updates/security/backports) to the same
+# snapshot timestamp makes `apt-get install` resolve identically forever, on any machine,
+# regardless of when the image is actually built. `Check-Valid-Until=false` is required
+# because a historical snapshot's own Release file has a short-lived Valid-Until date that
+# has long since passed by the time anyone builds this image.
+#
+# The snapshot timestamp must be on or after whatever point release the pinned base image
+# digest above was itself built from — apt will refuse to *downgrade* already-installed
+# packages (gcc-14-base, libc6, libssl3t64, ...) to match an older snapshot, and fails the
+# whole install with "unmet dependencies" instead. If you ever bump the base image digest,
+# re-verify this timestamp is still >= the versions already baked into that image.
+#
+# Overridable via `[toolchain].apt_snapshot` in cargo-unikernel.toml (`--build-arg
+# SNAPSHOT_TS=...`, see pipeline::docker::build_args_for) — see docs/reproducible_builds.md.
+ARG SNAPSHOT_TS=20260701T000000Z
+RUN rm -f /etc/apt/sources.list.d/ubuntu.sources && \
+    printf 'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble main restricted universe multiverse\n\
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble-updates main restricted universe multiverse\n\
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble-security main restricted universe multiverse\n\
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble-backports main restricted universe multiverse\n' \
+    "$SNAPSHOT_TS" "$SNAPSHOT_TS" "$SNAPSHOT_TS" "$SNAPSHOT_TS" \
+    > /etc/apt/sources.list && \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
+
+# Install build dependencies exactly as we need them
+RUN apt-get update && apt-get install -y \
+    build-essential flex bison libssl-dev libelf-dev wget cpio jq python3 python3-pip ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
+    xorriso systemd-ukify systemd-boot-efi nasm mtools
+
+# musl-tools no longer symlinks the Linux kernel headers (linux-libc-dev provides these only
+# for glibc's include paths: /usr/include/linux, /usr/include/asm-generic, and the
+# x86_64-linux-gnu multiarch dir) into musl's own include tree
+# (/usr/include/x86_64-linux-musl). Without this, any crate whose C sources reach for kernel
+# UAPI headers under musl — e.g. aws-lc-fips-sys's urandom.c including <linux/random.h> for its
+# FIPS entropy source — fails with "fatal error: linux/random.h: No such file or directory"
+# when cross-compiling to x86_64-unknown-linux-musl.
+RUN ln -s /usr/include/linux /usr/include/x86_64-linux-musl/linux && \
+    ln -s /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
+    ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
+
+# `sev-snp-measure` (git-cloned and pinned to an exact commit at build-script runtime — see
+# pipeline::docker::script_sev_snp_measurement) declares `cryptography>=39.0.1` as a runtime
+# dependency in its own setup.cfg, but nothing installs it — the specific invocation this
+# project makes (`--mode snp`) doesn't currently exercise the one module that imports it
+# (`id_block.py`, used only by the separate `snp-create-id-block` entry point), so this has
+# gone unnoticed. Install a version satisfying that requirement, hash-verified and wheel-only
+# (--no-deps: this project's call path needs nothing cryptography itself pulls in, e.g. cffi,
+# so there's nothing else to pin) so a future sev-snp-measure update that starts eagerly
+# importing it doesn't silently break — or silently install an unverified, unpinned version
+# of a crypto library. Deliberately newer than sev-snp-measure's own requirements.txt pin at
+# this commit (46.0.7): that version's wheels bundle an OpenSSL affected by GHSA-537c-gmf6-5ccf
+# (CVE-worthy, HIGH severity), fixed in cryptography 48.0.1+.
+#
+# `--hash` is only recognized inside a requirements file, not as a bare `pip install` CLI
+# argument (pip's argument parser rejects it there with "no such option: --hash") — so the
+# pin has to be written out to a file first rather than passed directly on the command line.
+RUN printf '%s\n' \
+    'cryptography==49.0.0 \' \
+    '    --hash=sha256:35b151772baff2c74cba7fa290ceaff4c3b11c0c881eb93eb5dbc05a7cfbba18 \' \
+    '    --hash=sha256:6f2debedf9ca60cf1d5bd466475638af5130f89965605cd818484d19987d3a21 \' \
+    '    --hash=sha256:2400ef9c9e2299a25614eb1dea3db54a69b1349efd043bfac9c67630d136df36' \
+    > /tmp/cryptography-requirements.txt && \
+    pip3 install --break-system-packages --no-cache-dir --no-deps --only-binary=:all: \
+    --require-hashes -r /tmp/cryptography-requirements.txt && \
+    rm /tmp/cryptography-requirements.txt
+
+# Install a specific, fixed version of Rust. Overridable via `[toolchain].rust_version`.
+ARG RUST_VERSION=1.97.0
+RUN curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_VERSION"
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add x86_64-unknown-linux-musl
+
+# Limine bootloader, pinned by release tag + checksum (used for ISO output — see
+# assets/scripts/make_iso.sh). Ubuntu doesn't package Limine, so it's fetched and built
+# from a pinned, checksum-verified source tarball rather than trusting a prebuilt binary.
+# Built with plain gcc/binutils (no clang/lld needed — confirmed against upstream's
+# configure, which only requires CC_FOR_TARGET/LD_FOR_TARGET etc. point at *something*
+# ELF-capable). Installed flat into /opt/limine to match what make_iso.sh expects
+# ($LIMINE_DIR/{limine-bios.sys,limine-bios-cd.bin,limine-uefi-cd.bin,limine}).
+# Overridable via `[toolchain].limine_version`/`limine_sha256`.
+ARG LIMINE_VERSION=12.4.1
+ARG LIMINE_SHA256=2dca50927d564d80a246f2c49a4df58a2d4a37ada31c835bd28028885f6de55f
+RUN curl -fL -o /tmp/limine.tar.gz \
+        "https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VERSION}/limine-${LIMINE_VERSION}.tar.gz" && \
+    echo "${LIMINE_SHA256}  /tmp/limine.tar.gz" | sha256sum -c - && \
+    mkdir -p /tmp/limine-src && tar -xzf /tmp/limine.tar.gz -C /tmp/limine-src --strip-components=1 && \
+    cd /tmp/limine-src && \
+    CC=gcc CC_FOR_TARGET=gcc LD_FOR_TARGET=ld OBJCOPY_FOR_TARGET=objcopy OBJDUMP_FOR_TARGET=objdump READELF_FOR_TARGET=readelf \
+        ./configure --prefix=/opt/limine-install \
+        --enable-bios --enable-bios-cd --enable-uefi-x86-64 --enable-uefi-cd && \
+    make -j"$(nproc)" && make install && \
+    mkdir -p /opt/limine && \
+    cp /opt/limine-install/share/limine/limine-bios.sys /opt/limine/ && \
+    cp /opt/limine-install/share/limine/limine-bios-cd.bin /opt/limine/ && \
+    cp /opt/limine-install/share/limine/limine-uefi-cd.bin /opt/limine/ && \
+    cp /opt/limine-install/bin/limine /opt/limine/ && \
+    rm -rf /tmp/limine.tar.gz /tmp/limine-src /opt/limine-install
+
+# Statically-linked `mke2fs`, bundled into `storage-persistent` images (see
+# pipeline::docker::rootfs_script) so the guest can format `/dev/vda` as ext4 — there is no
+# userspace at all in the guest's own initramfs to do this otherwise. `--enable-libuuid
+# --enable-libblkid` builds e2fsprogs' own private copies of those instead of linking the
+# host's shared libuuid/libblkid, which a static build can't use anyway. Everything not needed
+# to run `mke2fs -t ext4` (fsck, debugfs, e2image, resize2fs, fuse2fs, uuidd, mmp, tdb) is
+# trimmed. Depends on the musl kernel-header symlinks above (linux/unistd.h etc.) — this exact
+# configure/make recipe was verified to produce a working static binary before landing here.
+# Overridable via `[toolchain].e2fsprogs_version`/`e2fsprogs_sha256`.
+ARG E2FSPROGS_VERSION=1.47.4
+ARG E2FSPROGS_SHA256=da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96
+RUN curl -fL -o /tmp/e2fsprogs.tar.gz \
+        "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz" && \
+    echo "${E2FSPROGS_SHA256}  /tmp/e2fsprogs.tar.gz" | sha256sum -c - && \
+    mkdir -p /tmp/e2fsprogs-src && tar -xzf /tmp/e2fsprogs.tar.gz -C /tmp/e2fsprogs-src --strip-components=1 && \
+    cd /tmp/e2fsprogs-src && \
+    CC=musl-gcc ./configure \
+        --disable-nls --disable-uuidd --disable-tls --disable-defrag --disable-debugfs \
+        --disable-imager --disable-resizer --disable-backtrace --disable-fuse2fs \
+        --disable-mmp --disable-tdb --enable-libuuid --enable-libblkid --without-libarchive \
+        LDFLAGS=-static && \
+    make -j"$(nproc)" && \
+    mkdir -p /opt/e2fsprogs/sbin && \
+    cp misc/mke2fs /opt/e2fsprogs/sbin/mke2fs && \
+    strip /opt/e2fsprogs/sbin/mke2fs && \
+    rm -rf /tmp/e2fsprogs.tar.gz /tmp/e2fsprogs-src
+
+WORKDIR /workspace

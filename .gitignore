@@ -1,0 +1,13 @@
+/target
+guest/target
+/linux-*
+/rootfs
+linux.tar.xz
+sev_measurement.txt
+usr/
+sev-snp-measure/
+dist/
+*.bzImage
+*.efi
+*.iso
+.claude
