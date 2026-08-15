@@ -1,27 +1,26 @@
-//! A mandatory, non-configurable classic-BPF seccomp denylist installed on the app (and
-//! attestation server) child process.
+//! Mandatory classic-BPF seccomp denylist installed on the app and attestation-server child
+//! processes. Never on PID 1 itself, which still needs `mount()`/`reboot()`.
 //!
-//! Never on PID 1 itself, which still needs `mount()`/`reboot()` for its own supervisory
-//! duties.
+//! Denylist rather than allowlist: a wrong allowlist silently breaks every app this tool
+//! builds, which is worse than "not exhaustive." Each entry has no legitimate use in a
+//! single-purpose server and kills the process on first attempt; the watchdog then reboots
+//! the VM. `clone`/`fork`/`execve` stay unrestricted — most real servers need threads.
 //!
-//! Deliberately a *denylist*, not an allowlist: getting an allowlist wrong (missing a syscall
-//! an ordinary app needs) silently breaks every build this tool produces, which is worse than
-//! this denylist being merely "not exhaustive." The syscalls below have no legitimate use in a
-//! single-purpose server and are all standard post-exploitation moves — process escape,
-//! kernel/boot tampering, remounting something writable+executable, ASLR defeat, keyring
-//! access, namespace escape. Each one kills the process on first attempt, and the watchdog
-//! (any child dying is "System integrity compromised") reboots the VM on top of that.
+//! Two things this filter structurally cannot deny, and what covers them instead:
+//! - `execve`/`execveat`: installed via `pre_exec`, so the next syscall the child makes *is*
+//!   the exec that starts it. The write half of "drop and run a new binary" is denied instead
+//!   ([`write_execute_syscalls`]); `[app.runtime.danger].allow_write_execute` lifts it.
+//! - namespace creation via `clone`/`clone3`: can't deny without breaking thread creation.
+//!   `unshare`/`setns` are denied here; `CONFIG_NAMESPACES=n` (legacy-subsystems.config)
+//!   closes the `clone3` path at the kernel level.
 //!
-//! Ordinary process/thread creation (`clone`/`fork`/`execve`) is deliberately NOT restricted:
-//! almost every real server spawns threads, and getting this wrong would break most real
-//! deployments outright. `[app.runtime.danger].allow_write_execute` is the separate, explicit
-//! opt-in for the one capability this lockdown otherwise fully removes: writing and executing
-//! a new binary.
-//!
-//! Verified functionally against a running Linux 6.12 kernel outside the guest (a throwaway
-//! process installing this exact filter): an allowed syscall passes through untouched, a
-//! denylisted one kills the process immediately via SIGSYS. Not yet exercised inside an
-//! actual booted guest.
+//! The BPF construction (arch gate, jump encoding, terminal ALLOW/KILL) was verified against
+//! a running Linux 6.12 kernel outside the guest; not yet exercised inside a booted guest.
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!(
+    "cargo-unikernel-common's seccomp filter is x86_64-only (see AUDIT_ARCH_X86_64 below)"
+);
 
 use std::io;
 
@@ -65,10 +64,23 @@ const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 
+/// `memfd_create`/`memfd_secret` + `execveat(fd, "", AT_EMPTY_PATH)` runs an anonymous
+/// in-memory binary, invisible to every `noexec` mount flag in `mounts.rs`. This is what
+/// `[app.runtime.danger].allow_write_execute` actually gates — see `mounts.rs` for the other
+/// half (the writable mounts themselves).
+#[cfg(not(feature = "danger-allow-write-execute"))]
+fn write_execute_syscalls() -> Vec<i64> {
+    vec![libc::SYS_memfd_create, libc::SYS_memfd_secret]
+}
+#[cfg(feature = "danger-allow-write-execute")]
+const fn write_execute_syscalls() -> Vec<i64> {
+    Vec::new()
+}
+
 /// Only ever installed from inside a `Command::pre_exec` closure for a child — inherited by
 /// anything that child itself forks/execs, since seccomp filters survive both.
 fn denied_syscalls() -> Vec<i64> {
-    vec![
+    let mut denied = vec![
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
@@ -80,6 +92,13 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_mount_setattr,
+        libc::SYS_open_by_handle_at,
         libc::SYS_swapon,
         libc::SYS_swapoff,
         libc::SYS_reboot,
@@ -94,7 +113,16 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_unshare,
         libc::SYS_setns,
         libc::SYS_perf_event_open,
-    ]
+        libc::SYS_userfaultfd,
+        libc::SYS_kcmp,
+        libc::SYS_move_pages,
+        libc::SYS_settimeofday,
+        libc::SYS_clock_settime,
+        libc::SYS_clock_adjtime,
+        libc::SYS_adjtimex,
+    ];
+    denied.extend(write_execute_syscalls());
+    denied
 }
 
 /// Builds the BPF program: an `AUDIT_ARCH_X86_64` gate first (kills on any other syscall ABI),
@@ -320,6 +348,58 @@ mod tests {
             denied.len(),
             "denylist contains a duplicate syscall"
         );
+    }
+
+    /// The `mount(2)`-free mount API (`fsopen`/`fsconfig`/`fsmount`/`move_mount`) is a complete
+    /// second path to the same result if left open.
+    #[test]
+    fn denylist_covers_the_mount_free_mount_api() {
+        let denied = denied_syscalls();
+        for syscall in [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
+            libc::SYS_mount_setattr,
+        ] {
+            assert!(
+                denied.contains(&syscall),
+                "syscall {syscall} must be denied — the mount API is only closed as a set"
+            );
+        }
+    }
+
+    /// `noexec` mount flags cannot see an anonymous in-memory file, so this is what actually
+    /// backs the "no writable+executable paths remain" claim in the default build.
+    #[test]
+    #[cfg(not(feature = "danger-allow-write-execute"))]
+    fn denylist_blocks_anonymous_executable_memory_by_default() {
+        let denied = denied_syscalls();
+        assert!(denied.contains(&libc::SYS_memfd_create));
+        assert!(denied.contains(&libc::SYS_memfd_secret));
+    }
+
+    /// The mirror of the test above: opting into `danger-allow-write-execute` is opting into
+    /// exactly this capability, so killing the process for using it would be incoherent.
+    #[test]
+    #[cfg(feature = "danger-allow-write-execute")]
+    fn danger_allow_write_execute_permits_anonymous_executable_memory() {
+        let denied = denied_syscalls();
+        assert!(!denied.contains(&libc::SYS_memfd_create));
+        assert!(!denied.contains(&libc::SYS_memfd_secret));
+    }
+
+    /// `execve`/`execveat` must stay allowed: this filter is installed in a `pre_exec` closure,
+    /// so denying either would kill every child at the exec that starts it.
+    #[test]
+    fn denylist_never_blocks_the_exec_that_follows_it() {
+        let denied = denied_syscalls();
+        assert!(!denied.contains(&libc::SYS_execve));
+        assert!(!denied.contains(&libc::SYS_execveat));
     }
 
     #[test]

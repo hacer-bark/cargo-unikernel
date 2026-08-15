@@ -107,6 +107,11 @@ fn app_env_exports(config: &Config, s: &mut String) {
     write_export(s, "CARGO_UNIKERNEL_LIMIT_NOFILE", limits.max_open_files);
     write_export(s, "CARGO_UNIKERNEL_LIMIT_NPROC", limits.max_processes);
     write_export(s, "CARGO_UNIKERNEL_LIMIT_AS_MB", limits.max_memory_mb);
+    write_export(
+        s,
+        "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB",
+        limits.max_locked_memory_mb,
+    );
     if !config.hardening.extra_sysctls.is_empty() {
         write_export(
             s,

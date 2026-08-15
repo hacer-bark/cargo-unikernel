@@ -242,14 +242,28 @@ enum RateLimitError {
     ConcurrencyExceeded,
 }
 
+/// Minimum spacing between sweeps of the tracked-subnet table. The sweep is `O(tracked
+/// subnets)` under the limiter's single contended mutex, so running it on every request past
+/// the high-water mark (as opposed to once per window) would turn a distributed flood into a
+/// self-inflicted serialization point.
+const SUBNET_GC_INTERVAL: Duration = SUBNET_WINDOW;
+
+struct LimiterState {
+    subnets: HashMap<Subnet, SubnetState>,
+    last_gc: Instant,
+}
+
 struct SubnetLimiter {
-    subnets: Mutex<HashMap<Subnet, SubnetState>>,
+    state: Mutex<LimiterState>,
 }
 
 impl SubnetLimiter {
     fn new() -> Self {
         Self {
-            subnets: Mutex::new(HashMap::new()),
+            state: Mutex::new(LimiterState {
+                subnets: HashMap::new(),
+                last_gc: Instant::now(),
+            }),
         }
     }
 
@@ -259,12 +273,16 @@ impl SubnetLimiter {
         // A poisoned mutex means some other thread panicked while holding it — a state this
         // codebase's "never panic" discipline says should be unreachable, but the wipe-and-exit
         // protocol is exactly the right response if it somehow happens anyway.
-        let mut map = self.subnets.lock().unwrap_or_else(|_| {
+        let state = &mut *self.state.lock().unwrap_or_else(|_| {
             panic_shutdown("attestation subnet limiter mutex poisoned — system integrity compromised")
         });
+        let map = &mut state.subnets;
 
-        if map.len() > MAX_TRACKED_SUBNETS / 2 {
-            map.retain(|_, state| !state.is_idle(now));
+        if map.len() > MAX_TRACKED_SUBNETS / 2
+            && now.duration_since(state.last_gc) >= SUBNET_GC_INTERVAL
+        {
+            map.retain(|_, s| !s.is_idle(now));
+            state.last_gc = now;
         }
 
         // Once at capacity, refuse to start tracking a brand-new subnet — an already-tracked
@@ -286,7 +304,6 @@ impl SubnetLimiter {
         state.next = (state.next + 1) % SUBNET_MAX_REQUESTS;
         state.active_connections += 1;
 
-        drop(map);
         Ok(SubnetGuard {
             limiter: self,
             subnet,
@@ -301,8 +318,8 @@ struct SubnetGuard<'a> {
 
 impl Drop for SubnetGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.limiter.subnets.lock()
-            && let Some(state) = map.get_mut(&self.subnet)
+        if let Ok(mut limiter) = self.limiter.state.lock()
+            && let Some(state) = limiter.subnets.get_mut(&self.subnet)
         {
             state.active_connections = state.active_connections.saturating_sub(1);
         }

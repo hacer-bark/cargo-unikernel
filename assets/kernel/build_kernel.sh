@@ -4,16 +4,20 @@
 # fragments + an optional user-supplied extra-kconfig file — then compiles bzImage
 # deterministically.
 #
+# Every requested option is verified to have survived `make olddefconfig` before anything is
+# compiled (see verify_config below) — olddefconfig silently drops any symbol that was renamed,
+# removed upstream, has no prompt, or has an unmet dependency, so an unchecked config can claim
+# hardening the built kernel doesn't have.
+#
 # Caching (this is the expensive step in the whole pipeline — the kernel source tarball is
 # ~150MB and a from-scratch build takes minutes):
 #   - the downloaded source tarball is cached by version+sha256 under $CACHE_DIR/src/
 #   - ccache covers the actual compiler invocations across builds with the same toolchain
 #   - the *finished* bzImage is cached under $CACHE_DIR/bzimage/<fingerprint>/, where the
-#     fingerprint hashes the kernel version + every kconfig fragment that would be applied;
-#     if nothing kernel-config-relevant changed since the last build, this whole script
-#     short-circuits to a cache hit and copies the prebuilt bzImage out — no download,
-#     configure, or compile at all.
-set -e
+#     fingerprint covers everything that can change the output bytes (kernel version+checksum,
+#     every kconfig fragment, this script, the toolchain versions). A cache hit skips download,
+#     configure, and compile entirely.
+set -euo pipefail
 
 KERNEL_VER="${CARGO_UNIKERNEL_KERNEL_VERSION:-6.18.33}"
 KERNEL_SHA256="${CARGO_UNIKERNEL_KERNEL_SHA256:-}"
@@ -22,11 +26,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE_DIR="${CARGO_UNIKERNEL_KERNEL_CACHE_DIR:-/build/cache}"
 EXTRA_KCONFIG_FILE="${CARGO_UNIKERNEL_EXTRA_KCONFIG_FILE:-}"
 
-mkdir -p "$CACHE_DIR/src" "$CACHE_DIR/bzimage"
+# Building this artifact unverified is not a degraded mode worth having, so an absent checksum
+# is a hard failure, not a warning. The host CLI resolves `[kernel].sha256` (or its baked-in
+# default) before generating this script — this is the second line of that same rule.
+if [ -z "$KERNEL_SHA256" ]; then
+    echo "CARGO_UNIKERNEL_KERNEL_SHA256 is not set — refusing to build an unverified kernel." >&2
+    echo "Pin \`kernel.sha256\` for version $KERNEL_VER (see kernel.org's sha256sums.asc)." >&2
+    exit 1
+fi
 
 # --- ccache setup (compiler-level cache; helps whenever a full kernel build IS needed) ---
 export PATH="/usr/lib/ccache:$PATH"
 export CCACHE_DIR="${CCACHE_DIR:-/root/.cache/ccache}"
+# Hash compiler contents, not mtime+size — the randstruct GCC plugin is rebuilt per source
+# tree and passed as `-fplugin=<path>`, and a path-only match could serve objects built against
+# a stale plugin, reintroducing the non-reproducibility the fixed-seed patch below removes.
+export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
 ccache -M 5G >/dev/null 2>&1 || true
 
 case "$CARGO_UNIKERNEL_PROFILE" in
@@ -92,11 +107,68 @@ if [ -n "$EXTRA_KCONFIG_FILE" ] && [ -f "$EXTRA_KCONFIG_FILE" ]; then
     FRAGMENTS+=("$EXTRA_KCONFIG_FILE")
 fi
 
-# --- Fingerprint: kernel version + every fragment's content, in application order ---
-FINGERPRINT=$( { echo "$KERNEL_VER"; cat "${FRAGMENTS[@]}"; } | sha256sum | cut -d' ' -f1)
+# --- Parse every fragment up front, into one "last write wins" directive map ---
+#
+# Parsed once rather than streamed straight into `scripts/config`: verify_config below checks
+# against the same resolved map, and a later fragment overriding an earlier one is normal.
+#
+# The loop condition's `|| [ -n "$line" ]` picks up a final line with no trailing newline
+# (`read -r` alone drops it at EOF). CR is stripped too (a CRLF file otherwise produces
+# `scripts/config --enable $'CONFIG_FOO\r'`), and surrounding whitespace is trimmed.
+declare -A DIRECTIVES=()
+DIRECTIVE_ORDER=()
+
+parse_fragment() {
+    local fragment_path="$1" line key directive
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" != *=* ]]; then
+            echo "Malformed line (expected KEY=directive) in $fragment_path: $line" >&2
+            exit 1
+        fi
+        key="${line%%=*}"
+        directive="${line#*=}"
+        case "$directive" in
+            enable|disable|set-str:*|set-val:*) ;;
+            *)
+                echo "Unrecognized directive '$directive' for $key in $fragment_path" >&2
+                exit 1
+                ;;
+        esac
+        if [ -z "${DIRECTIVES[$key]+set}" ]; then
+            DIRECTIVE_ORDER+=("$key")
+        fi
+        DIRECTIVES["$key"]="$directive"
+    done < "$fragment_path"
+}
+
+for fragment_path in "${FRAGMENTS[@]}"; do
+    parse_fragment "$fragment_path"
+done
+
+# --- Fingerprint ---
+#
+# Covers this script itself and the toolchain versions, not just the config — otherwise
+# editing the randstruct seed below, or bumping the compiler, would cache-hit a bzImage built
+# from the old recipe.
+fingerprint_input() {
+    echo "$KERNEL_VER"
+    echo "$KERNEL_SHA256"
+    sha256sum "${BASH_SOURCE[0]}"
+    gcc --version 2>/dev/null | head -1 || echo "gcc unknown"
+    ld --version 2>/dev/null | head -1 || echo "ld unknown"
+    make --version 2>/dev/null | head -1 || echo "make unknown"
+    for key in "${DIRECTIVE_ORDER[@]}"; do
+        echo "$key=${DIRECTIVES[$key]}"
+    done
+}
+FINGERPRINT=$(fingerprint_input | sha256sum | cut -d' ' -f1)
 CACHED_BZIMAGE="$CACHE_DIR/bzimage/$FINGERPRINT/bzImage"
 
-mkdir -p linux-kernel/arch/x86/boot
+mkdir -p "$CACHE_DIR/src" "$CACHE_DIR/bzimage" linux-kernel/arch/x86/boot
 if [ -f "$CACHED_BZIMAGE" ]; then
     echo "Kernel config fingerprint $FINGERPRINT matches a cached build — skipping download/compile."
     cp "$CACHED_BZIMAGE" linux-kernel/arch/x86/boot/bzImage
@@ -104,7 +176,7 @@ if [ -f "$CACHED_BZIMAGE" ]; then
     exit 0
 fi
 
-# --- Download (cached by version; sha256-verified if provided) ---
+# --- Download (cached by version, always sha256-verified) ---
 TARBALL="$CACHE_DIR/src/linux-${KERNEL_VER}.tar.xz"
 if [ -f "$TARBALL" ]; then
     echo "Using cached kernel source tarball: $TARBALL"
@@ -113,13 +185,12 @@ else
     wget -qO "$TARBALL.partial" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VER}.tar.xz"
     mv "$TARBALL.partial" "$TARBALL"
 fi
-if [ -n "$KERNEL_SHA256" ]; then
-    echo "$KERNEL_SHA256  $TARBALL" | sha256sum -c - || {
-        echo "Kernel tarball sha256 mismatch for v$KERNEL_VER — refusing to build" >&2
-        rm -f "$TARBALL"
-        exit 1
-    }
-fi
+# Verified on the cached path too — otherwise one poisoned cache entry is trusted forever.
+echo "$KERNEL_SHA256  $TARBALL" | sha256sum -c - || {
+    echo "Kernel tarball sha256 mismatch for v$KERNEL_VER — refusing to build" >&2
+    rm -f "$TARBALL"
+    exit 1
+}
 
 rm -rf linux-kernel
 tar -xf "$TARBALL"
@@ -152,26 +223,74 @@ echo "Configuring minimal KVM guest kernel..."
 make defconfig
 make kvm_guest.config
 
-echo "Applying kconfig fragments: ${FRAGMENTS[*]}"
-for fragment_path in "${FRAGMENTS[@]}"; do
-    while IFS='=' read -r key directive; do
-        # Skip blank lines and comments
-        [[ -z "$key" || "$key" == \#* ]] && continue
-        case "$directive" in
-            enable) scripts/config --enable "$key" ;;
-            disable) scripts/config --disable "$key" ;;
-            set-str:*) scripts/config --set-str "$key" "${directive#set-str:}" ;;
-            set-val:*) scripts/config --set-val "$key" "${directive#set-val:}" ;;
-            *)
-                echo "Unrecognized directive '$directive' for $key in $fragment_path" >&2
-                exit 1
-                ;;
-        esac
-    done < "$fragment_path"
+echo "Applying ${#DIRECTIVE_ORDER[@]} kconfig directives from: ${FRAGMENTS[*]}"
+for key in "${DIRECTIVE_ORDER[@]}"; do
+    directive="${DIRECTIVES[$key]}"
+    case "$directive" in
+        enable) scripts/config --enable "$key" ;;
+        disable) scripts/config --disable "$key" ;;
+        set-str:*) scripts/config --set-str "$key" "${directive#set-str:}" ;;
+        set-val:*) scripts/config --set-val "$key" "${directive#set-val:}" ;;
+    esac
 done
 
 echo "Resolving dependencies and finalizing configuration..."
 make olddefconfig
+
+# --- Verify every directive actually took ---
+#
+# `make olddefconfig` discards anything it can't satisfy, silently. A dropped symbol is how a
+# rename (CONFIG_RETPOLINE -> CONFIG_MITIGATION_RETPOLINE), an upstream removal, or a missed
+# dependency shows up: as nothing at all. Failing the build beats warning — these are security
+# options.
+verify_config() {
+    local key directive expected actual failures=0
+    for key in "${DIRECTIVE_ORDER[@]}"; do
+        directive="${DIRECTIVES[$key]}"
+        actual="$(grep -E "^($key=|# $key is not set)" .config || true)"
+        case "$directive" in
+            enable)
+                # `y` or `m` both count. CONFIG_MODULES=n means nothing ends up `m` in
+                # practice, but that distinction isn't this check's to enforce.
+                expected="$key=y or $key=m"
+                [[ "$actual" == "$key=y" || "$actual" == "$key=m" ]] && continue
+                ;;
+            disable)
+                # Absent counts as disabled — a symbol removed upstream is dead weight, not a
+                # security hole.
+                expected="# $key is not set (or absent)"
+                [[ -z "$actual" || "$actual" == "# $key is not set" ]] && continue
+                ;;
+            set-val:*)
+                expected="$key=${directive#set-val:}"
+                [[ "$actual" == "$expected" ]] && continue
+                ;;
+            set-str:*)
+                expected="$key=\"${directive#set-str:}\""
+                [[ "$actual" == "$expected" ]] && continue
+                ;;
+        esac
+        echo "  $key: requested '$directive', expected '$expected', got '${actual:-<absent>}'" >&2
+        failures=$((failures + 1))
+    done
+
+    if [ "$failures" -gt 0 ]; then
+        cat >&2 <<VERIFY_EOF
+
+$failures kconfig option(s) above did not survive 'make olddefconfig' — refusing to build.
+
+Each one was requested by a fragment in assets/kernel/kconfig/ and then dropped, which means
+the built kernel would NOT have had it. Usual causes, in rough order of likelihood:
+  - the symbol was renamed or removed in Linux $KERNEL_VER (drop the line, or use the new name)
+  - a dependency is unmet, often disabled by an earlier fragment (grep the Kconfig 'depends on')
+  - the symbol has no prompt in this configuration (CONFIG_EXPERT in base.config unlocks many)
+  - it is 'select'ed by something else and not directly settable
+VERIFY_EOF
+        exit 1
+    fi
+    echo "All ${#DIRECTIVE_ORDER[@]} requested kconfig options verified present in .config."
+}
+verify_config
 
 echo "Compiling the kernel (this will take a few minutes; ccache speeds up repeat builds)..."
 export KBUILD_BUILD_TIMESTAMP="1970-01-01 00:00:00"

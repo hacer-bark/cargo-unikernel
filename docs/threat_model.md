@@ -76,13 +76,34 @@ measured.
 |:---|:---|:---|
 | RCE in your app | Read-only `/payload`, `noexec` elsewhere by default, no shell/package manager | Mitigated |
 | Post-RCE: `ptrace`/debug another process | Seccomp denylist blocks `ptrace`/`process_vm_read`/`write` | Mitigated |
-| Post-RCE: remount writable+exec, load a module, kexec, defeat ASLR | Seccomp blocks `mount`/`umount2`/`pivot_root`, `*_module`, `kexec_*`, `personality` | Mitigated |
-| Post-RCE: drop and run a new binary | Every writable mount is `noexec` unless `[app.runtime.danger].allow_write_execute` is set | Mitigated by default; opt-out is named to be hard to enable by accident |
+| Post-RCE: remount writable+exec, load a module, kexec, defeat ASLR | Seccomp blocks `mount`/`umount2`/`pivot_root` **and the mount(2)-free mount API** (`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`mount_setattr`), `*_module`, `kexec_*`, `personality` | Mitigated |
+| Post-RCE: drop and run a new binary | Every writable mount is `noexec`, **and `memfd_create`/`memfd_secret` are seccomp-denied** so an anonymous in-memory file can't be `execveat`'d past the mount flags. Both are lifted by `[app.runtime.danger].allow_write_execute` | Mitigated by default; opt-out is named to be hard to enable by accident |
+| Post-RCE: escape into a new namespace | `CONFIG_NAMESPACES=n` — every `CLONE_NEW*` flag returns `EINVAL` regardless of syscall. Seccomp additionally denies `unshare`/`setns` (it cannot deny `clone`/`clone3`, which threads need) | Mitigated |
+| Post-RCE: read another process's memory without `ptrace` | `yama ptrace_scope=3`, seccomp denies `process_vm_readv`/`writev`, `CONFIG_PROC_MEM_NO_FORCE=y` blocks `FOLL_FORCE` writes through `/proc/<pid>/mem` | Mitigated |
+| Post-RCE: move the clock to revive an expired/revoked certificate | Seccomp denies `settimeofday`/`clock_settime`/`clock_adjtime`/`adjtimex` | Mitigated against the guest; the host still supplies the initial clock, see below |
 | Post-RCE: acquire a capability on exec | Capability bounding set unconditionally dropped before exec | Mitigated |
 | Privilege escalation | No kernel modules (`CONFIG_MODULES=n`), filesystem lockdown regardless of privilege | Mitigated |
-| Persistence across reboot | `ram` mode (default): tmpfs, wiped on reboot. `persistent` mode: `/var` is real disk-backed ext4, survives reboots by design, and (sev-snp) sits outside SEV-SNP's memory encryption — a plain virtio-blk device the hypervisor can read/tamper with | Mitigated by default; opt-in trade-off with persistent storage |
+| Persistence across reboot | `ram` mode (default): tmpfs, wiped on reboot. `persistent` mode: `/var` is real disk-backed ext4, survives reboots by design — see the dedicated section below | Mitigated by default; opt-in trade-off with persistent storage |
+| Hostile block device fed to the in-kernel ext4 parser (`persistent`, sev-snp) | The device's superblock is read and checked from userspace *before* any mount, so a device that isn't recognizably this image's is wiped rather than parsed by the kernel | Bounds which images reach the parser; does not make the ones that do trustworthy |
 | Fork bomb / fd/memory exhaustion | `setrlimit` ceilings from `[app.runtime.limits]`, applied pre-exec; app holds no capability to raise them | Mitigated (memory ceiling opt-in) |
 | Flooding the attestation endpoint | Fixed worker pool, separate firmware-call counter, per-subnet rate/concurrency limits — see [`attestation_api.md`](attestation_api.md) | Mitigated against any single subnet, not a large distributed flood |
+
+## Persistent storage is outside the sev-snp guarantee
+
+`[storage].mode = "persistent"` attaches a hypervisor-supplied virtio-blk device and mounts it
+at `/var`. It is **not encrypted and not integrity-checked**:
+
+- the host can read everything the app writes there, and
+- the host can modify it between boots without the guest detecting it.
+
+SEV-SNP protects guest *memory*. It says nothing about a block device. The attestation report
+covers the launch measurement of kernel+initramfs+app — not the contents of `/var`, which by
+definition did not exist at launch.
+
+Closing this properly means `dm-crypt` plus `dm-integrity`, keyed from an `SNP_GET_DERIVED_KEY`
+secret (derived from the VCEK and bound to the launch measurement, so only this exact image can
+unseal it). **That is not implemented.** Until it is: with `mode = "persistent"` on the sev-snp
+profile, treat `/var` as untrusted, host-visible scratch space, and keep secrets in RAM.
 
 ## What is NOT protected
 
@@ -97,6 +118,17 @@ measured.
   model, the fundamental hardware assumption.
 - **Bugs in this code** — `cargo-unikernel-init` is kept small to minimize this; the kernel
   uses KSPP hardening regardless of profile.
+- **Wall-clock time** — there is no secure-time bootstrap. The clock the guest starts with
+  comes from the host, so any app decision that depends on absolute time (certificate expiry,
+  revocation freshness, token lifetimes) is only as trustworthy as the host on the sev-snp
+  profile. Seccomp stops a *compromised guest process* from moving the clock; nothing here
+  stops the host from setting it wrong to begin with.
+- **The seccomp layer is a denylist** — it names syscalls with no legitimate use in a
+  single-purpose server rather than enumerating the ones an app may make, because a wrong
+  allowlist silently breaks every image this tool produces. Where a gap in it would undermine
+  a guarantee claimed above, that guarantee is backed by a kernel-config decision as well
+  (`CONFIG_NAMESPACES`, `CONFIG_FHANDLE`, `CONFIG_KCMP`), so neither layer is load-bearing
+  alone. It remains a denylist, and a novel syscall is allowed until it is listed.
 - **Whatever you pin** — the tool verifies the running code matches the ref/hash you gave it,
   not that the ref/hash itself is trustworthy. It moves the trust question somewhere you
   control; it doesn't answer it for you.

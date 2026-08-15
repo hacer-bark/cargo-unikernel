@@ -246,10 +246,11 @@ allowed values, and default). The highlights:
   this image ever execs a capability-holding process). See
   [`docs/architecture.md`](docs/architecture.md).
 - **`[app.runtime.limits]`**: `setrlimit` ceilings (`max_open_files`, `max_processes`,
-  `max_memory_mb`) applied to the app's process before exec — contains a compromised or buggy
-  app forking itself into a fork bomb, exhausting file descriptors, or growing unboundedly in
-  memory. All optional, with generous built-in defaults (65536 files, 2048 processes, no
-  memory cap) that ordinary workloads shouldn't hit.
+  `max_memory_mb`, `max_locked_memory_mb`) applied to the app's process before exec — contains
+  a compromised or buggy app forking itself into a fork bomb, exhausting file descriptors,
+  growing unboundedly in memory, or pinning all of guest RAM. All optional, with generous
+  built-in defaults (65536 files, 2048 processes, no address-space cap, 64 MiB lockable) that
+  ordinary workloads shouldn't hit.
 - **`[app.runtime.danger]`**: everything here is off by default and named to be hard to
   enable by accident. `allow_write_execute` is the one opt-out from "no writable+executable
   path anywhere in the guest" — only turn it on if the app genuinely needs to write and run

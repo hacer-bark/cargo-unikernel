@@ -17,7 +17,7 @@ pub(super) fn script_kernel_build(config: &Config) -> String {
         "export CARGO_UNIKERNEL_KERNEL_VERSION={}",
         shell_quote(&config.kernel.version)
     );
-    if let Some(sha256) = &config.kernel.sha256 {
+    if let Some(sha256) = &config.kernel.sha256_for_build() {
         let _ = writeln!(
             s,
             "export CARGO_UNIKERNEL_KERNEL_SHA256={}",

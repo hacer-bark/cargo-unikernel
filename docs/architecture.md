@@ -56,21 +56,26 @@ The app is already embedded at build time, so the sequence is short:
 2. Mount `/proc`, `/sys`, `/dev`, `/tmp`+`/var` (noexec unless
    `[app.runtime.danger].allow_write_execute`), `/run`, `/payload`. `/var` is tmpfs unless
    `[storage].mode = "persistent"`, in which case it's the virtio-blk device, formatted ext4
-   on first use (a device without this tool's marker file is wiped, not trusted), then
-   `chown`'d to the app's uid/gid.
+   on first use (a device whose superblock doesn't carry this tool's volume label is wiped
+   rather than mounted — the check reads the raw device, before the kernel's ext4 driver sees
+   it), then `chown`'d to the app's uid/gid.
 3. Bring up loopback + admin-down interfaces, apply sysctl hardening for whatever's enabled.
 4. Wait for kernel entropy, then poll (up to 30s) for a default route — skipped when
    `[network].mode = "none"`.
-5. `exec` the app as an unprivileged child. Before `execve`, in order: apply `setrlimit`
+5. Remount `/payload` read-only and `/tmp`/`/run` back to noexec (unless
+   `allow_write_execute`); `/var` is never remounted. This happens before the app exists, so
+   there is no window in which a running app faces a still-writable payload mount.
+6. `exec` the app as an unprivileged child. Before `execve`, in order: apply `setrlimit`
    ceilings from `[app.runtime.limits]` (raising one above the kernel default needs
    `CAP_SYS_RESOURCE`, so this runs before the capability drop below removes it); drop the
    capability bounding set (`PR_CAPBSET_DROP`, while still root — dropping it needs
    `CAP_SETPCAP`); clear supplementary groups and `setgid`/`setuid` to the configured
    uid/gid; install a mandatory classic-BPF seccomp denylist (gated on the x86_64 syscall
-   ABI, then permanently blocking `ptrace`, kernel-module loading, `mount`/`kexec`/`reboot`,
-   keyring syscalls, `personality`, and more — ordinary `clone`/`fork`/`execve` is untouched).
-6. Remount `/payload` read-only and `/tmp`/`/run` back to noexec (unless
-   `allow_write_execute`); `/var` is never remounted.
+   ABI, then permanently blocking `ptrace`, kernel-module loading, both mount APIs —
+   `mount(2)` and `fsopen`/`fsmount`/`move_mount` — `kexec`/`reboot`, keyring syscalls,
+   `open_by_handle_at`, clock-setting syscalls, and `memfd_create`/`memfd_secret` unless
+   `allow_write_execute` is set. Ordinary `clone`/`fork`/`execve` is untouched; namespace
+   creation via `clone` is blocked by `CONFIG_NAMESPACES=n` instead).
 7. On sev-snp builds, `/dev/sev-guest` (if present) opens to both the app and the attestation
    server.
 8. If `[attestation].enabled` (sev-snp only): re-exec as an isolated, unprivileged

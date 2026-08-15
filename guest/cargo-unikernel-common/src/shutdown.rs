@@ -10,7 +10,7 @@
 //! every child to exit (`SIGTERM`), gives it a bounded grace period, force-kills anything
 //! still alive, best-effort zeroes writable tmpfs state, and powers off.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
@@ -286,9 +286,41 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// Fixed and reused across files rather than one `vec![0; len]` per file — scrubbing a full
+/// 64 MB `/tmp` shouldn't need a 64 MB allocation on the shutdown path.
+const SCRUB_CHUNK: usize = 16 * 1024;
+
+/// Overwrites a regular file's contents in place with zeros.
+///
+/// Not `std::fs::write`: its `O_TRUNC` releases tmpfs's backing pages (contents intact) before
+/// the zeros land in freshly-allocated *different* pages, leaving the original data in the
+/// free pool. Opening without truncation and writing over the existing extent is what actually
+/// overwrites it. `sync_data` before return so the write commits before the caller unlinks.
+fn overwrite_file(path: &std::path::Path, len: u64) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    let zeros = [0u8; SCRUB_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = usize::try_from(remaining).unwrap_or(SCRUB_CHUNK).min(SCRUB_CHUNK);
+        file.write_all(&zeros[..n])?;
+        remaining -= n as u64;
+    }
+    file.sync_data()
+}
+
 /// Best-effort: overwrites every regular file under `dir` with zeros before removing it, then
-/// removes now-empty subdirectories bottom-up. `/tmp` and `/run` are tmpfs (RAM-backed), so
-/// zeroing file contents here directly zeroes the backing pages.
+/// removes now-empty subdirectories bottom-up. `/tmp`, `/run`, `/dev/shm` and (RAM storage
+/// mode) `/var` are tmpfs, so this overwrites the RAM pages backing each file.
+///
+/// Defense in depth, not the primary guarantee — `CONFIG_INIT_ON_FREE_DEFAULT_ON` already
+/// zeroes pages on free, and sev-snp encrypts guest RAM regardless. This just bounds the
+/// window to scrub time instead of whenever the kernel reclaims the page.
+///
+/// Symlinks aren't followed (`DirEntry::metadata` doesn't traverse them) so they fall through
+/// untouched, still removed with their parent directory.
 fn scrub_dir(dir: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -300,9 +332,7 @@ fn scrub_dir(dir: &str) {
             scrub_dir(&path.to_string_lossy());
             let _ = std::fs::remove_dir(&path);
         } else if meta.is_file() {
-            if let Ok(len) = usize::try_from(meta.len()) {
-                let _ = std::fs::write(&path, vec![0u8; len]);
-            }
+            let _ = overwrite_file(&path, meta.len());
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -319,6 +349,25 @@ fn scrub_dir(dir: &str) {
 )]
 mod tests {
     use super::*;
+
+    /// Preserved length is the proof `O_TRUNC` didn't fire and free the original pages first.
+    #[test]
+    fn overwrite_file_zeroes_in_place_without_truncating() {
+        let path = std::env::temp_dir().join("cuk-scrub-in-place-test");
+        let secret = b"secret-bytes-that-must-not-survive".repeat(100);
+        std::fs::write(&path, &secret).unwrap();
+
+        overwrite_file(&path, secret.len() as u64).unwrap();
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after.len(),
+            secret.len(),
+            "file was truncated — the original pages were freed instead of overwritten"
+        );
+        assert!(after.iter().all(|&b| b == 0), "file contents were not zeroed");
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// `wait_for_trigger` must actually return once `SIGTERM` arrives — this is the one thing
     /// the epoll/self-pipe rewrite must not get wrong, since a bug here would mean the guest

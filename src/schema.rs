@@ -236,6 +236,14 @@ pub struct AppLimits {
     /// `RLIMIT_AS` in MiB. `0` (the default) means no cap.
     #[serde(default)]
     pub max_memory_mb: u64,
+    /// `RLIMIT_MEMLOCK` in MiB — how much memory the app may pin with `mlock`/`mlockall`.
+    ///
+    /// Raised well above the kernel's default so an app can keep key material out of any
+    /// future swap, but deliberately finite: an unlimited allowance lets a compromised app pin
+    /// all of guest RAM, which is the same resource-exhaustion problem the other fields here
+    /// exist to bound.
+    #[serde(default = "default_max_locked_memory_mb")]
+    pub max_locked_memory_mb: u64,
 }
 
 const fn default_max_open_files() -> u64 {
@@ -244,6 +252,9 @@ const fn default_max_open_files() -> u64 {
 const fn default_max_processes() -> u64 {
     2048
 }
+const fn default_max_locked_memory_mb() -> u64 {
+    64
+}
 
 impl Default for AppLimits {
     fn default() -> Self {
@@ -251,6 +262,7 @@ impl Default for AppLimits {
             max_open_files: default_max_open_files(),
             max_processes: default_max_processes(),
             max_memory_mb: 0,
+            max_locked_memory_mb: default_max_locked_memory_mb(),
         }
     }
 }
@@ -407,24 +419,25 @@ impl Default for Kernel {
 }
 
 impl Kernel {
-    /// Fills in the baked-in checksum when `sha256` wasn't set and `version` is still the
-    /// built-in default — covers a config that explicitly (but partially) sets `[kernel]`
-    /// without `sha256`. If `version` was changed too, there's no default to safely guess —
-    /// warn instead of silently building an unverified kernel tarball.
-    pub fn fill_default_sha256_or_warn(&mut self) {
-        if self.sha256.is_some() {
-            return;
-        }
-        if self.version == default_kernel_version() {
-            self.sha256 = Some(DEFAULT_KERNEL_SHA256.to_string());
-        } else {
-            eprintln!(
-                "[WARN] kernel.sha256 is not set for kernel.version = \"{}\" — the downloaded \
-                 tarball will NOT be integrity-checked. Pin `kernel.sha256` in your config \
-                 (see kernel.org's sha256sums.asc for that version) to verify it.",
-                self.version
-            );
-        }
+    /// The checksum this build must verify the downloaded tarball against.
+    ///
+    /// Falls back to the baked-in hash when `sha256` wasn't set and `version` is still the
+    /// built-in default, which covers a config that sets `[kernel]` explicitly but partially.
+    /// A changed `version` has no default to safely guess and yields `None`, which
+    /// `Config::validate` rejects.
+    ///
+    /// Resolved here rather than filled into the struct during config loading, so there is no
+    /// ordering question about whether the fill ran before the value was read: validation and
+    /// the build script both ask this one function. The previous arrangement only *warned*
+    /// about a missing hash, which meant the config change most likely to be made by someone
+    /// who cares about kernel provenance — pinning a different version — was also the one that
+    /// silently dropped integrity checking on the download.
+    #[must_use]
+    pub fn sha256_for_build(&self) -> Option<String> {
+        self.sha256.clone().or_else(|| {
+            (self.version == default_kernel_version())
+                .then(|| DEFAULT_KERNEL_SHA256.to_string())
+        })
     }
 }
 
@@ -837,6 +850,16 @@ pub enum ValidationError {
          — there's no assembled .efi to measure otherwise"
     )]
     MeasuredBootUkiNeedsUkiOutputFormat,
+    /// `kernel.version` was changed without pinning a matching `kernel.sha256`.
+    #[error(
+        "`kernel.sha256` must be set when `kernel.version` is not the built-in default \
+         ({version}) — the tarball would otherwise be downloaded and built without any \
+         integrity check. Take the hash for that version from kernel.org's sha256sums.asc"
+    )]
+    KernelSha256Required {
+        /// The version the config asks for, which has no baked-in checksum.
+        version: String,
+    },
     /// `attestation.port` was `0`.
     #[error("`attestation.port` must not be 0")]
     AttestationPortMustNotBeZero,
@@ -871,6 +894,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.validate_project()?;
         self.validate_storage()?;
+        self.validate_kernel()?;
         self.validate_attestation()?;
         self.validate_app()?;
         self.validate_profile()?;
@@ -907,6 +931,16 @@ impl Config {
             return Err(ValidationError::StorageSizeMustBePositive(
                 self.storage.size_mib,
             ));
+        }
+        Ok(())
+    }
+
+    /// `[kernel]` invariants: the tarball this build downloads is always checksum-verified.
+    fn validate_kernel(&self) -> Result<(), ValidationError> {
+        if self.kernel.sha256_for_build().is_none() {
+            return Err(ValidationError::KernelSha256Required {
+                version: self.kernel.version.clone(),
+            });
         }
         Ok(())
     }
@@ -1106,6 +1140,39 @@ mod tests {
         let mut config = base_config();
         config.project.name = "my-app_v2".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    /// Changing `kernel.version` is exactly the change that leaves the baked-in checksum
+    /// inapplicable, so it must not be the change that quietly turns verification off.
+    #[test]
+    fn changed_kernel_version_without_a_pinned_sha256_rejected() {
+        let mut config = sev_snp_base_config();
+        config.sev_snp = Some(sev_snp_section());
+        config.kernel = Kernel {
+            version: "6.17.1".to_string(),
+            sha256: None,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::KernelSha256Required { .. })
+        ));
+
+        config.kernel.sha256 = Some("0".repeat(64));
+        assert!(config.validate().is_ok());
+    }
+
+    /// The default version carries a checksum without the config having to name one, so the
+    /// zero-config path stays verified rather than merely unrejected.
+    #[test]
+    fn default_kernel_version_resolves_a_checksum_without_config() {
+        let kernel = Kernel {
+            version: default_kernel_version(),
+            sha256: None,
+        };
+        assert_eq!(
+            kernel.sha256_for_build().as_deref(),
+            Some(DEFAULT_KERNEL_SHA256)
+        );
     }
 
     #[test]

@@ -25,13 +25,12 @@ use std::path::{Path, PathBuf};
 pub fn load(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file at {}", path.display()))?;
-    let mut config: Config = toml::from_str(&raw).with_context(|| {
+    let config: Config = toml::from_str(&raw).with_context(|| {
         format!(
             "failed to parse {} as cargo-unikernel config TOML",
             path.display()
         )
     })?;
-    config.kernel.fill_default_sha256_or_warn();
     config.toolchain.warn_if_limine_unverified();
     config.toolchain.warn_if_e2fsprogs_unverified();
     config

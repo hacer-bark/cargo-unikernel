@@ -45,4 +45,6 @@ fn main() {
     passthrough("CARGO_UNIKERNEL_LIMIT_NOFILE", "65536");
     passthrough("CARGO_UNIKERNEL_LIMIT_NPROC", "2048");
     passthrough("CARGO_UNIKERNEL_LIMIT_AS_MB", "0");
+    // RLIMIT_MEMLOCK in MiB — finite on purpose, see schema::AppLimits::max_locked_memory_mb.
+    passthrough("CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB", "64");
 }

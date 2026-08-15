@@ -57,6 +57,7 @@ gid = 65534
 # max_open_files = 65536   # RLIMIT_NOFILE
 # max_processes = 2048     # RLIMIT_NPROC
 # max_memory_mb = 0        # RLIMIT_AS in MiB; 0 = no cap
+# max_locked_memory_mb = 64  # RLIMIT_MEMLOCK in MiB — how much the app may mlock
 
 [network]
 # "ipv4", "ipv6", "dual", or "none" — compile-time choice; unselected protocols aren't built in.
