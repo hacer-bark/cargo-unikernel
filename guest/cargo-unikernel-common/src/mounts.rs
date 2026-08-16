@@ -380,6 +380,7 @@ fn interface_index(name: &str) -> std::io::Result<libc::c_int> {
 /// Returns the errno-carrying error untouched rather than wrapping it in a labelled one:
 /// `io::Error::new` discards `raw_os_error()`, and the caller distinguishes `EEXIST` from a real
 /// failure by exactly that. Callers name the operation in their own message instead.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn inet6_ioctl<T>(request: libc::c_ulong, arg: &mut T) -> std::io::Result<()> {
     // SAFETY: `sock` is checked non-negative before use and closed on every exit path; `arg` is
     // a live, correctly-shaped struct borrowed mutably for the call's duration.
