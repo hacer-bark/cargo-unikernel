@@ -11,12 +11,6 @@
 [project]
 # Used for output filenames (dist/<name>.iso etc.). Required.
 name = "my-server"
-# Required for sev-snp: pins this config to an exact cargo-unikernel CLI version — build
-# refuses to run without it, since a different version can bundle a different kernel/
-# Dockerfile and silently change the launch measurement. `cargo-unikernel init --profile
-# sev-snp` always sets this to the version that scaffolded it; if hand-editing this file
-# instead, set it to your installed version (`cargo-unikernel --version`).
-# cargo_unikernel_version = "0.1.0"
 
 [profile]
 kind = "sev-snp"

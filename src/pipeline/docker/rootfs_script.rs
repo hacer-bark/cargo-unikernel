@@ -79,16 +79,12 @@ pub(super) fn script_rootfs_and_images(config: &Config) -> String {
             }
             OutputFormat::Uki => {
                 let cmdline_q = shell_quote(&cmdline_for(config));
-                // ukify is a Python tool (systemd-ukify); Python randomizes string hashing
-                // per-process by default (PYTHONHASHSEED), which affects the iteration
-                // order of any dict/set keyed by strings. Fixing it removes that as a
-                // possible source of nondeterminism in the assembled PE sections, the same
-                // way `-C codegen-units=1` removes thread-race ordering from the Rust
-                // builds above.
+                let uname_q = shell_quote(&config.kernel.version);
                 let _ = writeln!(
                     s,
                     "PYTHONHASHSEED=0 ukify build --linux={dist_q}/{name_q}.bzImage \
-                     --initrd={dist_q}/{name_q}.cpio --cmdline={cmdline_q} --output={dist_q}/{name_q}.efi"
+                     --initrd={dist_q}/{name_q}.cpio --cmdline={cmdline_q} --uname={uname_q} \
+                     --output={dist_q}/{name_q}.efi"
                 );
             }
         }

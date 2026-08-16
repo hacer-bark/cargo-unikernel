@@ -52,15 +52,6 @@ patching, and a RAM-only filesystem with no local durable state (full list:
 
 ## How it works
 
-```mermaid
-flowchart LR
-    A["Your app<br/>(source or pre-built binary)"] --> B["cargo-unikernel build"]
-    B --> C["Pinned, reproducible<br/>Docker build container"]
-    C --> D["Kernel + tiny init + your app,<br/>assembled into one rootfs"]
-    D --> E["dist/: cpio+bzImage, .iso, and/or UKI"]
-    E -.->|"profile.kind = sev-snp"| F["Launch measurement +<br/>encrypted guest memory"]
-```
-
 Your project directory is mounted into a pinned build container — nothing cloned or copied.
 Inside: the kernel builds from pinned source with a curated hardening profile, the app
 compiles (or, for a pre-built binary, is verified and staged) and is checked for static

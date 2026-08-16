@@ -213,7 +213,11 @@ cat > scripts/gen-randstruct-seed.sh <<'RANDSTRUCT_SEED_EOF'
 # SPDX-License-Identifier: GPL-2.0
 # Fixed, public seed — see build_kernel.sh. Deterministic structure-layout randomization,
 # not a security secret; reproducible builds require this to be constant across runs.
-SEED="c0ffee00d15ea5e0feedface0d15c0deba5eba11c0ffee00d15ea5e0feedface0d15c0deb"
+#
+# randomize_layout_plugin.c parses this with `sscanf(seed, "%016llx%016llx%016llx%016llx", ...)`
+# and rejects anything whose strlen() isn't exactly 64 (four 16-hex-digit u64 words, no
+# separators, no 0x prefix) — sha256 output is a convenient source of exactly that shape.
+SEED=$(echo -n "unikarnel-fixed-randstruct-seed" | sha256sum | cut -d" " -f1)
 echo "$SEED" > "$1"
 HASH=$(echo -n "$SEED" | sha256sum | cut -d" " -f1)
 echo "#define RANDSTRUCT_HASHED_SEED \"$HASH\"" > "$2"

@@ -45,8 +45,16 @@ deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble-backports
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
 
 # Install build dependencies exactly as we need them
+#
+# gcc-13-plugin-dev (build-essential's default gcc on noble is gcc-13): the guest kernel config
+# requests CONFIG_GCC_PLUGIN_LATENT_ENTROPY/CONFIG_RANDSTRUCT_FULL/CONFIG_KSTACK_ERASE, all
+# gated on CONFIG_GCC_PLUGINS in scripts/gcc-plugins/Kconfig, which itself probes for
+# `$(gcc -print-file-name=plugin)/include/plugin-version.h` at Kconfig time. Without this
+# package that header doesn't exist, GCC_PLUGINS silently resolves to n, and all three requested
+# options get dropped by `make olddefconfig` with no build error until build_kernel.sh's own
+# verify_config check catches it.
 RUN apt-get update && apt-get install -y \
-    build-essential flex bison libssl-dev libelf-dev wget cpio jq python3 python3-pip ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
+    build-essential gcc-13-plugin-dev flex bison libssl-dev libelf-dev wget cpio jq python3 python3-pip ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
     xorriso systemd-ukify systemd-boot-efi nasm mtools
 
 # musl-tools no longer symlinks the Linux kernel headers (linux-libc-dev provides these only
