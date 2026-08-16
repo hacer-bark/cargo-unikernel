@@ -29,8 +29,10 @@ pub(super) fn in_container_dist(config: &Config) -> String {
     "/workspace/".to_string() + config.output.dir.trim_end_matches('/')
 }
 
-/// sha256 of an actual artifact file, read host-side (used for bzImage/cpio, which always
-/// land in `dist/` regardless of profile).
+/// sha256 of an actual artifact file, read host-side.
+///
+/// Used for bzImage/cpio, which always land somewhere host-visible — `dist/` if `cpio` was
+/// requested as an output format, otherwise the last-build staging dir.
 ///
 /// # Errors
 ///

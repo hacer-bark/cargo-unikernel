@@ -55,7 +55,7 @@ pub(super) fn script_sev_snp_measurement(config: &Config) -> String {
     } else {
         let cmdline_q = shell_quote(&cmdline_for(config));
         format!(
-            "--kernel={dist_q}/{name_q}.bzImage --initrd={dist_q}/{name_q}.cpio \
+            "--kernel=/build-meta/{name_q}.bzImage --initrd=/build-meta/{name_q}.cpio \
              --append={cmdline_q}"
         )
     };
@@ -127,8 +127,8 @@ mod tests {
     fn non_uki_output_still_measures_bzimage_cpio_and_append_separately() {
         let config = sev_snp_config_with_formats(vec![OutputFormat::Cpio]);
         let script = script_sev_snp_measurement(&config);
-        assert!(script.contains("--kernel='/workspace/dist'/'test-app'.bzImage"));
-        assert!(script.contains("--initrd='/workspace/dist'/'test-app'.cpio"));
+        assert!(script.contains("--kernel=/build-meta/'test-app'.bzImage"));
+        assert!(script.contains("--initrd=/build-meta/'test-app'.cpio"));
         assert!(script.contains("--append="));
     }
 }

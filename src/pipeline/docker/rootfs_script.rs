@@ -48,16 +48,22 @@ pub(super) fn script_rootfs_and_images(config: &Config) -> String {
     let name_q = shell_quote(name);
     let _ = writeln!(
         s,
-        "(cd /build/rootfs && find . -mindepth 1 | LC_ALL=C sort | cpio -o -H newc -R 0:0 --reproducible) > {dist_q}/{name_q}.cpio"
+        "(cd /build/rootfs && find . -mindepth 1 | LC_ALL=C sort | cpio -o -H newc -R 0:0 --reproducible) > /build-meta/{name_q}.cpio"
     );
     let _ = writeln!(
         s,
-        "cp /build/linux-kernel/arch/x86/boot/bzImage {dist_q}/{name_q}.bzImage"
+        "cp /build/linux-kernel/arch/x86/boot/bzImage /build-meta/{name_q}.bzImage"
     );
 
     for format in &config.output.formats {
         match format {
-            OutputFormat::Cpio => {} // produced above
+            OutputFormat::Cpio => {
+                let _ = writeln!(
+                    s,
+                    "cp /build-meta/{name_q}.cpio {dist_q}/{name_q}.cpio && \
+                     cp /build-meta/{name_q}.bzImage {dist_q}/{name_q}.bzImage"
+                );
+            }
             OutputFormat::Binary => {
                 let _ = writeln!(
                     s,
@@ -65,16 +71,11 @@ pub(super) fn script_rootfs_and_images(config: &Config) -> String {
                 );
             }
             OutputFormat::Iso => {
-                // The 4th (cmdline) arg is required here, not optional — without it,
-                // make_iso.sh silently falls back to its own hardcoded default cmdline
-                // instead of this build's actual one, so the ISO would boot with different
-                // kernel behavior (no panic=-1, no lockdown=, wrong loglevel) than the
-                // cpio+bzImage/UKI pair from the exact same build.
                 let cmdline_q = shell_quote(&cmdline_for(config));
                 let _ = writeln!(
                     s,
-                    "/assets/scripts/make_iso.sh {dist_q}/{name_q}.bzImage {dist_q}/{name_q}.cpio \
-                     {dist_q}/{name_q}.iso {cmdline_q}"
+                    "/assets/scripts/make_iso.sh /build-meta/{name_q}.bzImage \
+                     /build-meta/{name_q}.cpio {dist_q}/{name_q}.iso {cmdline_q}"
                 );
             }
             OutputFormat::Uki => {
@@ -82,8 +83,8 @@ pub(super) fn script_rootfs_and_images(config: &Config) -> String {
                 let uname_q = shell_quote(&config.kernel.version);
                 let _ = writeln!(
                     s,
-                    "PYTHONHASHSEED=0 ukify build --linux={dist_q}/{name_q}.bzImage \
-                     --initrd={dist_q}/{name_q}.cpio --cmdline={cmdline_q} --uname={uname_q} \
+                    "PYTHONHASHSEED=0 ukify build --linux=/build-meta/{name_q}.bzImage \
+                     --initrd=/build-meta/{name_q}.cpio --cmdline={cmdline_q} --uname={uname_q} \
                      --output={dist_q}/{name_q}.efi"
                 );
             }
@@ -121,10 +122,6 @@ mod tests {
     fn iso_build_passes_the_actual_cmdline_not_the_script_default() {
         let config = casual_config_with_formats(vec![OutputFormat::Cpio, OutputFormat::Iso]);
         let script = script_rootfs_and_images(&config);
-        // make_iso.sh's cmdline arg is optional (falls back to its own hardcoded default if
-        // omitted) — confirm the pipeline always passes ours explicitly instead of silently
-        // relying on that fallback, which would boot the ISO with a different cmdline than
-        // the cpio+bzImage pair from the same build.
         assert!(script.contains("make_iso.sh"));
         assert!(script.contains("'/workspace/dist'/'test-app'.iso"));
         assert!(script.contains(&shell_quote(&cmdline_for(&config))));
@@ -152,6 +149,31 @@ mod tests {
         let config = casual_config_with_formats(vec![OutputFormat::Cpio, OutputFormat::Binary]);
         let script = script_rootfs_and_images(&config);
         assert!(script.contains("cp \"$APP_BIN\" '/workspace/dist'/'test-app'.bin"));
+    }
+
+    #[test]
+    fn uki_only_build_does_not_copy_cpio_or_bzimage_into_dist() {
+        // bzImage/cpio are always assembled (uki is built from them), but they're
+        // intermediate inputs, not a requested output — they should stay staged under
+        // `/build-meta` and never reach `dist/` unless `cpio` is itself in `output.formats`.
+        let config = casual_config_with_formats(vec![OutputFormat::Uki]);
+        let script = script_rootfs_and_images(&config);
+        assert!(script.contains("/build-meta/'test-app'.cpio"));
+        assert!(script.contains("/build-meta/'test-app'.bzImage"));
+        assert!(!script.contains("'/workspace/dist'/'test-app'.cpio"));
+        assert!(!script.contains("'/workspace/dist'/'test-app'.bzImage"));
+    }
+
+    #[test]
+    fn cpio_format_copies_staged_cpio_and_bzimage_into_dist() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        let script = script_rootfs_and_images(&config);
+        assert!(script.contains(
+            "cp /build-meta/'test-app'.cpio '/workspace/dist'/'test-app'.cpio"
+        ));
+        assert!(script.contains(
+            "cp /build-meta/'test-app'.bzImage '/workspace/dist'/'test-app'.bzImage"
+        ));
     }
 
     #[test]

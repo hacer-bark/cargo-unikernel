@@ -25,7 +25,7 @@ pub mod measurement_script;
 pub mod rootfs_script;
 
 use crate::pipeline::app_source::AcquiredApp;
-use crate::schema::Config;
+use crate::schema::{Config, OutputFormat};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -283,8 +283,21 @@ fn collect_artifacts(
     last_build_dir: &Path,
 ) -> Result<BuildArtifacts> {
     let name = &config.project.name;
-    let bzimage = dist_dir.join(format!("{name}.bzImage"));
-    let cpio = dist_dir.join(format!("{name}.cpio"));
+    // bzImage/cpio are always built (every other format is assembled from them), but only
+    // land in dist_dir when `cpio` was actually requested as an output format — otherwise
+    // they stay staged under last_build_dir (the host side of /build-meta). See
+    // script_rootfs_and_images.
+    let (bzimage, cpio) = if config.output.formats.contains(&OutputFormat::Cpio) {
+        (
+            dist_dir.join(format!("{name}.bzImage")),
+            dist_dir.join(format!("{name}.cpio")),
+        )
+    } else {
+        (
+            last_build_dir.join(format!("{name}.bzImage")),
+            last_build_dir.join(format!("{name}.cpio")),
+        )
+    };
     let iso = dist_dir.join(format!("{name}.iso"));
     let uki = dist_dir.join(format!("{name}.efi"));
     let binary = dist_dir.join(format!("{name}.bin"));
