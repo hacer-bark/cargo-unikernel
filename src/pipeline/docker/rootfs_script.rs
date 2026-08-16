@@ -168,12 +168,13 @@ mod tests {
     fn cpio_format_copies_staged_cpio_and_bzimage_into_dist() {
         let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
         let script = script_rootfs_and_images(&config);
-        assert!(script.contains(
-            "cp /build-meta/'test-app'.cpio '/workspace/dist'/'test-app'.cpio"
-        ));
-        assert!(script.contains(
-            "cp /build-meta/'test-app'.bzImage '/workspace/dist'/'test-app'.bzImage"
-        ));
+        assert!(
+            script.contains("cp /build-meta/'test-app'.cpio '/workspace/dist'/'test-app'.cpio")
+        );
+        assert!(
+            script
+                .contains("cp /build-meta/'test-app'.bzImage '/workspace/dist'/'test-app'.bzImage")
+        );
     }
 
     #[test]
