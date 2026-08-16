@@ -74,7 +74,7 @@ jobs:
             flags: --all-features
           - name: guest workspace (sev-snp confidential-computing profile)
             dir: guest
-            flags: --no-default-features --features sev-snp,attestation,net-ipv4
+            flags: --no-default-features --features sev-snp,net-ipv4
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

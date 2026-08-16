@@ -105,4 +105,3 @@ pub enum ProfileArg {
     /// AMD SEV-SNP confidential computing.
     SevSnp,
 }
-

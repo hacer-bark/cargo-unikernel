@@ -1,106 +1,54 @@
-# cargo-unikernel
+<div align="center">
+  <h1>cargo-unikernel</h1>
+  <p><strong>Turn a Rust project, another language's static build, or a pre-built binary into a minimal, hardened bootable unikernel image — ISO, cpio+kernel, UKI, with an optional AMD SEV-SNP confidential-computing profile.</strong></p>
 
-[![Crates.io](https://img.shields.io/crates/v/cargo-unikernel.svg)](https://crates.io/crates/cargo-unikernel)
-[![Docs.rs](https://img.shields.io/docsrs/cargo-unikernel)](https://docs.rs/cargo-unikernel)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](#minimum-supported-rust-version)
+  [![Crates.io](https://img.shields.io/crates/v/cargo-unikernel.svg?style=for-the-badge&color=fc8d62)](https://crates.io/crates/cargo-unikernel)
+  [![Docs.rs](https://img.shields.io/docsrs/cargo-unikernel?style=for-the-badge&color=66c2a5)](https://docs.rs/cargo-unikernel)
+  [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-8da0cb.svg?style=for-the-badge)](#license)
+  [![CI](https://img.shields.io/github/actions/workflow/status/hacer-bark/cargo-unikernel/ci.yml?label=CI&style=for-the-badge&color=e78ac3)](https://github.com/hacer-bark/cargo-unikernel/actions/workflows/ci.yml)
+</div>
 
-> **0.0.1, pre-release.** The config schema, CLI flags, and generated GitHub Actions workflow
-> can all still change between versions without warning. If you need something stable to
-> depend on today, wait for a 0.1 tag or pin an exact version and re-verify on upgrade —
-> `project.cargo_unikernel_version` in `cargo-unikernel.toml` exists specifically to make that
-> upgrade a deliberate, re-verified step rather than a silent one.
+<br/>
+
+> **0.0.1, pre-release.** Config schema, CLI flags, and the generated GitHub Actions workflow
+> can change between versions without warning. Pin an exact version
+> (`project.cargo_unikernel_version` in `cargo-unikernel.toml`) and re-verify on upgrade if
+> you need something stable today.
 
 ```sh
-cargo install cargo-unikernel --locked
+cargo install cargo-unikernel
 cd my-server/
 cargo unikernel build
 ```
 
-`--locked` pins every dependency to what's in this crate's own `Cargo.lock`, so two installs
-of the same `cargo-unikernel` version always resolve to the exact same build — without it,
-`cargo install` re-resolves dependency versions against whatever's newest on crates.io right
-now, which can silently vary between two installs of the same version.
+No config file, no template repo — `cargo install` puts the binary on `PATH`, Cargo's
+external-subcommand convention picks it up, and it drops into any project. Output is
+`.iso`, `.cpio`+kernel, UKI, or a raw app binary, with an optional AMD SEV-SNP profile.
 
-That's it — no config file, no separate repo, no template to fork. `cargo install` puts a
-`cargo-unikernel` binary on `PATH`, and Cargo's own external-subcommand convention (the same
-mechanism behind `cargo clippy`, `cargo fmt`, `cargo audit`, ...) picks it straight up, so
-`cargo unikernel <command>` just works. (`cargo-unikernel <command>` works identically, if
-calling the binary directly is preferred.) It drops into any project and turns it into a
-minimal, hardened, bootable unikernel image: no OS bloat, no shell, no package manager,
-nothing running except your app (and, optionally, a remote attestation endpoint). Pick
-`.iso`, `.cpio`+kernel, UKI, or the raw app binary as output, with an optional AMD SEV-SNP
-confidential-computing profile.
-
-**Any language works.** Rust is the default and the most polished path — zero-config,
-compiles straight from your `Cargo.toml` with no extra setup. But the tool doesn't assume
-Rust: bring a pre-built binary in any language/runtime with zero build-time trust decisions,
-or point it at a build command (Go, Zig, C, whatever produces a static binary) and it
-compiles from source the same reproducible way Rust does. See [Bringing your app
-in](#bringing-your-app-in) below for the three options side by side.
+**Any language works.** Rust is zero-config. Bring a pre-built binary in anything, or point
+the tool at a build command (Go, Zig, C, ...) for the same reproducible source build Rust
+gets. See [Bringing your app in](#bringing-your-app-in).
 
 ## What it is
 
-A unikernel image produced by `cargo-unikernel` is a Linux kernel, a tiny init binary, and
-one application binary, packed together with nothing else. There is no distribution layered
-on top of the kernel: no systemd, no bash, no coreutils, no package manager, no SSH daemon,
-no dynamic linker. The init process mounts a handful of filesystems, applies kernel/network
-hardening, execs the app as an unprivileged child, watches it, and powers the machine off the
-moment anything looks wrong. That's the entire runtime surface — see [How it
-works](#how-it-works) below and [`docs/architecture.md`](docs/architecture.md) for the full
-boot sequence.
+The output is a Linux kernel, a tiny init binary, and your app — nothing else. No systemd,
+bash, coreutils, package manager, SSH daemon, or dynamic linker. Init mounts a few
+filesystems, applies hardening, execs the app unprivileged, watches it, and powers off the
+instant anything looks wrong. Full boot sequence: [`docs/architecture.md`](docs/architecture.md).
 
 ## Why this over a container or a hand-built VM image
 
-The obvious alternative is a container (Docker/OCI) on a shared kernel, or a hand-rolled VM
-image built from a general-purpose distro. Both still carry a shell, a package manager, and a
-dynamic linker an attacker can pivot to after a compromise — `cargo-unikernel` strips those
-out entirely rather than trying to lock them down. That trade goes against you too: no shell
-means no live debugging by attaching to the running instance, no package manager means you
-can't patch a dependency without rebuilding, and the filesystem is RAM-only, so there is
-nowhere local for state to durably live across a reboot (see [Is cargo-unikernel right for
-your app?](#is-cargo-unikernel-right-for-your-app) below for the full list of what this rules
-out).
+A container or a general-purpose-distro VM image still carries a shell, a package manager,
+and a dynamic linker for an attacker to pivot to post-compromise. `cargo-unikernel` strips
+those out rather than locking them down — which also means no live debugging, no runtime
+patching, and a RAM-only filesystem with no local durable state (full list:
+[Is cargo-unikernel right for your app?](#is-cargo-unikernel-right-for-your-app)). In exchange:
 
-In exchange:
-
-### Performance
-
-Nothing else ever runs on this kernel. There's no container runtime, no cron, no log-shipping
-agent, no monitoring daemon, no other tenant's process competing for the scheduler or the
-CPU cache — every cycle and every byte of RAM the VM has belongs to the app. On top of that,
-the kernel itself is tuned for exactly this single-workload shape rather than for
-general-purpose multitasking: `CONFIG_PREEMPT_NONE` (there's nothing else to preempt for),
-BBR TCP congestion control, opt-in transparent hugepages, and a boot sequence that polls for
-network readiness instead of sleeping for a worst-case timeout. The image itself is small —
-a bare kernel, a small init, and the app — so boot is fast, which matters for anything that
-scales up and down rather than staying resident forever. See
-[`docs/architecture.md`](docs/architecture.md#kernel-cmdline-rationale) for the exact flags
-and the reasoning behind each one.
-
-### Security
-
-The threat model here is **zero trust in the OS**, because there effectively isn't one to
-trust: no shell to pivot to after a compromise, no package manager to pull in a second-stage
-payload, no dynamic linker or shared libraries for an attacker to hijack. The rootfs is
-read-only after boot, every other writable mount is `noexec` by default, the app's capability
-bounding set is dropped to empty before it ever runs, a mandatory seccomp filter permanently
-blocks `ptrace`, kernel-module loading, `mount`/`kexec`/`reboot`, and a handful of other
-post-exploitation syscalls, and `setrlimit` ceilings contain a compromised or buggy app's own
-resource use. None of this is opt-in configuration to remember to enable — it's the default
-shape of the image. A full break-down of what's defended against, attack by attack, lives in
-[`docs/threat_model.md`](docs/threat_model.md).
-
-### Confidential computing (AMD SEV-SNP)
-
-Set `profile.kind = "sev-snp"` and the same image gets a hardware root of trust: AMD's
-Secure Processor measures the kernel, init, and app before any of it executes, guest memory
-is encrypted with a hardware-derived per-VM key, and an optional in-guest attestation server
-proves to a remote party that this exact measured image — not a tampered one — is what's
-running right now. This moves the cloud provider, the hypervisor, and anyone with physical
-access to the host outside the trust boundary. See [Confidential computing
-(SEV-SNP)](#confidential-computing-sev-snp) below and
-[`docs/threat_model.md`](docs/threat_model.md) for the full trust-boundary diagram.
+| | |
+|:---|:---|
+| **Performance** | Nothing else runs on the kernel — no container runtime, no other tenant. `CONFIG_PREEMPT_NONE`, BBR congestion control, opt-in transparent hugepages, boot that polls instead of sleeping for timeouts. Small image, fast boot. Details: [architecture.md#kernel-cmdline-rationale](docs/architecture.md#kernel-cmdline-rationale). |
+| **Security** | Zero trust in the OS, because there's effectively none to trust. Read-only rootfs, `noexec` elsewhere, empty capability set before exec, a mandatory seccomp filter blocking `ptrace`/module-loading/`mount`/`kexec`/`reboot`/etc., `setrlimit` ceilings. None of it opt-in. Full catalog: [threat_model.md](docs/threat_model.md). |
+| **Confidential computing** | `profile.kind = "sev-snp"` gets a hardware root of trust: AMD's Secure Processor measures kernel+init+app before execution, memory is hardware-encrypted per-VM, `/dev/sev-guest` lets the app prove to a remote party this exact image is running. Puts the cloud provider and hypervisor outside the trust boundary. Details: [Confidential computing (SEV-SNP)](#confidential-computing-sev-snp). |
 
 ## How it works
 
@@ -110,96 +58,59 @@ flowchart LR
     B --> C["Pinned, reproducible<br/>Docker build container"]
     C --> D["Kernel + tiny init + your app,<br/>assembled into one rootfs"]
     D --> E["dist/: cpio+bzImage, .iso, and/or UKI"]
-    E -.->|"profile.kind = sev-snp"| F["Launch measurement +<br/>optional attestation server"]
+    E -.->|"profile.kind = sev-snp"| F["Launch measurement +<br/>encrypted guest memory"]
 ```
 
-Your project directory is mounted straight into a pinned build container — nothing is cloned
-or copied for a local build. Inside that container: the kernel is built from a pinned source
-with a curated hardening profile, the app is compiled (or, for a pre-built binary, verified
-and staged) and checked to confirm it's statically linked, the guest init is cross-compiled
-alongside it, and everything is assembled into a rootfs and packed into whichever output
-formats were requested. Everything the build needs beyond your own project — the Dockerfile,
-the kernel build script and Kconfig fragments, the ISO/UKI tooling, and the guest init's own
-source — is embedded directly inside the `cargo-unikernel` binary itself, so `cargo install
-cargo-unikernel` really is the whole install: nothing to clone, nothing to keep in sync with
-a separate template repo.
+Your project directory is mounted into a pinned build container — nothing cloned or copied.
+Inside: the kernel builds from pinned source with a curated hardening profile, the app
+compiles (or, for a pre-built binary, is verified and staged) and is checked for static
+linking, the guest init cross-compiles alongside it, everything assembles into a rootfs and
+packs into the requested formats. Every build dependency beyond your own project —
+Dockerfile, kernel Kconfig, ISO/UKI tooling, guest init source — is embedded in the
+`cargo-unikernel` binary itself.
 
-For the full pipeline stage by stage, the guest boot sequence, and the reasoning behind each
-kernel cmdline flag, see [`docs/architecture.md`](docs/architecture.md).
+Full pipeline stage by stage: [`docs/architecture.md`](docs/architecture.md).
 
 ## Is cargo-unikernel right for your app?
 
-Not every app can be turned into a unikernel this way. The build enforces a few hard
-requirements, so it's worth checking these before committing to the tool:
+Hard requirements, checked before committing to the tool:
 
-- **A fully static `x86_64-unknown-linux-musl` binary.** The build fails immediately (naming
-  the missing libraries) if the app binary has a dynamic linker segment or any `DT_NEEDED`
-  dependency — the rootfs never contains a dynamic linker or any shared library. Rust's
-  default target already produces this; other languages need to opt into static linking
-  (`CGO_ENABLED=0` for Go, `-Dtarget=x86_64-linux-musl` for Zig, `cc -static` for C). See
-  [Bringing your app in](#bringing-your-app-in).
-- **x86_64 only, today.** The kernel, the musl target, and (for the confidential-computing
-  profile) AMD SEV-SNP itself are all x86_64-specific.
-- **No durable local disk state.** The entire filesystem is RAM-only (tmpfs/initramfs); a
-  reboot starts fresh from the measured image every time, and nothing durably persists
-  locally across restarts. State that needs to survive belongs somewhere else — object
-  storage, an external database, an upstream queue.
-- **Everything the app needs has to already be in the binary at build time.** There's no
-  package manager and no shell to install anything at runtime, and the guest never fetches
-  the app itself over the network — it's baked into the image before the image is ever
-  measured or booted.
-- **A single embedded app binary**, though it's free to be internally multi-threaded or
-  multi-process (ordinary `fork`/`clone`/`execve` are untouched by the seccomp filter) — a
-  default `#[tokio::main]` runtime or an app that forks worker processes both work fine.
+- **A fully static `x86_64-unknown-linux-musl` binary.** Build fails immediately, naming
+  missing libraries, on any dynamic linker segment or `DT_NEEDED` dependency. Rust's default
+  target already qualifies; other languages need `CGO_ENABLED=0` (Go), `-Dtarget=...-musl`
+  (Zig), `cc -static` (C).
+- **x86_64 only.**
+- **Everything the app needs is baked in at build time.** No package manager, no runtime
+  fetch — the app is in the image before it's ever measured or booted.
+- **A single embedded app binary**, free to be multi-threaded or multi-process (ordinary
+  `fork`/`clone`/`execve` are untouched by seccomp).
 
-None of this is exotic for the kind of workload the tool targets — it mirrors how a
-well-behaved container image should already be built — but it does rule some things out.
+**Best fits:** standalone web/API servers, RAM-only workloads (caches, stream processors,
+ephemeral compute), apps whose persistent state already lives off-box, anything that already
+ships as a static binary, confidential-computing workloads that need the infra operator
+outside the trust boundary.
 
-**Best fits:**
-
-- Standalone web/API servers and network-facing services — the performance and security
-  properties above matter most exactly here.
-- Anything that's RAM-only by nature: caches, stream/event processors, ephemeral compute,
-  request-scoped workloads with no precise state to preserve between restarts.
-- Apps where all persistent state already lives off-box (object storage, a managed database,
-  a queue), so "the filesystem resets every boot" is a non-issue rather than a limitation.
-- Anything that already ships as a single self-contained static binary, or can be made to —
-  no runtime dependency fetching, no install step.
-- Confidential-computing workloads that need the infrastructure operator — cloud provider,
-  hypervisor admin, anyone with physical access to the host — outside the trust boundary.
-
-**Not a good fit:**
-
-- Apps that expect a full OS environment at runtime: shelling out to system tools, cron,
-  multiple cooperating system daemons, systemd units.
-- Anything that can't be statically linked, or that dynamically loads plugins/shared objects
-  at runtime.
-- Non-x86_64 targets.
-- Databases or other software that depends on durable local disk state surviving a reboot.
-- GUI applications, or anything needing a display server.
+**Not a good fit:** apps expecting a full OS at runtime (shelling out, cron, systemd units),
+anything that can't be statically linked or loads plugins at runtime, non-x86_64 targets,
+databases needing durable local disk, GUI apps.
 
 ## Bringing your app in
-
-Not a Rust project, or want more control? Three ways to get the app into the image, from
-least to most setup:
 
 | | How it works | Trust model | Setup |
 |:---|:---|:---|:---|
 | **Rust source build** | `cargo build`, cross-compiled to musl | Compiler never sees pre-built bytes | Zero-config, or `toolchain = "rust"` |
-| **Generic source build** | A `build_command` runs in the same reproducible container | Same as Rust — nothing pre-built ever touches the image | `toolchain = "generic"` + `build_command`/`output_binary` |
+| **Generic source build** | A `build_command` runs in the same reproducible container | Same as Rust — nothing pre-built touches the image | `toolchain = "generic"` + `build_command`/`output_binary` |
 | **Bring your own binary** | A local file — never fetched over the network | Trust whatever produced the binary | `[app.binary]` |
 
-The first two ("Mode A", compile from source) are functionally the same pipeline with a
-different last-mile build step — see `examples/cargo-unikernel.casual.toml`'s `[app.source]`
-section for a worked Go example (static binary, no dynamic libc). The third ("Mode B") works
-with literally anything, at the cost of trusting pre-built bytes instead of verifying a
-build. [`docs/toolchains.md`](docs/toolchains.md) goes through the trade-offs in more depth.
+The first two are the same pipeline with a different last-mile build step — see
+`examples/cargo-unikernel.casual.toml`'s `[app.source]` for a worked Go example. The third
+works with anything, at the cost of trusting pre-built bytes over a verified build. Trade-offs
+in depth: [`docs/toolchains.md`](docs/toolchains.md).
 
 ## Customizing with cargo-unikernel.toml
 
-The zero-config path always builds the `casual` profile with the Rust toolchain. To choose
-SEV-SNP, switch to a generic build command, pick specific output formats, use a pre-built
-binary, or tune hardening, scaffold a config:
+Zero-config always builds the `casual` profile with the Rust toolchain. To pick SEV-SNP, a
+generic build command, specific output formats, a pre-built binary, or tuned hardening:
 
 ```sh
 cargo-unikernel init # writes ./cargo-unikernel.toml
@@ -207,81 +118,43 @@ nano cargo-unikernel.toml
 cargo-unikernel build
 ```
 
-`cargo-unikernel init --profile <casual|sev-snp>` picks which starting point to scaffold.
-See `examples/cargo-unikernel.casual.toml` and `examples/cargo-unikernel.sev-snp.toml` —
-each is a fully-commented starting point that documents every app-acquisition mode
-(Rust source, generic source, or a pre-built binary) inline.
+`cargo-unikernel init --profile <casual|sev-snp>` picks the starting point. See
+`examples/cargo-unikernel.casual.toml` and `examples/cargo-unikernel.sev-snp.toml` — each is
+a fully-commented reference covering all three app-acquisition modes.
 
-## Granular control: kernel version, hardening, and caching
+## Granular control
 
-Every knob is exposed and exhaustively documented inline in the example configs — open
-`examples/cargo-unikernel.casual.toml` for the full reference (every field, its type,
-allowed values, and default). The highlights:
+Every knob is documented inline in the example configs (`examples/cargo-unikernel.casual.toml`
+has the full field reference). Highlights:
 
-- **`[kernel]`**: pin the exact Linux kernel `version` to build (and optionally its
-  `sha256`).
-- **`[hardening.kernel]`**: named build-time (Kconfig) toggles — legacy subsystems,
-  debug interfaces, KSPP self-protection + Lockdown LSM, exploit mitigations, seccomp — each
-  on by default, each independently toggleable, chosen to cost as little performance as
-  possible for the security they buy (see [`docs/architecture.md`](docs/architecture.md)'s
-  hardening notes for the specific trade-offs made, e.g. why the seccomp-friendly BPF JIT
-  stays enabled while unprivileged BPF loading doesn't).
-- **`[hardening.runtime]`**: named boot-time (sysctl) toggles — network spoofing
-  protection, ICMP hardening, TCP hardening (+ a keep-alive throughput tweak), info-leak
-  restriction, ptrace/BPF restriction (+ JIT hardening), kexec/filesystem protection — same
-  default-on, independently toggleable shape.
-- **`extra_sysctls`/`extra_kernel_config`**: raw escape hatches for exact, per-flag control
-  beyond the curated categories above.
-- **`[attestation]`**: omit this section (or set `enabled = false`) and the guest init
-  doesn't even compile the attestation server's code — smaller binary, fewer moving parts, if
-  remote attestation isn't needed. When it is compiled in, it adds no third-party
-  dependencies: the server is plain blocking sockets over `libc`, not an async runtime. See
-  [`docs/attestation_api.md`](docs/attestation_api.md) for the wire protocol.
-- **Always on, not configurable**: a seccomp denylist permanently blocking `ptrace`, kernel-
-  module loading, `mount`/`kexec`/`reboot`, and a handful of other syscalls with no
-  legitimate use in a single-purpose server — the app process is killed immediately on any
-  attempt, which the existing watchdog turns into a full VM reboot. Ordinary threads and
-  child processes are unaffected. The app's capability bounding set is also unconditionally
-  dropped to empty before exec (defense-in-depth beyond the uid/gid drop below — nothing in
-  this image ever execs a capability-holding process). See
-  [`docs/architecture.md`](docs/architecture.md).
-- **`[app.runtime.limits]`**: `setrlimit` ceilings (`max_open_files`, `max_processes`,
-  `max_memory_mb`, `max_locked_memory_mb`) applied to the app's process before exec — contains
-  a compromised or buggy app forking itself into a fork bomb, exhausting file descriptors,
-  growing unboundedly in memory, or pinning all of guest RAM. All optional, with generous
-  built-in defaults (65536 files, 2048 processes, no address-space cap, 64 MiB lockable) that
-  ordinary workloads shouldn't hit.
-- **`[app.runtime.danger]`**: everything here is off by default and named to be hard to
-  enable by accident. `allow_write_execute` is the one opt-out from "no writable+executable
-  path anywhere in the guest" — only turn it on if the app genuinely needs to write and run
-  new code at runtime.
+| Section | Controls |
+|:---|:---|
+| `[kernel]` | Pin the exact Linux kernel `version` (and optionally `sha256`). |
+| `[hardening.kernel]` | Build-time Kconfig toggles — legacy subsystems, debug interfaces, KSPP + Lockdown LSM, exploit mitigations, seccomp. On by default, independently toggleable. |
+| `[hardening.runtime]` | Boot-time sysctl toggles — spoofing protection, ICMP/TCP hardening, info-leak restriction, ptrace/BPF restriction, kexec/filesystem protection. Same default-on shape. |
+| `extra_sysctls` / `extra_kernel_config` | Raw escape hatches beyond the curated categories. |
+| `[app.runtime.limits]` | `setrlimit` ceilings (open files, processes, memory, locked memory) applied pre-exec. Generous defaults; optional. |
+| `[app.runtime.danger]` | Off by default, named to be hard to enable by accident. `allow_write_execute` is the one opt-out from "no writable+executable path anywhere in the guest." |
 
-**Caching.** The Linux kernel source tarball (~150MB) and, for a given kernel
-version+hardening config, the *compiled* bzImage are both cached under
-`~/.cache/cargo-unikernel/` — change your app code or output formats and the kernel step is
-skipped entirely; change a hardening toggle or kernel version and only that gets rebuilt.
-`ccache` covers the compiler invocations for everything else. `cargo-unikernel github init`'s
-generated workflow caches this same directory (plus the cargo install itself) across CI runs
-via `actions/cache` — and, since GitHub Actions cache scopes are isolated per tag (a cache
-from one release can never be reused by another), also builds on every push to `main` so a
-warm cache actually exists for tag-triggered releases to inherit; see [CI/CD via GitHub
-Actions](#cicd-via-github-actions) below for what this means for build time.
+**Always on, not configurable:** a seccomp denylist blocking `ptrace`, module loading,
+`mount`/`kexec`/`reboot`, and similar syscalls with no legitimate use in a single-purpose
+server — the app is killed on any attempt, which the watchdog turns into a full reboot. The
+capability bounding set is unconditionally dropped to empty before exec. See
+[`docs/architecture.md`](docs/architecture.md).
 
-**Clean output.** `dist/` (or wherever `[output].dir` points) only ever contains the actual
-build artifacts requested — the generated in-container build script and other internal
-scratch files live under `~/.cache/cargo-unikernel/last-build/` instead, out of the way,
-but still there to inspect if a build fails.
+**Caching.** The kernel source tarball and the compiled bzImage (per kernel version +
+hardening config) are cached under `~/.cache/cargo-unikernel/` — an app-only change skips the
+kernel step entirely. `ccache` covers everything else. `cargo-unikernel github init`'s
+workflow caches the same directory across CI runs, and also builds (never publishes) on every
+push to `main` so a tag-triggered release always inherits a warm cache (GitHub Actions cache
+scopes are isolated per tag).
 
-## Why build-time embedding
+**Clean output.** `dist/` only ever contains the requested build artifacts; scratch files
+live under `~/.cache/cargo-unikernel/last-build/`, inspectable if a build fails.
 
-The app binary is compiled/verified and baked into the image **at build time**, never
-fetched by the guest over the network at boot. That means no runtime network dependency for
-the app to start, no signing-key management, no time-of-check/time-of-use gap — and for
-SEV-SNP builds, the launch measurement already deterministically covers the exact app
-bytes, because measuring the image *is* measuring the app. The guest-side init is
-intentionally tiny: mount filesystems, apply kernel/sysctl hardening, exec the app as an
-unprivileged child, watch it, and power off immediately if anything looks wrong. See
-[`docs/init_security.md`](docs/init_security.md) for the full rationale.
+The app binary is compiled/verified and baked into the image **at build time** — the guest
+never fetches it over the network at boot. No runtime dependency, no signing-key management,
+no TOCTOU gap, and for SEV-SNP the launch measurement already covers the exact app bytes.
 
 ## CLI
 
@@ -290,97 +163,75 @@ unprivileged child, watch it, and power off immediately if anything looks wrong.
 - `cargo-unikernel measure` — recompute the SEV-SNP launch measurement from already-built
   artifacts without a full rebuild (`sev-snp` profile only).
 - `cargo-unikernel doctor` — check the host toolchain (Docker, git, gh).
-- `cargo-unikernel github init` — write `.github/workflows/cargo-unikernel.yml`, so a tag
-  push (any `v*` tag) builds and publishes a GitHub Release with the built image,
-  automatically. See [CI/CD via GitHub Actions](#cicd-via-github-actions) below.
-- `cargo-unikernel release` — build (unless `--no-build`) and publish a GitHub Release with
-  the built artifacts right now, via the `gh` CLI — the one-call path `github init`'s
-  workflow also uses under the hood. Which artifacts get attached and the release's
-  title/notes/draft/prerelease flags are configurable via an optional `[release]` section
-  in `cargo-unikernel.toml`; see `examples/cargo-unikernel.casual.toml` for every knob.
+- `cargo-unikernel github init` — write `.github/workflows/cargo-unikernel.yml`: a `v*` tag
+  push builds and publishes a GitHub Release automatically.
+- `cargo-unikernel release` — build (unless `--no-build`) and publish a GitHub Release via
+  `gh` right now. Attached artifacts and release title/notes/draft/prerelease are
+  configurable via `[release]` in `cargo-unikernel.toml`.
 
 ## CI/CD via GitHub Actions
 
-`cargo-unikernel github init` writes a complete release workflow: on every `v*`-matching tag
-push, it installs `cargo-unikernel`, builds, and publishes the result as a GitHub Release. It
-also builds (never publishes) on every push to `main`, purely to keep the cache warm — see
-**Caching** above for why that matters for tag-triggered releases specifically. The tag glob
-is `v*`, not a strict `vX.Y.Z` semver check, so any tag starting with `v` triggers it.
+`cargo-unikernel github init` writes a workflow that, on every `v*`-glob tag push, installs
+`cargo-unikernel`, builds, and publishes a GitHub Release. It also builds (never publishes) on
+every push to `main`, purely to keep the cache warm.
 
-If the config passed to `github init` (`--config`, default `cargo-unikernel.toml`) pins
-`project.cargo_unikernel_version`, the generated workflow installs that exact version
-(`cargo install cargo-unikernel --version <pinned> --locked`) instead of whatever's newest —
-CI builds with the same CLI version the config was written against, and `cargo-unikernel
-build` still fails closed (`ValidationError::ToolVersionMismatch`) if a different version
-ever ends up running against it anyway (e.g. a stale cache). Re-run `github init` after
-pinning or changing the version, once the old workflow file is deleted, to pick it up.
+If `cargo-unikernel.toml` pins `project.cargo_unikernel_version`, the generated workflow
+installs that exact version instead of latest — `cargo-unikernel build` also fails closed
+(`ValidationError::ToolVersionMismatch`) if a different version ever runs against it. Re-run
+`github init` after changing the pin.
 
 > [!IMPORTANT]
-> **The first build in a fresh environment compiles a complete Linux kernel from source
-> inside the pinned container, and that takes a while — expect around 25 minutes.** This is
-> normal, not a hang or a misconfiguration: it's a real kernel build, not a cache miss on
-> something small. Every build after that, in CI or locally, shares the kernel source and
-> compiled-bzImage cache described above and typically finishes in a few minutes, as long as
-> the kernel version and hardening config haven't changed.
+> **The first build in a fresh environment compiles a full Linux kernel from source — expect
+> around 25 minutes.** Not a hang. Every build after that shares the kernel/bzImage cache and
+> typically finishes in a few minutes, as long as the kernel version and hardening config
+> haven't changed.
 
-Pass `--attest-provenance` to also add a GitHub build-provenance attestation step
-(`actions/attest-build-provenance`) for the published artifacts — a Sigstore-backed,
-GitHub-verifiable proof that this exact workflow run, from this exact commit, produced these
-exact bytes (`gh attestation verify <file> --repo <owner>/<repo>`). Off by default: it
-requires granting the workflow `id-token: write`/`attestations: write`, so it's opt-in
-rather than assumed. (This is a supply-chain provenance attestation via GitHub's own
-Sigstore-backed infrastructure — a different thing from this project's own `[attestation]`
-section, which is AMD SEV-SNP hardware remote attestation of a *running* guest.)
+`--attest-provenance` adds a GitHub build-provenance attestation step
+(`actions/attest-build-provenance`) — a Sigstore-backed, GitHub-verifiable proof that this
+exact workflow run produced these exact bytes. Off by default (requires
+`id-token: write`/`attestations: write`). This is supply-chain provenance about the released
+bytes — distinct from an app's own SEV-SNP report about a *running* guest.
 
 ## Confidential computing (SEV-SNP)
 
 Set `profile.kind = "sev-snp"` and a `[sev_snp]` section (`vcpus`, `vcpu_type`,
-`kernel_cmdline`). sev-snp also requires `project.cargo_unikernel_version` to be set (the
-only profile where it's mandatory, not optional) — a different CLI version can bundle a
-different pinned kernel/Dockerfile, which would silently change the launch measurement
-otherwise; `cargo-unikernel build`/`measure` refuse to run unpinned, or under a different
-version than the one pinned. `cargo-unikernel init --profile sev-snp` sets this
-automatically. `cargo-unikernel build` will then:
+`kernel_cmdline`). This is the only profile where `project.cargo_unikernel_version` is
+mandatory — a different CLI version can bundle a different pinned kernel/Dockerfile, which
+would silently change the launch measurement. `build`/`measure` refuse to run unpinned or
+under a mismatched version. `cargo-unikernel init --profile sev-snp` sets this automatically.
 
-1. Build the kernel with the SEV-SNP guest-attestation Kconfig fragment layered on top of
-   the universal hardening baseline.
-2. Compute the launch measurement with `virtee/sev-snp-measure`, using *exactly* the vcpu
-   count/type and kernel cmdline configured — the same cmdline is baked into the UKI's
-   `.cmdline` section, so what's measured and what boots can never drift.
-3. Write `dist/sev_measurement.txt` (the raw measurement) and `dist/sev_measurement.json`
-   (a sidecar recording every input that produced it, plus a `component_sha256` block —
-   individual sha256 hashes of the kernel, the cpio, the raw app binary, `cargo-unikernel-
-   init`, and the OVMF firmware used — so two builds that produced different measurements
-   can be diffed component-by-component instead of only knowing the final hash differs).
-4. Optionally enable the remote-attestation server (`[attestation]`) — see
-   [`docs/attestation_api.md`](docs/attestation_api.md) for its request/response format and
-   how a remote party verifies a report.
+`cargo-unikernel build` then:
 
-**Bring your own OVMF.** By default, `preset = "builtin"` uses the AMD SEV-SNP firmware baked
-directly into the `cargo-unikernel` binary itself — hash-pinned, never fetched over the
-network at build time (see [`docs/reproducible_builds.md`](docs/reproducible_builds.md)).
-Different cloud providers ship different OVMF/UEFI firmware builds for SEV-SNP, though, so
-`[sev_snp.ovmf]` also accepts a local `path` to firmware the provider supplied — always a
-local file, never a URL. See `examples/cargo-unikernel.sev-snp.toml`.
+1. Builds the kernel with the SEV-SNP attestation Kconfig fragment on top of the hardening
+   baseline.
+2. Computes the launch measurement with `virtee/sev-snp-measure`, using the exact vcpu
+   count/type and kernel cmdline configured — the same cmdline is baked into the UKI, so what's
+   measured and what boots can't drift.
+3. Writes `dist/sev_measurement.txt` and `dist/sev_measurement.json` (every input, plus
+   per-component sha256 hashes for diffing two divergent builds).
+4. Leaves `/dev/sev-guest` readable to the app. Proving the measurement to a remote peer is
+   the app's protocol — see [`docs/threat_model.md`](docs/threat_model.md#remote-attestation-is-the-apps-job).
 
-For sev-snp, build via a tagged release workflow (`cargo-unikernel github init`) so the
-measurement corresponds to an immutable, inspectable commit rather than whatever's
-uncommitted on disk. ISO output is available for sev-snp builds too, as a convenience/testing
-image — the artifact that's actually measured is the cpio+bzImage (or UKI) pair, and a
-benign `xorriso ... WARNING: EFI boot equipment is
-provided but no directory /EFI/BOOT` may appear during ISO builds specifically — see
-[`docs/architecture.md`](docs/architecture.md)'s note on it if that looks alarming the first
-time.
+**Bring your own OVMF.** `preset = "builtin"` (default) uses the AMD SEV-SNP firmware baked
+into the binary, hash-pinned, never fetched over the network. Different cloud providers ship
+different OVMF builds — `[sev_snp.ovmf]` also accepts a local `path` (never a URL). See
+`examples/cargo-unikernel.sev-snp.toml`.
+
+Build sev-snp via a tagged release workflow so the measurement corresponds to an immutable
+commit rather than uncommitted local state. ISO output works for sev-snp too as a
+convenience/testing artifact — the measured artifact is always cpio+bzImage or UKI. A benign
+`xorriso ... WARNING: EFI boot equipment is provided but no directory /EFI/BOOT` may appear
+during ISO builds — see [`docs/architecture.md`](docs/architecture.md) if that looks alarming.
 
 ## Minimum supported Rust version
 
-**This crate requires Rust 1.88 or newer** — the config-validation code relies on `if let`
-chains, stabilized in 1.88. This is the version needed to build `cargo-unikernel` itself; it
-has no bearing on your app's own toolchain, which is pinned independently inside the build
-container (see [`docs/reproducible_builds.md`](docs/reproducible_builds.md)). Bumping the
-MSRV is a minor-version change, not treated as a breaking one, while the crate stays pre-1.0.
+**Rust 1.88+** — config-validation code relies on `if let` chains, stabilized in 1.88. This
+is what's needed to build `cargo-unikernel` itself; it has no bearing on your app's own
+toolchain, pinned independently inside the build container (see
+[`docs/reproducible_builds.md`](docs/reproducible_builds.md)). MSRV bumps are minor-version
+changes while the crate stays pre-1.0.
 
-## Project layout (this repo — building cargo-unikernel itself)
+## Project layout
 
 ```
 Cargo.toml    the published CLI crate itself — `cargo install cargo-unikernel`
@@ -401,8 +252,7 @@ docs/         architecture, toolchain trade-offs, threat model,
 
 ## Documentation
 
-Start at [`docs/README.md`](docs/README.md) for the full index and suggested reading paths
-depending on what's being evaluated. Direct links:
+Start at [`docs/README.md`](docs/README.md) for the full index. Direct links:
 
 - [`docs/architecture.md`](docs/architecture.md) — how the pieces fit together: host CLI,
   build container, guest init, boot sequence, kernel cmdline rationale.
@@ -411,10 +261,6 @@ depending on what's being evaluated. Direct links:
   each profile.
 - [`docs/reproducible_builds.md`](docs/reproducible_builds.md) — the determinism story, and
   how to verify a build independently.
-- [`docs/attestation_api.md`](docs/attestation_api.md) — the remote-attestation HTTP server's
-  wire protocol and how to verify a report.
-- [`docs/init_security.md`](docs/init_security.md) — why the guest embeds the app at build
-  time instead of fetching it at runtime, and what security machinery the init runs.
 
 ## License
 
@@ -428,3 +274,4 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 this crate, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
+</content>

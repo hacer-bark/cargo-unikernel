@@ -2,12 +2,14 @@
 name = "cargo-unikernel-init"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Minimal guest PID-1 embedded into cargo-unikernel images."
 readme = "README.md"
-repository = "https://codeberg.org/hacer-bark/cargo-unikernel"
-keywords = ["unikernel", "sev-snp", "guest", "pid1"]
-categories = ["os", "no-std"]
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "cargo-unikernel-init"
@@ -15,7 +17,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-attestation = []
 sev-snp = []
 net-ipv4 = ["cargo-unikernel-common/net-ipv4"]
 net-ipv6 = ["cargo-unikernel-common/net-ipv6"]
@@ -27,9 +28,6 @@ hardening-ptrace-bpf = ["cargo-unikernel-common/hardening-ptrace-bpf"]
 hardening-kexec-fs = ["cargo-unikernel-common/hardening-kexec-fs"]
 danger-allow-write-execute = ["cargo-unikernel-common/danger-allow-write-execute"]
 storage-persistent = ["cargo-unikernel-common/storage-persistent"]
-# DANGER: suppresses panic_shutdown's power-off, halting instead so a fatal error can be read
-# off a slow-to-connect console. Never compile this into a real deployment.
-debug-mode = []
 
 [dependencies]
 cargo-unikernel-common = { path = "../cargo-unikernel-common" }

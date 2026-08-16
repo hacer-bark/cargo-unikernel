@@ -96,14 +96,12 @@ fn build_config(name: String, app: App) -> Config {
         kernel: Kernel::default(),
         toolchain: ToolchainPins::default(),
         hardening: Hardening::default(),
-        attestation: None,
         sev_snp: None,
         output: Output {
             formats: vec![OutputFormat::Cpio, OutputFormat::Iso],
             dir: "dist/".to_string(),
         },
         release: Release::default(),
-        debug: false,
     }
 }
 

@@ -62,8 +62,7 @@ pub fn stage(ovmf: &OvmfSource, project_dir: &Path, output_dir: &str) -> Result<
     let src = project_dir.join(path);
     let bytes = std::fs::read(&src)
         .with_context(|| format!("failed to read sev_snp.ovmf.path {}", src.display()))?;
-    std::fs::write(&dest, bytes)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    std::fs::write(&dest, bytes).with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
 

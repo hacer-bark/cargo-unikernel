@@ -5,9 +5,6 @@
 
 #![forbid(unsafe_op_in_unsafe_fn, elided_lifetimes_in_paths)]
 
-#[cfg(feature = "attestation")]
-mod attestation;
-
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -19,11 +16,13 @@ const APP_PATH: &str = env!("CARGO_UNIKERNEL_APP_PATH");
 const APP_UID: &str = env!("CARGO_UNIKERNEL_APP_UID");
 const APP_GID: &str = env!("CARGO_UNIKERNEL_APP_GID");
 const APP_ENV: &str = env!("CARGO_UNIKERNEL_APP_ENV");
-#[cfg(feature = "attestation")]
-const ATTEST_UID: &str = env!("CARGO_UNIKERNEL_ATTEST_UID");
-#[cfg(feature = "attestation")]
-const ATTEST_GID: &str = env!("CARGO_UNIKERNEL_ATTEST_GID");
 const EXTRA_SYSCTLS: &str = env!("CARGO_UNIKERNEL_EXTRA_SYSCTLS");
+#[cfg(feature = "net-ipv6")]
+const IPV6_STATIC: &str = env!("CARGO_UNIKERNEL_IPV6_STATIC");
+#[cfg(feature = "net-ipv6")]
+const IPV6_GATEWAY: &str = env!("CARGO_UNIKERNEL_IPV6_GATEWAY");
+#[cfg(feature = "net-ipv6")]
+const IPV6_IFACE: &str = env!("CARGO_UNIKERNEL_IPV6_IFACE");
 
 const LIMIT_NOFILE: &str = env!("CARGO_UNIKERNEL_LIMIT_NOFILE");
 const LIMIT_NPROC: &str = env!("CARGO_UNIKERNEL_LIMIT_NPROC");
@@ -34,13 +33,13 @@ const LIMIT_MEMLOCK_MB: &str = env!("CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB");
 ///
 /// A pair with no `=` runs the wipe protocol rather than being silently dropped — these
 /// strings come from validated host-side config, so a malformed one means the two sides
-/// disagree about the encoding. `what` names the setting in the panic message.
+/// disagree about the encoding. `what` names the setting in the shutdown message.
 fn parse_pairs<'a>(raw: &'a str, what: &str) -> Vec<(&'a str, &'a str)> {
     raw.split(';')
         .filter(|s| !s.is_empty())
         .map(|pair| {
             pair.split_once('=').unwrap_or_else(|| {
-                panic_shutdown(&format!(
+                fatal_shutdown(&format!(
                     "Malformed entry in {what}: {pair:?} is not a 'key=value' pair"
                 ))
             })
@@ -48,31 +47,21 @@ fn parse_pairs<'a>(raw: &'a str, what: &str) -> Vec<(&'a str, &'a str)> {
         .collect()
 }
 
-/// Every `*_uid`/`*_gid`/`limit_*` accessor below parses a build-time-baked constant (see
-/// `build.rs`) rather than untrusted runtime input, but a malformed override is still
-/// something this process can observe at its own runtime — so a parse failure runs the wipe
-/// protocol via [`panic_shutdown`] rather than unwinding.
-fn app_uid() -> u32 {
-    APP_UID
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_APP_UID must be a u32"))
+/// Parses a build-time-baked constant (see `build.rs`) rather than untrusted runtime input, but
+/// a malformed override is still something this process can only observe at its own runtime —
+/// so a parse failure runs the wipe protocol via [`fatal_shutdown`] rather than unwinding.
+/// `what` names the constant in the shutdown message.
+fn baked<T: std::str::FromStr>(raw: &str, what: &str) -> T {
+    raw.parse().unwrap_or_else(|_| {
+        fatal_shutdown(&format!("{what} must be a {}", std::any::type_name::<T>()))
+    })
 }
-fn app_gid() -> u32 {
-    APP_GID
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_APP_GID must be a u32"))
-}
-#[cfg(feature = "attestation")]
-fn attest_uid() -> u32 {
-    ATTEST_UID
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_ATTEST_UID must be a u32"))
-}
-#[cfg(feature = "attestation")]
-fn attest_gid() -> u32 {
-    ATTEST_GID
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_ATTEST_GID must be a u32"))
+
+fn app_ids() -> (u32, u32) {
+    (
+        baked(APP_UID, "CARGO_UNIKERNEL_APP_UID"),
+        baked(APP_GID, "CARGO_UNIKERNEL_APP_GID"),
+    )
 }
 
 fn log(msg: &str) {
@@ -97,78 +86,58 @@ fn is_pid1() -> bool {
     std::process::id() == 1
 }
 
-/// Logs a fatal error and exits the calling child, without touching the VM.
+/// Logs a fatal error and exits, without touching the VM.
 ///
-/// A child can't power off: `drop_privileges` already removed `CAP_SYS_BOOT`, and `reboot` is
-/// seccomp-denied. Exiting gets to the same place one hop later, via PID 1's watchdog treating
-/// the exit as a compromise. Runs even under `debug-mode` — a child parked in the debug halt
-/// loop would stay alive and the watchdog would never fire.
-fn child_fatal_exit(message: &str) -> ! {
+/// Only reachable when this binary is running as something other than PID 1 — which nothing in
+/// a built image does, since PID 1 spawns the app binary and never re-execs itself. A process
+/// that got here anyway can't power off (it is not PID 1, so it has neither `CAP_SYS_BOOT` nor
+/// the standing to `kill(-1)`), and exiting is the only safe thing left.
+fn non_pid1_fatal_exit(message: &str) -> ! {
     eprintln!("\n======================================================================");
-    eprintln!("FATAL (child PID {}): {message}", std::process::id());
-    eprintln!("Exiting — PID 1's watchdog will take the guest down.");
+    eprintln!("FATAL (PID {}): {message}", std::process::id());
+    eprintln!("Exiting — only PID 1 may run the guest's shutdown protocol.");
     eprintln!("======================================================================\n");
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(1);
 }
 
-/// The guest's wipe-and-exit protocol for any unrecoverable or integrity-compromising error.
+/// The guest's wipe-and-shutdown protocol for any unrecoverable or integrity-compromising error.
 ///
-/// Never unwinds or returns. From PID 1, logs and powers the VM off immediately; from a child,
-/// defers to [`child_fatal_exit`]. This is the *only* sanctioned way any critical failure in
-/// this crate ends — production code paths call this instead of panicking so a bug or bypassed
-/// check fails safely rather than continuing in an unknown state.
+/// Never unwinds or returns. From PID 1, kills every other process, zeroes the same writable
+/// state a graceful stop zeroes, and powers off; anywhere else, defers to
+/// [`non_pid1_fatal_exit`]. This is the *only* sanctioned way any critical failure in this crate
+/// ends — production code paths call this instead of panicking so a bug or bypassed check fails
+/// safely rather than continuing in an unknown state.
 ///
-/// Two implementations selected by the `debug-mode` feature, not a runtime flag: the
-/// "stay up and halt instead of powering off" behavior below must never exist in a binary
-/// that wasn't deliberately built with it — see that feature's doc comment in Cargo.toml.
-#[cfg(not(feature = "debug-mode"))]
-pub(crate) fn panic_shutdown(message: &str) -> ! {
+/// Wiping rather than powering off on the spot: a bare `reboot(2)` leaves every tmpfs page the
+/// app wrote sitting in guest RAM, and a fatal error is not a reason to protect that data less
+/// carefully than an orderly stop does. The wipe cannot delay the power-off unboundedly — see
+/// [`cargo_unikernel_common::shutdown::wipe_and_power_off`] for the deadline and re-entry
+/// guarantees that make "try to clean up" safe on a path that only runs when something is
+/// already wrong.
+///
+/// There is deliberately no build that suppresses the power-off to keep a failed guest alive
+/// for inspection: a fatal error means the guest's state is already untrusted, and any binary
+/// carrying that behavior could be deployed by mistake.
+fn fatal_shutdown(message: &str) -> ! {
     if !is_pid1() {
-        child_fatal_exit(message);
+        non_pid1_fatal_exit(message);
     }
 
     eprintln!("\n======================================================================");
     eprintln!("FATAL: {message}");
-    eprintln!("PANIC SHUTDOWN: Powering off immediately.");
+    eprintln!("SHUTDOWN: wiping writable state, then powering off.");
     eprintln!("======================================================================\n");
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    // SAFETY: plain integer command code, no pointers; PID 1 is who is allowed to call it.
-    unsafe {
-        libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
-    }
-    std::process::exit(1);
-}
-
-/// `debug-mode` build: suppresses the power-off so a fatal error can be read off a
-/// slow-to-connect console instead of vanishing with the guest. Never compiled into a real
-/// deployment — see this feature's doc comment in Cargo.toml.
-#[cfg(feature = "debug-mode")]
-pub(crate) fn panic_shutdown(message: &str) -> ! {
-    if !is_pid1() {
-        child_fatal_exit(message);
-    }
-
-    eprintln!("\n======================================================================");
-    eprintln!("FATAL: {message}");
-    eprintln!("PANIC SHUTDOWN SUPPRESSED (debug-mode): guest stays up. Not secure.");
-    eprintln!("======================================================================\n");
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
-    loop {
-        eprintln!("[DEBUG] Halted after fatal error (see above). Guest intentionally not powered off.");
-        let _ = std::io::stderr().flush();
-        std::thread::sleep(std::time::Duration::from_secs(30));
-    }
+    cargo_unikernel_common::shutdown::wipe_and_power_off(log);
 }
 
 /// Marks PID 1 non-dumpable, so `/proc/1/mem`/`maps` stay unreadable.
 ///
-/// Not applied in the children's `pre_exec` chain — `execve` resets `dumpable` on any exec
+/// Not applied in the app's `pre_exec` chain — `execve` resets `dumpable` on any exec
 /// that isn't a "secure exec", and [`drop_privileges`] switches uid *before* the exec, so it
 /// would just get cleared again there. PID 1 never execs, so here it sticks. The app is
 /// covered instead by `yama ptrace_scope=3`, the seccomp `ptrace`/`process_vm_readv`/`writev`
@@ -222,27 +191,6 @@ fn drop_privileges(uid: u32, gid: u32) -> impl Fn() -> std::io::Result<()> {
     }
 }
 
-fn limit_nofile() -> u64 {
-    LIMIT_NOFILE
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_LIMIT_NOFILE must be a u64"))
-}
-fn limit_nproc() -> u64 {
-    LIMIT_NPROC
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_LIMIT_NPROC must be a u64"))
-}
-fn limit_as_mb() -> u64 {
-    LIMIT_AS_MB
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_LIMIT_AS_MB must be a u64"))
-}
-fn limit_memlock_mb() -> u64 {
-    LIMIT_MEMLOCK_MB
-        .parse()
-        .unwrap_or_else(|_| panic_shutdown("CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB must be a u64"))
-}
-
 /// Caps the child's open-file, process/thread, locked-memory and (optionally) address-space
 /// limits before exec.
 ///
@@ -257,13 +205,20 @@ fn limit_memlock_mb() -> u64 {
 /// below are exact, never lossy.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn apply_resource_limits() -> std::io::Result<()> {
-    set_rlimit(libc::RLIMIT_NOFILE as libc::c_int, limit_nofile())?;
-    set_rlimit(libc::RLIMIT_NPROC as libc::c_int, limit_nproc())?;
+    set_rlimit(
+        libc::RLIMIT_NOFILE as libc::c_int,
+        baked(LIMIT_NOFILE, "CARGO_UNIKERNEL_LIMIT_NOFILE"),
+    )?;
+    set_rlimit(
+        libc::RLIMIT_NPROC as libc::c_int,
+        baked(LIMIT_NPROC, "CARGO_UNIKERNEL_LIMIT_NPROC"),
+    )?;
     set_rlimit(
         libc::RLIMIT_MEMLOCK as libc::c_int,
-        limit_memlock_mb().saturating_mul(1024 * 1024),
+        baked::<u64>(LIMIT_MEMLOCK_MB, "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB")
+            .saturating_mul(1024 * 1024),
     )?;
-    let as_mb = limit_as_mb();
+    let as_mb: u64 = baked(LIMIT_AS_MB, "CARGO_UNIKERNEL_LIMIT_AS_MB");
     if as_mb > 0 {
         set_rlimit(
             libc::RLIMIT_AS as libc::c_int,
@@ -291,10 +246,10 @@ fn set_rlimit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Runs after fork, before exec — installs the mandatory baseline seccomp denylist on every
-/// child this init spawns.
+/// Runs after fork, before exec — installs the mandatory baseline seccomp denylist on the app
+/// child.
 ///
-/// A failure here surfaces through `Command::spawn()` into `panic_shutdown`: booting without
+/// A failure here surfaces through `Command::spawn()` into `fatal_shutdown`: booting without
 /// the filter silently in place would be worse than refusing to boot.
 fn install_seccomp_baseline() -> std::io::Result<()> {
     cargo_unikernel_common::seccomp::install_baseline_denylist()
@@ -307,12 +262,12 @@ fn install_seccomp_baseline() -> std::io::Result<()> {
 /// read-only — this `chmod` would fail against an already-locked-down mount.
 fn prepare_app_binary() {
     if !std::path::Path::new(APP_PATH).exists() {
-        panic_shutdown(&format!(
+        fatal_shutdown(&format!(
             "Embedded app binary not found at {APP_PATH} — this image was not built correctly"
         ));
     }
     std::fs::set_permissions(APP_PATH, Permissions::from_mode(0o555)).unwrap_or_else(|e| {
-        panic_shutdown(&format!("Failed to set permissions on {APP_PATH}: {e}"))
+        fatal_shutdown(&format!("Failed to set permissions on {APP_PATH}: {e}"))
     });
 }
 
@@ -323,68 +278,41 @@ fn spawn_app() -> u32 {
 
     // SAFETY: `pre_exec` closures run in the forked child between `fork()` and `execve()`,
     // where only async-signal-safe operations are sound; each closure here calls only a fixed,
-    // small number of setrlimit/setgroups/setgid/setuid/seccomp syscalls. Not using
-    // `Command::uid`/`gid`: its built-in switch always runs before `pre_exec`, which would
-    // leave `drop_privileges`'s capability-bounding-set drop without `CAP_SETPCAP` (see its
-    // doc comment). Order matters: `apply_resource_limits` must run before `drop_privileges`,
-    // since raising a hard rlimit above the kernel's default needs `CAP_SYS_RESOURCE`, which
-    // `drop_privileges` removes.
+    // small number of setrlimit/setgroups/setgid/setuid/seccomp syscalls.
+    let (uid, gid) = app_ids();
     let child = unsafe {
         Command::new(APP_PATH)
             .env_clear()
             .envs(parse_pairs(APP_ENV, "[app.runtime].env"))
             .pre_exec(apply_resource_limits)
-            .pre_exec(drop_privileges(app_uid(), app_gid()))
+            .pre_exec(drop_privileges(uid, gid))
             .pre_exec(install_seccomp_baseline)
             .spawn()
-            .unwrap_or_else(|e| panic_shutdown(&format!("Failed to spawn app: {e}")))
+            .unwrap_or_else(|e| fatal_shutdown(&format!("Failed to spawn app: {e}")))
     };
     let child_pid = child.id();
     log(&format!("App launched as PID {child_pid}."));
     child_pid
 }
 
-/// Makes `/dev/sev-guest` (if present — only ever true on the sev-snp profile) openable by
-/// both the app AND the attestation server.
+/// Makes `/dev/sev-guest` (if present — only ever true on the sev-snp profile) openable by the
+/// app.
 ///
-/// Gated on the `sev-snp` feature (set for every sev-snp-profile build), not `attestation`:
-/// the app legitimately wants to fetch/verify its own SEV-SNP report (e.g. to attest itself to
-/// a peer, or sanity-check its own launch measurement) whether or not this build also runs the
-/// separate attestation server — tying this to `attestation` would silently leave the app
-/// locked out of a device it's entitled to whenever the user hadn't also enabled that server.
-/// The only processes that ever run in this guest are the app and (if compiled in) the
-/// attestation server, both under their own fixed uids — 0666 here doesn't broaden exposure
-/// beyond those two, it just stops requiring a shared group to express that.
+/// The guest ships no attestation service of its own: proving to a remote peer that this
+/// measured image is what's running is the app's job, because only the app knows what it needs
+/// bound into the report's `REPORT_DATA` (a TLS key, a request hash, a session identifier) for
+/// the proof to cover the channel the peer actually talks over. A generic server that echoed a
+/// caller's nonce could only prove "some VM with this measurement is alive", which is relayable.
+/// So the guest just hands the app the device and stays out of the protocol.
+///
+/// The app is the only process that ever runs in this guest besides PID 1 (which is
+/// non-dumpable and doesn't need the device), so 0666 here doesn't broaden exposure beyond the
+/// app's own uid — it just stops requiring a shared group to express that.
 #[cfg(feature = "sev-snp")]
 fn expose_sev_guest_device() {
     if std::path::Path::new("/dev/sev-guest").exists() {
         let _ = std::fs::set_permissions("/dev/sev-guest", Permissions::from_mode(0o666));
     }
-}
-
-/// Spawns the optional SEV-SNP attestation server as an isolated, separately-privileged
-/// child. Only exists at all when the `attestation` feature is compiled in.
-#[cfg(feature = "attestation")]
-fn spawn_attestation_server() -> u32 {
-    let current_exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/init"));
-    // SAFETY: same pre_exec-in-forked-child reasoning, and the same ordering requirement, as
-    // the app spawn in `spawn_app`.
-    let attest_child = unsafe {
-        Command::new(current_exe)
-            .arg("run-attestation-server")
-            // PID 1's env comes from the host-supplied kernel cmdline; nothing this server
-            // needs travels that way (port/uid/gid are env!-baked at build time).
-            .env_clear()
-            .pre_exec(apply_resource_limits)
-            .pre_exec(drop_privileges(attest_uid(), attest_gid()))
-            .pre_exec(install_seccomp_baseline)
-            .spawn()
-            .unwrap_or_else(|e| panic_shutdown(&format!("Failed to spawn attestation server: {e}")))
-    };
-    let pid = attest_child.id();
-    log(&format!("Attestation server spawned as isolated PID {pid}."));
-    pid
 }
 
 /// PID 1's final role once boot completes: blocks in `waitpid` for a child to exit, and
@@ -393,47 +321,41 @@ fn spawn_attestation_server() -> u32 {
 /// Blocking (no `WNOHANG`): the kernel wakes this thread only when a child actually changes
 /// state, so PID 1 costs zero CPU while idle instead of polling on a timer.
 ///
+/// Waits on `-1` rather than `app_pid` alone: PID 1 inherits every orphan the app leaves behind
+/// and has to reap them, or they accumulate as zombies. A result that isn't `app_pid` is one of
+/// those — not the supervised process, so not a compromise.
+///
 /// PIDs never exceed `i32::MAX` on Linux (`pid_max` is capped well below that), so the
 /// `u32`/`pid_t` conversions below are always exact.
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-fn watchdog_loop(child_pid: u32, attest_pid: Option<u32>) -> ! {
+fn watchdog_loop(app_pid: u32) -> ! {
     loop {
         let mut status = 0;
         // SAFETY: `status` is a valid, in-scope `i32`, written only within this call.
         let pid = unsafe { libc::waitpid(-1, std::ptr::addr_of_mut!(status), 0) };
-        // A child that exited because graceful shutdown asked it to isn't a compromise.
         let shutting_down = cargo_unikernel_common::shutdown::SHUTDOWN_IN_PROGRESS
             .load(std::sync::atomic::Ordering::SeqCst);
 
         if pid <= 0 {
             let err = std::io::Error::last_os_error();
-            // ECHILD means every supervised process is gone. Expected during graceful
-            // shutdown (the watcher is already headed to reboot()); otherwise the workload
-            // vanished without the watchdog seeing how, which is exactly what to power off for.
             if err.raw_os_error() == Some(libc::ECHILD) && !shutting_down {
-                panic_shutdown("No supervised processes remain. System integrity compromised.");
+                fatal_shutdown("No supervised processes remain. System integrity compromised.");
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
             continue;
         }
-        if pid == child_pid as i32 {
-            if shutting_down {
-                log(&format!("App process (PID {pid}) exited (graceful shutdown)."));
-            } else {
-                panic_shutdown(&format!(
-                    "App process (PID {pid}) exited. System integrity compromised."
-                ));
-            }
-        } else if Some(pid as u32) == attest_pid {
-            if shutting_down {
-                log(&format!(
-                    "Attestation server (PID {pid}) exited (graceful shutdown)."
-                ));
-            } else {
-                panic_shutdown(&format!(
-                    "Attestation server (PID {pid}) exited. System integrity compromised."
-                ));
-            }
+
+        if pid as u32 != app_pid {
+            continue;
+        }
+        if shutting_down {
+            log(&format!(
+                "App process (PID {pid}) exited (graceful shutdown)."
+            ));
+        } else {
+            fatal_shutdown(&format!(
+                "App process (PID {pid}) exited. System integrity compromised."
+            ));
         }
     }
 }
@@ -445,33 +367,43 @@ fn main() {
         let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT);
     }
 
-    #[cfg(feature = "attestation")]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if args.len() == 2 && args[1] == "run-attestation-server" {
-            println!(
-                "[ATTEST] Starting isolated attestation server (PID {})",
-                std::process::id()
-            );
-            attestation::run_attestation_server();
-        }
+    if !is_pid1() {
+        non_pid1_fatal_exit("This binary is the guest's init and only runs as PID 1");
     }
 
     println!("[INIT] cargo-unikernel guest init starting (PID 1)...");
     set_self_non_dumpable(|w| log(&format!("[WARN] {w}")));
 
-    cargo_unikernel_common::mounts::prepare_system_env(PAYLOAD_DIR, log, panic_shutdown);
-    chown_var_for_app(app_uid(), app_gid(), panic_shutdown);
+    cargo_unikernel_common::mounts::prepare_system_env(PAYLOAD_DIR, log, fatal_shutdown);
+
+    // Armed here rather than alongside `spawn_watcher` below: evdev only queues events for a
+    // client from the moment it opens the device, and everything between this line and that one
+    // (the entropy and network-settle waits alone allow 30s each) is time a hypervisor's
+    // graceful-stop request would otherwise land in and be lost.
+    let shutdown_triggers = cargo_unikernel_common::shutdown::arm_shutdown_triggers();
+    let (uid, gid) = app_ids();
+    chown_var_for_app(uid, gid, fatal_shutdown);
 
     let extra_sysctls = parse_pairs(EXTRA_SYSCTLS, "[hardening].extra_sysctls");
     cargo_unikernel_common::hardening::apply(&extra_sysctls, |w| {
         log(&format!("[WARN] {w}"));
     });
 
-    cargo_unikernel_common::entropy::wait_for_entropy(log);
+    cargo_unikernel_common::entropy::wait_for_entropy(log, fatal_shutdown);
 
     #[cfg(feature = "sev-snp")]
     expose_sev_guest_device();
+
+    // Before the settle wait, not after: the wait polls for a default route, and a configured
+    // gateway is the only thing that installs one where the provider routes a prefix instead of
+    // advertising it. Doing this afterwards would mean always paying the full 30s timeout there.
+    #[cfg(feature = "net-ipv6")]
+    cargo_unikernel_common::mounts::configure_static_ipv6(
+        IPV6_STATIC,
+        IPV6_GATEWAY,
+        IPV6_IFACE,
+        &log,
+    );
 
     #[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
     cargo_unikernel_common::mounts::wait_for_network_settle(
@@ -483,19 +415,15 @@ fn main() {
     // Lockdown before the app exists, so "the payload is read-only" holds for the app's whole
     // lifetime instead of depending on file ownership during a window before the remount.
     prepare_app_binary();
-    cargo_unikernel_common::mounts::lockdown_filesystem(PAYLOAD_DIR, log, panic_shutdown);
+    cargo_unikernel_common::mounts::lockdown_filesystem(PAYLOAD_DIR, log, fatal_shutdown);
 
-    let child_pid = spawn_app();
+    let app_pid = spawn_app();
 
-    #[cfg(feature = "attestation")]
-    let attest_pid = Some(spawn_attestation_server());
-    #[cfg(not(feature = "attestation"))]
-    let attest_pid: Option<u32> = None;
-
-    let mut watched_pids = vec![child_pid];
-    watched_pids.extend(attest_pid);
-    cargo_unikernel_common::shutdown::spawn_watcher(watched_pids, log);
+    // Spawned only now that the app exists: `Command::pre_exec` runs between `fork()` and
+    // `execve()`, where only async-signal-safe work is sound, and forking a process that
+    // already has other threads is what makes that a real constraint rather than a formality.
+    cargo_unikernel_common::shutdown::spawn_watcher(shutdown_triggers, app_pid, log);
 
     log("Boot sequence complete. System operational. PID 1 entering watchdog mode.");
-    watchdog_loop(child_pid, attest_pid);
+    watchdog_loop(app_pid);
 }

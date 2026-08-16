@@ -86,8 +86,8 @@ pub fn compute(
 mod tests {
     use super::*;
     use crate::schema::{
-        App, AppMode, AppRuntime, Attestation, Hardening, Kernel, Network, Output, OutputFormat,
-        OvmfSource, Profile, ProfileKind, Project, Release, SevSnp, Storage, ToolchainPins,
+        App, AppMode, AppRuntime, Hardening, Kernel, Network, Output, OutputFormat, OvmfSource,
+        Profile, ProfileKind, Project, Release, SevSnp, Storage, ToolchainPins,
     };
     use std::path::PathBuf;
 
@@ -113,10 +113,6 @@ mod tests {
             kernel: Kernel::default(),
             toolchain: ToolchainPins::default(),
             hardening: Hardening::default(),
-            attestation: Some(Attestation {
-                enabled: false,
-                port: 8080,
-            }),
             sev_snp: Some(SevSnp {
                 vcpus: 2,
                 vcpu_type: "EPYC-v3".to_string(),
@@ -132,7 +128,6 @@ mod tests {
                 dir: "dist/".to_string(),
             },
             release: Release::default(),
-            debug: false,
         }
     }
 

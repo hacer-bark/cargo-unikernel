@@ -23,25 +23,17 @@ fn main() {
     // ';'-joined "key=value" pairs from [app.runtime].env, applied to the app's process
     // environment before exec. Empty by default (no env vars passed).
     passthrough("CARGO_UNIKERNEL_APP_ENV", "");
-    // Fixed, distinct from the app's uid/gid (see schema::ATTESTATION_UID on the host side) —
-    // keeps the attestation server isolated from the app by Unix DAC, not just by PID.
-    passthrough("CARGO_UNIKERNEL_ATTEST_UID", "65533");
-    passthrough("CARGO_UNIKERNEL_ATTEST_GID", "65533");
-    passthrough("CARGO_UNIKERNEL_ATTESTATION_PORT", "8080");
-    // Note what's deliberately NOT here: allow_write_execute, attestation-enabled, debug-mode,
-    // and each [hardening.runtime] category used to be env!()-baked booleans checked with a
-    // runtime `if`/`==`. They're now Cargo features (danger-allow-write-execute, attestation,
-    // debug-mode, hardening-*) selected via `--features` when cargo-unikernel invokes this
-    // crate's build — see src/pipeline/docker/guest_init_script.rs. A disabled one is compiled
-    // out entirely, not left in the binary behind a branch that happens not to trigger.
-
+    // [network.ipv6_static], as "address/prefix_len" — empty means SLAAC only. The gateway and
+    // interface are separate and each empty unless configured.
+    passthrough("CARGO_UNIKERNEL_IPV6_STATIC", "");
+    passthrough("CARGO_UNIKERNEL_IPV6_GATEWAY", "");
+    passthrough("CARGO_UNIKERNEL_IPV6_IFACE", "");
     // Semicolon-separated "path=value" pairs from [hardening].extra_sysctls, applied after
     // the compiled-in named categories — arbitrary per-deployment data, not a toggle, so this
     // one still travels as a plain baked-in string rather than a feature.
     passthrough("CARGO_UNIKERNEL_EXTRA_SYSCTLS", "");
-
-    // setrlimit ceilings for the app/attestation-server child — see schema::AppLimits. "0"
-    // for max_memory_mb means no RLIMIT_AS cap.
+    // setrlimit ceilings for the app child — see schema::AppLimits. "0" for max_memory_mb
+    // means no RLIMIT_AS cap.
     passthrough("CARGO_UNIKERNEL_LIMIT_NOFILE", "65536");
     passthrough("CARGO_UNIKERNEL_LIMIT_NPROC", "2048");
     passthrough("CARGO_UNIKERNEL_LIMIT_AS_MB", "0");

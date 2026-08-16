@@ -11,16 +11,23 @@
 //! dm-integrity keyed from an `SNP_GET_DERIVED_KEY` secret, not implemented here. Treat `/var`
 //! as untrusted, host-visible scratch space.
 //!
-//! What this module does address: the superblock is validated from userspace
+//! What this module does address, and how far: the superblock is read from userspace
 //! ([`device_carries_our_marker`]) before the kernel's ext4 driver ever sees the device, so a
-//! hostile image is rejected and wiped instead of parsed.
+//! device that isn't recognizably this image's is wiped rather than parsed. That screens
+//! *unrecognized* images — a blank device, another workload's filesystem, a corrupted one. It is
+//! not a defense against a hostile one: the marker is a 16-byte volume label in a field the host
+//! can write, so a host that wants its ext4 metadata parsed just copies the label. On sev-snp
+//! that means the in-kernel ext4 parser, inside the TCB, reading host-controlled input. Nothing
+//! short of dm-integrity changes that.
 
 use crate::mounts::{mount, writable_exec_mount_flags};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::process::Command;
 
 const DEVICE_PATH: &str = "/dev/vda";
 const MOUNT_TARGET: &str = "/var";
+/// Submount of [`MOUNT_TARGET`] — see [`unmount_var`] for why this module has to know about it.
+const VAR_TMP: &str = "/var/tmp";
 const MKE2FS_PATH: &str = "/sbin/mke2fs";
 
 /// Written into the ext4 superblock's volume-label field by `wipe_and_format`'s `mke2fs -L`,
@@ -47,10 +54,14 @@ const EXT4_MAGIC: u16 = 0xEF53;
 /// Enough to cover both fields above without reading the whole 1024-byte superblock.
 const SUPERBLOCK_PREFIX_LEN: usize = SB_LABEL_OFFSET + SB_LABEL_LEN;
 
-/// Reads the ext4 superblock straight off the block device and reports whether it is one this
-/// crate wrote. Runs *before* [`mount_persistent_var`] mounts anything, so a crafted superblock
-/// never reaches the in-kernel ext4 parser at all — a trust decision, not an integrity
-/// guarantee (a host that wants to can still write a superblock carrying this label).
+/// Reads the ext4 superblock straight off the block device and reports whether it carries this
+/// crate's volume label.
+///
+/// Runs *before* [`mount_persistent_var`] mounts anything, so an unrecognized filesystem is
+/// wiped rather than handed to the in-kernel ext4 parser. That is a trust decision about which
+/// images reach the parser, not an integrity check on the ones that do — the label is
+/// host-writable, so this stops accidents and unrelated data, not a host that means it. See the
+/// module doc.
 ///
 /// Any read error, short device, or bad magic means "not ours"; the caller wipes and reformats.
 fn device_carries_our_marker() -> bool {
@@ -80,15 +91,9 @@ fn superblock_is_ours(sb: &[u8; SUPERBLOCK_PREFIX_LEN]) -> bool {
     expected == VOLUME_LABEL && padding.iter().all(|&b| b == 0)
 }
 
-fn write_zeros(dev: &mut std::fs::File, mut remaining: u64) -> std::io::Result<()> {
-    let chunk = vec![0u8; 1024 * 1024];
-    while remaining > 0 {
-        let n = usize::try_from(remaining).unwrap_or(chunk.len()).min(chunk.len());
-        dev.write_all(&chunk[..n])?;
-        remaining -= n as u64;
-    }
-    Ok(())
-}
+/// Larger than the tmpfs scrub chunk in `shutdown.rs`: this one goes to a virtio-blk device
+/// where a bigger write per syscall measurably shortens a full-device wipe.
+const WIPE_CHUNK: usize = 1024 * 1024;
 
 /// Zeroes the whole device, then runs the bundled static `mke2fs` over it. Zeroing first (not
 /// just reformatting) means bytes from whatever was on the device before are never left
@@ -102,8 +107,9 @@ fn wipe_and_format(fatal: fn(&str) -> !) {
     let device_len = dev
         .seek(SeekFrom::End(0))
         .unwrap_or_else(|e| fatal(&format!("Failed to size {DEVICE_PATH}: {e}")));
+    let zeros = vec![0u8; WIPE_CHUNK];
     dev.seek(SeekFrom::Start(0))
-        .and_then(|_| write_zeros(&mut dev, device_len))
+        .and_then(|_| crate::write_zeros(&mut dev, device_len, &zeros))
         .unwrap_or_else(|e| fatal(&format!("Failed to wipe {DEVICE_PATH}: {e}")));
     dev.sync_all()
         .unwrap_or_else(|e| fatal(&format!("Failed to sync {DEVICE_PATH} after wipe: {e}")));
@@ -136,15 +142,32 @@ pub fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
         wipe_and_format(fatal);
     }
 
-    mount(Some(DEVICE_PATH), MOUNT_TARGET, Some("ext4"), writable_exec_mount_flags(), None)
-        .unwrap_or_else(|e| fatal(&format!("Failed to mount {DEVICE_PATH} at {MOUNT_TARGET}: {e}")));
+    mount(
+        Some(DEVICE_PATH),
+        MOUNT_TARGET,
+        Some("ext4"),
+        writable_exec_mount_flags(),
+        None,
+    )
+    .unwrap_or_else(|e| {
+        fatal(&format!(
+            "Failed to mount {DEVICE_PATH} at {MOUNT_TARGET}: {e}"
+        ))
+    });
     log("[storage] /var is live on /dev/vda.");
 }
 
 /// Unmounts `/var` so the journal/metadata is flushed cleanly before power-off, rather than
 /// relying solely on `sync(2)`.
-pub fn unmount_var() {
-    let _ = umount(MOUNT_TARGET);
+///
+/// `/var/tmp` is a tmpfs mounted *over* a subdirectory of this filesystem (see
+/// `mounts::prepare_system_env`), and `umount(2)` refuses a mount point that still has a
+/// submount — so unmounting it first is what makes the `/var` unmount able to succeed at all
+/// rather than silently returning `EBUSY`. Returns whether `/var` itself came away cleanly.
+#[must_use]
+pub fn unmount_var() -> bool {
+    umount(VAR_TMP);
+    umount(MOUNT_TARGET)
 }
 
 #[cfg(test)]
@@ -163,7 +186,10 @@ mod tests {
 
     #[test]
     fn accepts_a_superblock_this_crate_wrote() {
-        assert!(superblock_is_ours(&superblock_with(EXT4_MAGIC, VOLUME_LABEL)));
+        assert!(superblock_is_ours(&superblock_with(
+            EXT4_MAGIC,
+            VOLUME_LABEL
+        )));
     }
 
     #[test]
@@ -186,6 +212,9 @@ mod tests {
     /// starting with ours would be accepted as ours.
     #[test]
     fn rejects_a_label_that_merely_starts_with_ours() {
-        assert!(!superblock_is_ours(&superblock_with(EXT4_MAGIC, b"CUKINITIAL")));
+        assert!(!superblock_is_ours(&superblock_with(
+            EXT4_MAGIC,
+            b"CUKINITIAL"
+        )));
     }
 }

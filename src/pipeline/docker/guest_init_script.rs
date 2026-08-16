@@ -1,18 +1,17 @@
 use super::helpers::{rustflags_export, write_export};
-use crate::schema::{ATTESTATION_GID, ATTESTATION_UID, Config, ProfileKind, StorageMode};
+use crate::schema::{Config, ProfileKind, StorageMode};
 use std::fmt::Write as _;
 
-/// Stage 2: cross-compile `cargo-unikernel-init` (the embedded guest source) with the
-/// app-uid/gid/attestation env vars baked in via its `build.rs`, and every config-selected
-/// toggle (network protocols, runtime hardening categories, `danger.allow_write_execute`,
-/// `attestation`, `debug`) compiled in via `cargo build --features`, not left in the binary
-/// behind a runtime `if` that happens not to trigger.
+/// Stage 2: cross-compile `cargo-unikernel-init` (the embedded guest source) with the app's
+/// uid/gid/env/limits baked in via its `build.rs`, and every config-selected toggle (network
+/// protocols, runtime hardening categories, `danger.allow_write_execute`) compiled in via
+/// `cargo build --features`, not left in the binary behind a runtime `if` that happens not to
+/// trigger.
 pub(super) fn script_guest_init_build(config: &Config) -> String {
     let mut s = String::new();
     s.push_str("export CARGO_TARGET_DIR=/tmp/cargo-target\n");
     s.push_str(&rustflags_export());
     app_env_exports(config, &mut s);
-    attestation_exports(config, &mut s);
 
     let features = init_features(config).join(",");
     let features_flag = if features.is_empty() {
@@ -71,38 +70,25 @@ fn init_features(config: &Config) -> Vec<&'static str> {
     if config.app.runtime.danger.allow_write_execute {
         features.push("danger-allow-write-execute");
     }
-    if matches!(&config.attestation, Some(a) if a.enabled) {
-        features.push("attestation");
-    }
-    if config.debug {
-        features.push("debug-mode");
-    }
 
     features
 }
 
-/// Exports `[app.runtime]`'s uid/gid/env/limits, plus the attestation server's fixed
-/// (non-user-configurable) uid/gid. `danger.allow_write_execute` and `[hardening.runtime]`
-/// are compile-time features now (see [`init_features`]), not env vars.
+/// Exports `[app.runtime]`'s uid/gid/env/limits. `danger.allow_write_execute` and
+/// `[hardening.runtime]` are compile-time features now (see [`init_features`]), not env vars.
 fn app_env_exports(config: &Config, s: &mut String) {
     write_export(s, "CARGO_UNIKERNEL_APP_UID", config.app.runtime.uid);
     write_export(s, "CARGO_UNIKERNEL_APP_GID", config.app.runtime.gid);
     if !config.app.runtime.env.is_empty() {
         // Same encoding as [hardening].extra_sysctls below: ';'-joined "key=value" pairs.
-        // Values containing ';' aren't representable — acceptable for the same reason it's
-        // acceptable there (matches this codebase's existing convention rather than adding a
-        // second, inconsistent encoding scheme for one field).
+        // Values containing ';' aren't representable, which `Config::validate_kv_encoding`
+        // rejects up front rather than letting it reach the guest as a malformed pair.
         write_export(
             s,
             "CARGO_UNIKERNEL_APP_ENV",
             encode_kv_pairs(&config.app.runtime.env),
         );
     }
-    // Fixed, not user-configurable (see schema::ATTESTATION_UID) — the attestation server
-    // drops to this uid/gid instead of the app's, so the two child processes are actually
-    // isolated from each other by Unix DAC, not just by being separate processes.
-    write_export(s, "CARGO_UNIKERNEL_ATTEST_UID", ATTESTATION_UID);
-    write_export(s, "CARGO_UNIKERNEL_ATTEST_GID", ATTESTATION_GID);
     let limits = &config.app.runtime.limits;
     write_export(s, "CARGO_UNIKERNEL_LIMIT_NOFILE", limits.max_open_files);
     write_export(s, "CARGO_UNIKERNEL_LIMIT_NPROC", limits.max_processes);
@@ -112,6 +98,21 @@ fn app_env_exports(config: &Config, s: &mut String) {
         "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB",
         limits.max_locked_memory_mb,
     );
+    if let Some(static_v6) = &config.network.ipv6_static {
+        // Address and prefix travel as one "addr/len" string: they are meaningless apart, and
+        // the guest parses them in one place rather than re-deriving which default applies.
+        write_export(
+            s,
+            "CARGO_UNIKERNEL_IPV6_STATIC",
+            format!("{}/{}", static_v6.address, static_v6.prefix_len),
+        );
+        if let Some(gateway) = &static_v6.gateway {
+            write_export(s, "CARGO_UNIKERNEL_IPV6_GATEWAY", gateway);
+        }
+        if let Some(interface) = &static_v6.interface {
+            write_export(s, "CARGO_UNIKERNEL_IPV6_IFACE", interface);
+        }
+    }
     if !config.hardening.extra_sysctls.is_empty() {
         write_export(
             s,
@@ -131,14 +132,6 @@ fn encode_kv_pairs(pairs: &std::collections::BTreeMap<String, String>) -> String
         .join(";")
 }
 
-/// Exports the attestation-server's port (its `enabled` bit is now the `attestation` Cargo
-/// feature — see [`init_features`] — not an env var).
-fn attestation_exports(config: &Config, s: &mut String) {
-    if let Some(a) = &config.attestation {
-        write_export(s, "CARGO_UNIKERNEL_ATTESTATION_PORT", a.port);
-    }
-}
-
 #[cfg(test)]
 // Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
 // smell — this is the standard justified exception to these lints.
@@ -146,7 +139,7 @@ fn attestation_exports(config: &Config, s: &mut String) {
 mod tests {
     use super::super::test_fixtures::*;
     use super::*;
-    use crate::schema::{Attestation, NetworkMode, OutputFormat};
+    use crate::schema::{NetworkMode, OutputFormat};
 
     #[test]
     fn guest_init_build_pins_codegen_units_for_reproducibility() {
@@ -173,25 +166,54 @@ mod tests {
         assert!(script.contains("danger-allow-write-execute"));
     }
 
+    /// The app is what fetches SEV-SNP reports (the guest ships no attestation service of its
+    /// own), so this feature — which is what chmods `/dev/sev-guest` into its reach — has to
+    /// follow the profile alone.
     #[test]
-    fn attestation_server_gets_a_uid_distinct_from_the_configured_app_uid() {
-        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
-        config.app.runtime.uid = 12345;
-        config.app.runtime.gid = 12345;
-        let script = script_guest_init_build(&config);
-        assert!(script.contains(&format!("CARGO_UNIKERNEL_ATTEST_UID=\"{ATTESTATION_UID}\"")));
-        assert!(script.contains(&format!("CARGO_UNIKERNEL_ATTEST_GID=\"{ATTESTATION_GID}\"")));
-        assert_ne!(ATTESTATION_UID, config.app.runtime.uid);
+    fn sev_snp_profile_gets_the_sev_snp_feature() {
+        let config = sev_snp_config_with_formats(vec![OutputFormat::Cpio]);
+        let features = init_features(&config);
+        assert!(features.contains(&"sev-snp"));
     }
 
     #[test]
-    fn sev_snp_profile_gets_the_sev_snp_feature_regardless_of_attestation() {
-        // Independent of `attestation` — the app needs `/dev/sev-guest` fixed up even when
-        // it's the only process running (no attestation server compiled in at all).
-        let config = sev_snp_config_with_formats(vec![OutputFormat::Cpio]);
-        assert!(!config.attestation.as_ref().is_some_and(|a| a.enabled));
-        let features = init_features(&config);
-        assert!(features.contains(&"sev-snp"));
+    fn static_ipv6_is_exported_as_one_address_slash_prefix_string() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.network.mode = NetworkMode::Ipv6;
+        config.network.ipv6_static = Some(crate::schema::Ipv6Static {
+            address: "2001:db8:1:2::1".to_string(),
+            prefix_len: 64,
+            gateway: Some("fe80::1".to_string()),
+            interface: Some("eth0".to_string()),
+        });
+        let script = script_guest_init_build(&config);
+        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_STATIC="2001:db8:1:2::1/64""#));
+        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_GATEWAY="fe80::1""#));
+        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_IFACE="eth0""#));
+    }
+
+    /// The guest reads an unset value as "SLAAC only", so the optional halves must stay unset
+    /// rather than being exported empty.
+    #[test]
+    fn omitted_static_ipv6_exports_nothing() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        let script = script_guest_init_build(&config);
+        assert!(!script.contains("CARGO_UNIKERNEL_IPV6_STATIC"));
+        assert!(!script.contains("CARGO_UNIKERNEL_IPV6_GATEWAY"));
+        assert!(!script.contains("CARGO_UNIKERNEL_IPV6_IFACE"));
+
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.network.mode = NetworkMode::Ipv6;
+        config.network.ipv6_static = Some(crate::schema::Ipv6Static {
+            address: "2001:db8::5".to_string(),
+            prefix_len: 128,
+            gateway: None,
+            interface: None,
+        });
+        let script = script_guest_init_build(&config);
+        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_STATIC="2001:db8::5/128""#));
+        assert!(!script.contains("CARGO_UNIKERNEL_IPV6_GATEWAY"));
+        assert!(!script.contains("CARGO_UNIKERNEL_IPV6_IFACE"));
     }
 
     #[test]
@@ -244,27 +266,5 @@ mod tests {
         let features = init_features(&config);
         assert!(!features.contains(&"hardening-icmp"));
         assert!(features.contains(&"hardening-tcp"));
-    }
-
-    #[test]
-    fn attestation_enabled_adds_the_feature_and_port_env_var() {
-        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
-        config.network.mode = NetworkMode::Ipv4;
-        config.attestation = Some(Attestation {
-            enabled: true,
-            port: 9443,
-        });
-        let features = init_features(&config);
-        assert!(features.contains(&"attestation"));
-        let script = script_guest_init_build(&config);
-        assert!(script.contains("CARGO_UNIKERNEL_ATTESTATION_PORT=\"9443\""));
-    }
-
-    #[test]
-    fn debug_flag_adds_debug_mode_feature() {
-        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
-        config.debug = true;
-        let features = init_features(&config);
-        assert!(features.contains(&"debug-mode"));
     }
 }

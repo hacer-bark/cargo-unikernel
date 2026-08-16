@@ -32,8 +32,6 @@ pub struct Config {
     /// `[hardening]` — build-time and runtime hardening toggles.
     #[serde(default)]
     pub hardening: Hardening,
-    /// `[attestation]` — remote-attestation server settings (sev-snp only).
-    pub attestation: Option<Attestation>,
     /// `[sev_snp]` — confidential-computing profile settings (sev-snp only).
     pub sev_snp: Option<SevSnp>,
     /// `[output]` — which image formats to produce and where.
@@ -41,10 +39,6 @@ pub struct Config {
     /// `[release]` — which `dist/` assets a GitHub Release includes.
     #[serde(default)]
     pub release: Release,
-    /// Keeps the generated in-container build script (and other scratch files) around under
-    /// the build cache for inspection after a build, instead of only on failure.
-    #[serde(default)]
-    pub debug: bool,
 }
 
 /// `[project]` — identifies the project and, optionally, pins it to an exact CLI version.
@@ -73,8 +67,7 @@ pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum ProfileKind {
     /// The default, no-frills profile: no measurement, no confidential-computing guarantees.
     Casual,
-    /// AMD SEV-SNP confidential computing: measured boot, encrypted guest memory, optional
-    /// remote attestation.
+    /// AMD SEV-SNP confidential computing: measured boot, encrypted guest memory.
     SevSnp,
 }
 
@@ -180,10 +173,12 @@ pub struct AppRuntime {
     /// Environment variables set on the app process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// uid the app process runs as after exec (dropped from root).
+    /// uid the app process runs as after exec (dropped from root). Must not be `0` — the drop
+    /// is a `setuid` call, which succeeds and changes nothing when asked for root.
     #[serde(default = "default_uid")]
     pub uid: u32,
-    /// gid the app process runs as after exec (dropped from root).
+    /// gid the app process runs as after exec (dropped from root). Must not be `0`, for the
+    /// same reason as `uid`.
     #[serde(default = "default_gid")]
     pub gid: u32,
     /// `[app.runtime.danger]` — opt-in escape hatches from the default lockdown.
@@ -201,16 +196,6 @@ const fn default_gid() -> u32 {
     65534
 }
 
-/// Fixed uid the attestation server (not the app) drops privileges to.
-///
-/// Distinct from `app.runtime.uid`/`gid` so the two child processes are actually isolated
-/// from each other by Unix DAC, not just by being separate processes. Not user-configurable:
-/// it only needs to differ from whatever the app runs as, which `Config::validate` enforces
-/// below.
-pub const ATTESTATION_UID: u32 = 65533;
-/// Same as `ATTESTATION_UID`, for the gid.
-pub const ATTESTATION_GID: u32 = 65533;
-
 impl Default for AppRuntime {
     fn default() -> Self {
         Self {
@@ -223,8 +208,8 @@ impl Default for AppRuntime {
     }
 }
 
-/// `setrlimit` ceilings applied to the app (and attestation server) child process before exec
-/// — defense-in-depth against a fork bomb, fd exhaustion, or unbounded memory growth.
+/// `setrlimit` ceilings applied to the app child process before exec — defense-in-depth
+/// against a fork bomb, fd exhaustion, or unbounded memory growth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppLimits {
     /// `RLIMIT_NOFILE` — max open file descriptors.
@@ -299,8 +284,7 @@ pub enum NetworkMode {
     /// Both IPv4 (`ip=dhcp`) and IPv6 (SLAAC).
     Dual,
     /// No networking at all: no virtio-net device, no IP stack compiled into the kernel, no
-    /// network bring-up code in the guest init. `[attestation]` cannot be enabled alongside
-    /// this — there'd be no way for a remote client to ever reach it.
+    /// network bring-up code in the guest init.
     None,
 }
 
@@ -330,6 +314,9 @@ pub struct Network {
     /// `ipv4`, `ipv6`, `dual`, or `none` — see [`NetworkMode`].
     #[serde(default = "default_network_mode")]
     pub mode: NetworkMode,
+    /// `[network.ipv6_static]` — a fixed IPv6 address instead of relying on SLAAC. Omitted by
+    /// default; see [`Ipv6Static`].
+    pub ipv6_static: Option<Ipv6Static>,
 }
 
 const fn default_network_mode() -> NetworkMode {
@@ -340,8 +327,45 @@ impl Default for Network {
     fn default() -> Self {
         Self {
             mode: default_network_mode(),
+            ipv6_static: None,
         }
     }
+}
+
+/// `[network.ipv6_static]` — assigns a fixed IPv6 address at boot.
+///
+/// Exists because SLAAC's address is not knowable in advance: the interface identifier is
+/// derived from the virtio-net MAC the hypervisor picked, so the only way to learn the guest's
+/// address is to read it off the boot console. A guest you cannot attach a console to — the
+/// normal case on a confidential-computing host — therefore has no reachable address you could
+/// have put in DNS beforehand. A static address is known before the image ever boots.
+///
+/// Assigned *in addition to* whatever SLAAC provides, not instead of it: router advertisements
+/// are what supply the default route in the common case, and turning `accept_ra` off to suppress
+/// the extra address would take the route with it. The app binds the address configured here;
+/// the SLAAC one existing alongside costs nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ipv6Static {
+    /// The address to assign, e.g. `"2001:db8:1:2::1"`. With a `/64` from a provider, any host
+    /// part works and `::1` is the conventional pick; with a single `/128`, this is that exact
+    /// address.
+    pub address: String,
+    /// Prefix length of the address above. `64` matches what providers hand out most often;
+    /// use `128` for a single delegated address.
+    #[serde(default = "default_ipv6_prefix_len")]
+    pub prefix_len: u8,
+    /// Default-route next hop, for a provider that routes a prefix to the VM without sending
+    /// router advertisements — in that setup nothing else installs a default route, and the
+    /// address alone leaves the guest unreachable. Usually the provider's link-local
+    /// (`"fe80::1"`). Omit when router advertisements are present, which is the common case.
+    pub gateway: Option<String>,
+    /// Which interface to configure. Omitted means the sole non-loopback interface, which is
+    /// what a single-NIC guest always has; set it explicitly only for a multi-NIC guest.
+    pub interface: Option<String>,
+}
+
+const fn default_ipv6_prefix_len() -> u8 {
+    64
 }
 
 /// Whether `/var` (and other long-term-storage paths) live only in RAM or persist across
@@ -435,8 +459,7 @@ impl Kernel {
     #[must_use]
     pub fn sha256_for_build(&self) -> Option<String> {
         self.sha256.clone().or_else(|| {
-            (self.version == default_kernel_version())
-                .then(|| DEFAULT_KERNEL_SHA256.to_string())
+            (self.version == default_kernel_version()).then(|| DEFAULT_KERNEL_SHA256.to_string())
         })
     }
 }
@@ -577,7 +600,8 @@ pub struct Hardening {
     #[serde(default)]
     pub runtime: RuntimeHardening,
     /// Extra sysctls applied by the guest at boot, after the named runtime categories
-    /// above. Format: `{ "/proc/sys/..." = "value" }`.
+    /// above. Format: `{ "/proc/sys/..." = "value" }` — keys are written verbatim as root, so
+    /// anything outside `/proc/sys/` is rejected by `validate_extra_sysctl_paths`.
     #[serde(default)]
     pub extra_sysctls: BTreeMap<String, String>,
     /// Extra raw Kconfig directives applied after every named kernel category above (so
@@ -603,22 +627,6 @@ impl Default for Hardening {
             extra_kernel_config: Vec::new(),
         }
     }
-}
-
-/// `[attestation]` — the in-guest remote-attestation HTTP server (sev-snp only). See
-/// `docs/attestation_api.md` for the wire protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attestation {
-    /// Compiles the attestation server's code into the guest init at all. `false`/omitted
-    /// keeps it out entirely — smaller binary, fewer moving parts.
-    pub enabled: bool,
-    /// TCP port the attestation server listens on.
-    #[serde(default = "default_attestation_port")]
-    pub port: u16,
-}
-
-const fn default_attestation_port() -> u16 {
-    8080
 }
 
 /// Where to get the OVMF/UEFI firmware used for the SEV-SNP launch measurement. Cloud
@@ -780,9 +788,6 @@ pub enum ValidationError {
          `toolchain = \"generic\"` — remove them or switch off the rust toolchain"
     )]
     RustToolchainCannotSetGenericFields,
-    /// `[attestation]` set with `profile.kind = "casual"`.
-    #[error("`[attestation]` is only valid when `profile.kind = \"sev-snp\"`")]
-    AttestationRequiresSevSnp,
     /// `[sev_snp]` set with `profile.kind = "casual"`.
     #[error("`[sev_snp]` is only valid when `profile.kind = \"sev-snp\"`")]
     SevSnpSectionRequiresSevSnpProfile,
@@ -860,26 +865,61 @@ pub enum ValidationError {
         /// The version the config asks for, which has no baked-in checksum.
         version: String,
     },
-    /// `attestation.port` was `0`.
-    #[error("`attestation.port` must not be 0")]
-    AttestationPortMustNotBeZero,
-    /// `app.runtime.uid`/`gid` collided with the attestation server's reserved uid/gid while
-    /// `[attestation]` was enabled.
+    /// `[network.ipv6_static]` set while `network.mode` has no IPv6.
     #[error(
-        "`app.runtime.uid`/`gid` must not be {ATTESTATION_UID} when `[attestation]` is enabled \
-         — that uid/gid is reserved for the attestation server so it stays isolated from the \
-         app process (a different, unprivileged uid, not just a different PID)"
+        "`[network.ipv6_static]` requires `network.mode` to include IPv6 (\"ipv6\" or \"dual\") \
+         — the guest has no IPv6 stack compiled in otherwise"
     )]
-    AppRuntimeUidCollidesWithAttestation,
-    /// `[attestation]` enabled while `network.mode = "none"`.
+    Ipv6StaticRequiresIpv6,
+    /// `network.ipv6_static.address` was not an IPv6 address.
+    #[error("`network.ipv6_static.address` {0:?} is not a valid IPv6 address")]
+    Ipv6StaticAddressUnparseable(String),
+    /// `network.ipv6_static.address` was an address nothing can reach from off-link.
     #[error(
-        "`[attestation]` cannot be enabled while `network.mode = \"none\"` — a remote client \
-         has no way to reach the attestation server without networking"
+        "`network.ipv6_static.address` {0:?} is loopback, link-local, multicast or unspecified \
+         — a remote client cannot reach it, and the point of a static address is to be the one \
+         you connect to"
     )]
-    AttestationRequiresNetworking,
+    Ipv6StaticAddressNotRoutable(String),
+    /// `network.ipv6_static.prefix_len` was outside 1–128.
+    #[error("`network.ipv6_static.prefix_len` must be between 1 and 128 (got {0})")]
+    Ipv6StaticPrefixLenOutOfRange(u8),
+    /// `network.ipv6_static.gateway` was not an IPv6 address.
+    #[error("`network.ipv6_static.gateway` {0:?} is not a valid IPv6 address")]
+    Ipv6StaticGatewayUnparseable(String),
     /// `storage.size_mib` was `0`.
     #[error("`storage.size_mib` must be greater than 0 (got {0})")]
     StorageSizeMustBePositive(u32),
+    /// A key/value pair contained a character the `';'`-joined wire format can't round-trip.
+    #[error(
+        "`{table}` entry {key:?} contains a `;` (or a `=` in the key) — these reach the guest \
+         as one `;`-joined string of `key=value` pairs, so such an entry cannot be encoded \
+         without the guest reading it back as something different"
+    )]
+    UnrepresentableKvPair {
+        /// The config table the offending entry came from.
+        table: &'static str,
+        /// The offending entry's key.
+        key: String,
+    },
+    /// `app.runtime.uid` or `gid` was `0`.
+    #[error(
+        "`app.runtime.{field}` must not be 0 — the guest init drops privileges by calling \
+         `setuid`/`setgid` before exec, which is a no-op for root, leaving the app owning \
+         every root-owned file in the guest (including `/proc/sys`, so it could undo the \
+         sysctl hardening applied at boot)"
+    )]
+    AppRuntimeIdMustNotBeRoot {
+        /// Whichever of `uid`/`gid` was `0`.
+        field: &'static str,
+    },
+    /// A `hardening.extra_sysctls` key was not a path under `/proc/sys/`.
+    #[error(
+        "`hardening.extra_sysctls` key {0:?} must be a path under `/proc/sys/` — the guest \
+         init writes each key verbatim as root before the filesystem lockdown, so a key \
+         pointing elsewhere writes to that path instead of tuning a sysctl"
+    )]
+    ExtraSysctlNotUnderProcSys(String),
 }
 
 impl Config {
@@ -895,10 +935,52 @@ impl Config {
         self.validate_project()?;
         self.validate_storage()?;
         self.validate_kernel()?;
-        self.validate_attestation()?;
+        self.validate_kv_encoding()?;
+        self.validate_extra_sysctl_paths()?;
+        self.validate_ipv6_static()?;
         self.validate_app()?;
         self.validate_profile()?;
         self.validate_output_and_release()?;
+        Ok(())
+    }
+
+    /// `[app.runtime].env` and `[hardening].extra_sysctls` both reach the guest as one
+    /// `';'`-joined string of `key=value` pairs (see `pipeline::docker::guest_init_script`).
+    ///
+    /// A `';'` anywhere in a key or value, or a `'='` in a key, splits into a pair the guest
+    /// reads back differently than it was written — and the guest treats a malformed pair as an
+    /// integrity failure and powers off. Rejecting it here turns an unbootable image into a
+    /// config error.
+    fn validate_kv_encoding(&self) -> Result<(), ValidationError> {
+        let checks = [
+            ("app.runtime.env", &self.app.runtime.env),
+            ("hardening.extra_sysctls", &self.hardening.extra_sysctls),
+        ];
+        for (table, pairs) in checks {
+            for (key, value) in pairs {
+                if key.contains(';') || key.contains('=') || value.contains(';') {
+                    return Err(ValidationError::UnrepresentableKvPair {
+                        table,
+                        key: key.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Confines `[hardening].extra_sysctls` keys to `/proc/sys/`.
+    ///
+    /// The guest init hands each key straight to `write(2)` as root, before the filesystem
+    /// lockdown — so an unconfined key isn't a broken sysctl, it's a write to whatever path it
+    /// names. `..` is rejected separately: a prefix check alone would accept
+    /// `/proc/sys/../../etc/passwd`.
+    fn validate_extra_sysctl_paths(&self) -> Result<(), ValidationError> {
+        for key in self.hardening.extra_sysctls.keys() {
+            if !key.starts_with("/proc/sys/") || key.split('/').any(|part| part == "..") {
+                return Err(ValidationError::ExtraSysctlNotUnderProcSys(key.clone()));
+            }
+        }
         Ok(())
     }
 
@@ -945,22 +1027,44 @@ impl Config {
         Ok(())
     }
 
-    /// `[attestation]` invariants: nonzero port, no uid/gid collision with the attestation
-    /// server's reserved uid/gid, and networking actually enabled.
-    const fn validate_attestation(&self) -> Result<(), ValidationError> {
-        let Some(attestation) = &self.attestation else {
+    /// `[network.ipv6_static]` invariants: IPv6 actually compiled in, a parseable and
+    /// *routable* address, a sane prefix length, and a parseable gateway if given.
+    ///
+    /// The address checks matter more than usual here: this exists to serve a guest whose
+    /// console cannot be read, so a bad value produces an image that boots, looks healthy, and
+    /// is silently unreachable. Catching it at config time is the only place it is cheap.
+    fn validate_ipv6_static(&self) -> Result<(), ValidationError> {
+        let Some(static_v6) = &self.network.ipv6_static else {
             return Ok(());
         };
-        if attestation.port == 0 {
-            return Err(ValidationError::AttestationPortMustNotBeZero);
+        if !self.network.mode.has_ipv6() {
+            return Err(ValidationError::Ipv6StaticRequiresIpv6);
         }
-        if attestation.enabled {
-            if self.app.runtime.uid == ATTESTATION_UID || self.app.runtime.gid == ATTESTATION_GID {
-                return Err(ValidationError::AppRuntimeUidCollidesWithAttestation);
-            }
-            if !self.network.mode.has_any() {
-                return Err(ValidationError::AttestationRequiresNetworking);
-            }
+
+        let address: std::net::Ipv6Addr = static_v6.address.parse().map_err(|_| {
+            ValidationError::Ipv6StaticAddressUnparseable(static_v6.address.clone())
+        })?;
+        if address.is_loopback()
+            || address.is_multicast()
+            || address.is_unspecified()
+            || address.segments()[0] & 0xffc0 == 0xfe80
+        {
+            return Err(ValidationError::Ipv6StaticAddressNotRoutable(
+                static_v6.address.clone(),
+            ));
+        }
+        if static_v6.prefix_len == 0 || static_v6.prefix_len > 128 {
+            return Err(ValidationError::Ipv6StaticPrefixLenOutOfRange(
+                static_v6.prefix_len,
+            ));
+        }
+
+        if let Some(gateway) = &static_v6.gateway
+            && gateway.parse::<std::net::Ipv6Addr>().is_err()
+        {
+            return Err(ValidationError::Ipv6StaticGatewayUnparseable(
+                gateway.clone(),
+            ));
         }
         Ok(())
     }
@@ -968,6 +1072,15 @@ impl Config {
     /// `[app]` invariants: `path` required, whether `[app.source]` (source mode) or
     /// `[app.binary]` (binary mode), plus the toolchain-specific field requirements.
     fn validate_app(&self) -> Result<(), ValidationError> {
+        // `setuid(0)`/`setgid(0)` succeed and change nothing, so the guest's privilege drop
+        // reports success while leaving the app as root.
+        if self.app.runtime.uid == 0 {
+            return Err(ValidationError::AppRuntimeIdMustNotBeRoot { field: "uid" });
+        }
+        if self.app.runtime.gid == 0 {
+            return Err(ValidationError::AppRuntimeIdMustNotBeRoot { field: "gid" });
+        }
+
         match self.app.mode {
             AppMode::Source => {
                 let source = self
@@ -1012,14 +1125,11 @@ impl Config {
         }
     }
 
-    /// `[profile]` invariants: `[attestation]`/`[sev_snp]` only valid for the matching
-    /// profile, and (sev-snp only) vcpu/ovmf/measured-boot requirements.
+    /// `[profile]` invariants: `[sev_snp]` only valid for the matching profile, and (sev-snp
+    /// only) vcpu/ovmf/measured-boot requirements.
     fn validate_profile(&self) -> Result<(), ValidationError> {
         match self.profile.kind {
             ProfileKind::Casual => {
-                if self.attestation.is_some() {
-                    return Err(ValidationError::AttestationRequiresSevSnp);
-                }
                 if self.sev_snp.is_some() {
                     return Err(ValidationError::SevSnpSectionRequiresSevSnpProfile);
                 }
@@ -1086,9 +1196,7 @@ mod tests {
     use super::*;
 
     fn base_config() -> Config {
-        crate::pipeline::docker::test_fixtures::casual_config_with_formats(vec![
-            OutputFormat::Cpio,
-        ])
+        crate::pipeline::docker::test_fixtures::casual_config_with_formats(vec![OutputFormat::Cpio])
     }
 
     fn sev_snp_section() -> SevSnp {
@@ -1175,45 +1283,200 @@ mod tests {
         );
     }
 
+    fn ipv6_config() -> Config {
+        let mut config = base_config();
+        config.network.mode = NetworkMode::Ipv6;
+        config
+    }
+
+    fn static_v6(address: &str) -> Ipv6Static {
+        Ipv6Static {
+            address: address.to_string(),
+            prefix_len: default_ipv6_prefix_len(),
+            gateway: None,
+            interface: None,
+        }
+    }
+
     #[test]
-    fn zero_attestation_port_rejected() {
-        let mut config = sev_snp_base_config();
-        config.sev_snp = Some(sev_snp_section());
-        config.attestation = Some(Attestation {
-            enabled: true,
-            port: 0,
+    fn a_routable_static_ipv6_is_accepted() {
+        let mut config = ipv6_config();
+        config.network.ipv6_static = Some(static_v6("2001:db8:1:2::1"));
+        assert!(config.validate().is_ok());
+
+        // A single delegated address, the other shape a provider hands out.
+        let mut config = ipv6_config();
+        config.network.ipv6_static = Some(Ipv6Static {
+            prefix_len: 128,
+            ..static_v6("2001:db8::5")
         });
+        assert!(config.validate().is_ok());
+
+        // Dual-stack counts as having IPv6.
+        let mut config = ipv6_config();
+        config.network.mode = NetworkMode::Dual;
+        config.network.ipv6_static = Some(static_v6("2001:db8:1:2::1"));
+        assert!(config.validate().is_ok());
+    }
+
+    /// Every one of these builds an image that boots, looks healthy, and cannot be reached —
+    /// which on a guest with no readable console is indistinguishable from a broken app.
+    #[test]
+    fn an_unreachable_static_ipv6_is_rejected() {
+        for address in ["fe80::1", "::1", "::", "ff02::1"] {
+            let mut config = ipv6_config();
+            config.network.ipv6_static = Some(static_v6(address));
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ValidationError::Ipv6StaticAddressNotRoutable(_))
+                ),
+                "{address} should be rejected as unreachable"
+            );
+        }
+
+        let mut config = ipv6_config();
+        config.network.ipv6_static = Some(static_v6("not-an-address"));
         assert!(matches!(
             config.validate(),
-            Err(ValidationError::AttestationPortMustNotBeZero)
+            Err(ValidationError::Ipv6StaticAddressUnparseable(_))
+        ));
+
+        // An IPv4 address in the IPv6 field is the likeliest typo of all.
+        let mut config = ipv6_config();
+        config.network.ipv6_static = Some(static_v6("192.0.2.1"));
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::Ipv6StaticAddressUnparseable(_))
         ));
     }
 
     #[test]
-    fn app_uid_colliding_with_attestation_uid_rejected_when_enabled() {
-        let mut config = sev_snp_base_config();
-        config.sev_snp = Some(sev_snp_section());
-        config.attestation = Some(Attestation {
-            enabled: true,
-            port: default_attestation_port(),
+    fn static_ipv6_prefix_len_and_gateway_are_checked() {
+        for prefix_len in [0, 129] {
+            let mut config = ipv6_config();
+            config.network.ipv6_static = Some(Ipv6Static {
+                prefix_len,
+                ..static_v6("2001:db8:1:2::1")
+            });
+            assert!(matches!(
+                config.validate(),
+                Err(ValidationError::Ipv6StaticPrefixLenOutOfRange(_))
+            ));
+        }
+
+        let mut config = ipv6_config();
+        config.network.ipv6_static = Some(Ipv6Static {
+            gateway: Some("fe80::1".to_string()),
+            ..static_v6("2001:db8:1:2::1")
         });
-        config.app.runtime.uid = ATTESTATION_UID;
+        assert!(
+            config.validate().is_ok(),
+            "a link-local gateway is normal — that check is only for the address"
+        );
+
+        let mut config = ipv6_config();
+        config.network.ipv6_static = Some(Ipv6Static {
+            gateway: Some("nope".to_string()),
+            ..static_v6("2001:db8:1:2::1")
+        });
         assert!(matches!(
             config.validate(),
-            Err(ValidationError::AppRuntimeUidCollidesWithAttestation)
+            Err(ValidationError::Ipv6StaticGatewayUnparseable(_))
+        ));
+    }
+
+    /// The guest compiles no IPv6 stack at all in these modes, so the address would be baked
+    /// into an image that can never apply it.
+    #[test]
+    fn static_ipv6_without_an_ipv6_stack_is_rejected() {
+        for mode in [NetworkMode::Ipv4, NetworkMode::None] {
+            let mut config = base_config();
+            config.network.mode = mode;
+            config.network.ipv6_static = Some(static_v6("2001:db8:1:2::1"));
+            assert!(matches!(
+                config.validate(),
+                Err(ValidationError::Ipv6StaticRequiresIpv6)
+            ));
+        }
+    }
+
+    #[test]
+    fn kv_pair_that_the_wire_format_cannot_round_trip_is_rejected() {
+        let semicolon_cases = [
+            ("PATH".to_string(), "/usr/bin;/bin".to_string()),
+            ("A;B".to_string(), "value".to_string()),
+            ("A=B".to_string(), "value".to_string()),
+        ];
+        for (key, value) in semicolon_cases {
+            let mut config = base_config();
+            config.app.runtime.env = BTreeMap::from([(key.clone(), value)]);
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ValidationError::UnrepresentableKvPair { .. })
+                ),
+                "{key:?} should not be encodable"
+            );
+        }
+
+        // extra_sysctls shares the encoding, so it shares the check.
+        let mut config = base_config();
+        config.hardening.extra_sysctls = BTreeMap::from([(
+            "/proc/sys/net/ipv4/tcp_rmem".to_string(),
+            "4096;87380".to_string(),
+        )]);
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::UnrepresentableKvPair { .. })
+        ));
+
+        // A value containing '=' is fine: the guest splits on the *first* '=' only.
+        let mut config = base_config();
+        config.app.runtime.env = BTreeMap::from([("OPTS".to_string(), "a=b".to_string())]);
+        assert!(config.validate().is_ok());
+    }
+
+    /// `setuid(0)` succeeds and changes nothing, so a root uid here would produce a guest whose
+    /// privilege drop reports success while the app keeps owning every root-owned file.
+    #[test]
+    fn root_app_uid_or_gid_rejected() {
+        let mut config = base_config();
+        config.app.runtime.uid = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::AppRuntimeIdMustNotBeRoot { field: "uid" })
+        ));
+
+        let mut config = base_config();
+        config.app.runtime.gid = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::AppRuntimeIdMustNotBeRoot { field: "gid" })
         ));
     }
 
     #[test]
-    fn app_uid_colliding_with_attestation_uid_allowed_when_disabled() {
-        // The reserved uid only matters once the attestation server can actually spawn.
-        let mut config = sev_snp_base_config();
-        config.sev_snp = Some(sev_snp_section());
-        config.attestation = Some(Attestation {
-            enabled: false,
-            port: default_attestation_port(),
-        });
-        config.app.runtime.uid = ATTESTATION_UID;
+    fn extra_sysctl_key_outside_proc_sys_rejected() {
+        for key in [
+            "/etc/passwd",
+            "net.ipv4.ip_forward",
+            "/proc/sys/../../payload/app",
+        ] {
+            let mut config = base_config();
+            config.hardening.extra_sysctls = BTreeMap::from([(key.to_string(), "1".to_string())]);
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ValidationError::ExtraSysctlNotUnderProcSys(_))
+                ),
+                "{key:?} should not be writable as a sysctl"
+            );
+        }
+
+        let mut config = base_config();
+        config.hardening.extra_sysctls =
+            BTreeMap::from([("/proc/sys/net/ipv4/ip_forward".to_string(), "0".to_string())]);
         assert!(config.validate().is_ok());
     }
 
@@ -1367,19 +1630,6 @@ mod tests {
 
         config.project.cargo_unikernel_version = Some(CLI_VERSION.to_string());
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn attestation_requires_sev_snp_profile() {
-        let mut config = base_config();
-        config.attestation = Some(Attestation {
-            enabled: true,
-            port: default_attestation_port(),
-        });
-        assert!(matches!(
-            config.validate(),
-            Err(ValidationError::AttestationRequiresSevSnp)
-        ));
     }
 
     #[test]

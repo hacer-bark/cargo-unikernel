@@ -5,7 +5,12 @@ members = ["cargo-unikernel-common", "cargo-unikernel-init"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
+authors = ["Hacer-Bark <hacer.bark@proton.me>"]
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/hacer-bark/cargo-unikernel"
+homepage = "https://github.com/hacer-bark/cargo-unikernel"
+keywords = ["unikernel", "sev-snp", "guest", "pid1"]
+categories = ["os"]
 
 [profile.release]
 opt-level = 3

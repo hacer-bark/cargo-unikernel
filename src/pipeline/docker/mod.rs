@@ -228,7 +228,11 @@ fn run_build_container(
         (last_build_dir.to_path_buf(), "/build-meta", false),
         (cache_root.join("kernel-build"), "/build", false),
         (cache_root.join("ccache"), "/root/.cache/ccache", false),
-        (cache_root.join("cargo/registry"), "/root/.cargo/registry", false),
+        (
+            cache_root.join("cargo/registry"),
+            "/root/.cargo/registry",
+            false,
+        ),
         (cache_root.join("cargo/git"), "/root/.cargo/git", false),
         (cache_root.join("target"), "/tmp/cargo-target", false),
     ];
@@ -431,28 +435,22 @@ pub mod test_fixtures {
             kernel: Kernel::default(),
             toolchain: ToolchainPins::default(),
             hardening: Hardening::default(),
-            attestation: None,
             sev_snp: None,
             output: Output {
                 formats,
                 dir: "dist/".to_string(),
             },
             release: Release::default(),
-            debug: false,
         }
     }
 
     /// A minimal valid sev-snp-profile `Config` requesting the given output `formats`.
     #[must_use]
     pub fn sev_snp_config_with_formats(formats: Vec<OutputFormat>) -> Config {
-        use crate::schema::{Attestation, OvmfSource, SevSnp};
+        use crate::schema::{OvmfSource, SevSnp};
         let mut config = casual_config_with_formats(formats);
         config.profile.kind = ProfileKind::SevSnp;
         config.project.cargo_unikernel_version = Some(crate::schema::CLI_VERSION.to_string());
-        config.attestation = Some(Attestation {
-            enabled: false,
-            port: 8080,
-        });
         config.sev_snp = Some(SevSnp {
             vcpus: 2,
             vcpu_type: "EPYC-v3".to_string(),

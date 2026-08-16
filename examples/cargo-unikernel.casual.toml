@@ -54,14 +54,26 @@ gid = 65534
 
 # [app.runtime.limits]
 # setrlimit ceilings applied before exec. Shown with defaults.
-# max_open_files = 65536   # RLIMIT_NOFILE
-# max_processes = 2048     # RLIMIT_NPROC
-# max_memory_mb = 0        # RLIMIT_AS in MiB; 0 = no cap
+# max_open_files = 65536     # RLIMIT_NOFILE
+# max_processes = 2048       # RLIMIT_NPROC
+# max_memory_mb = 0          # RLIMIT_AS in MiB; 0 = no cap
 # max_locked_memory_mb = 64  # RLIMIT_MEMLOCK in MiB — how much the app may mlock
 
 [network]
 # "ipv4", "ipv6", "dual", or "none" — compile-time choice; unselected protocols aren't built in.
+# IPv4 addresses come from DHCP (kernel `ip=dhcp`); IPv6 comes from SLAAC, which means one
+# global /64 per advertised prefix and no address at all from a routed /48 or /56 — there is no
+# DHCPv6-PD client here. See docs/architecture.md#network-addressing.
 mode = "ipv4"
+
+# A SLAAC address is derived from the MAC the hypervisor picked, so you cannot know it before
+# boot — and on a guest whose console you cannot read, that means no address you could have put
+# in DNS. Uncomment to pin one instead. Assigned in addition to SLAAC, not instead of it.
+# [network.ipv6_static]
+# address = "2001:db8:1:2::1"   # any host part in your /64; ::1 is the conventional pick
+# prefix_len = 64               # 128 for a single delegated address
+# gateway = "fe80::1"           # only if the provider sends no router advertisements
+# interface = "eth0"            # only on a multi-NIC guest
 
 [storage]
 # "ram" (default): /var is wiped every reboot. "persistent": /var lives on a virtio-blk disk;
@@ -121,11 +133,11 @@ formats = ["cpio", "iso", "uki"]
 dir = "dist/"
 
 [release]
-# Assets `cargo-unikernel release` attaches to the GitHub Release; omit to attach everything
-# produced (the default). sev-snp adds "measurement" and "ovmf" to the valid set.
-# assets = ["cpio", "uki", "binary"]
+# Omit `assets` to attach every produced asset (the default). For sev-snp, keeping
+# "measurement" and "ovmf" lets a third party verify the launch measurement without rebuilding.
+# assets = ["cpio", "uki", "measurement", "ovmf"]
 
-# title = "My App Release"   # defaults to the tag name
+# title = "My App Release"                # defaults to the tag name
 
 # notes = "See CHANGELOG.md for details." # mutually exclusive with notes_file
 # notes_file = "RELEASE_NOTES.md"         # path relative to this config file

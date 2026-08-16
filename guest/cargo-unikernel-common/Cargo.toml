@@ -2,12 +2,14 @@
 name = "cargo-unikernel-common"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Shared guest-side PID-1 primitives for cargo-unikernel-init."
 readme = "README.md"
-repository = "https://codeberg.org/hacer-bark/cargo-unikernel"
-keywords = ["unikernel", "sev-snp", "guest", "pid1"]
-categories = ["os", "no-std"]
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 libc = "0.2"

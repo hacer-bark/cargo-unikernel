@@ -25,11 +25,19 @@ fn apply_network_spoofing_protection(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", b"1", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/default/rp_filter", b"1", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/all/accept_redirects", b"0", warn);
-    write_sysctl("/proc/sys/net/ipv4/conf/default/accept_redirects", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv4/conf/default/accept_redirects",
+        b"0",
+        warn,
+    );
     write_sysctl("/proc/sys/net/ipv4/conf/all/send_redirects", b"0", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/default/send_redirects", b"0", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/all/secure_redirects", b"0", warn);
-    write_sysctl("/proc/sys/net/ipv4/conf/default/secure_redirects", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv4/conf/default/secure_redirects",
+        b"0",
+        warn,
+    );
     // A single-purpose guest should never silently double as a router between interfaces.
     write_sysctl("/proc/sys/net/ipv4/ip_forward", b"0", warn);
     write_sysctl("/proc/sys/net/ipv6/conf/all/forwarding", b"0", warn);
@@ -119,6 +127,61 @@ pub fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
     apply_kexec_and_fs_protection(&warn);
 
     for (path, val) in extra {
+        if !is_sysctl_path(path) {
+            warn(&format!(
+                "Refusing to write {path:?}: `extra_sysctls` keys must be paths under \
+                 /proc/sys/ with no `..` component"
+            ));
+            continue;
+        }
         write_sysctl(path, val.as_bytes(), &warn);
+    }
+}
+
+/// Whether `path` is confined to `/proc/sys/`.
+///
+/// The host tool checks this too, when it validates the config that bakes these keys in
+/// (`schema::Config::validate_extra_sysctl_paths`) — this is the same check standing where the
+/// write actually happens. PID 1 runs it as root, before `lockdown_filesystem` seals anything,
+/// so an unconfined key isn't a broken sysctl, it's a root write to whatever path it names. That
+/// is worth two lines on this side rather than resting entirely on a check in a different
+/// binary, built at a different time, from a version of the tool this image can't inspect.
+///
+/// `..` is rejected separately: a prefix check alone accepts `/proc/sys/../../etc/passwd`.
+fn is_sysctl_path(path: &str) -> bool {
+    path.starts_with("/proc/sys/") && !path.split('/').any(|part| part == "..")
+}
+
+#[cfg(test)]
+// Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
+// smell — this is the standard justified exception to these lints.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sysctl_paths_are_confined_to_proc_sys() {
+        assert!(is_sysctl_path("/proc/sys/net/ipv4/ip_forward"));
+        assert!(!is_sysctl_path("/etc/passwd"));
+        assert!(!is_sysctl_path("proc/sys/net/ipv4/ip_forward"));
+        assert!(!is_sysctl_path("/proc/self/mem"));
+        // A prefix check alone would accept this one.
+        assert!(!is_sysctl_path("/proc/sys/../../payload/app"));
+    }
+
+    /// The guard has to reject before the write, not merely log alongside it.
+    #[test]
+    fn an_unconfined_key_is_skipped_rather_than_written() {
+        let target = std::env::temp_dir().join("cuk-sysctl-escape-test");
+        let _ = std::fs::remove_file(&target);
+        let path = target.to_str().unwrap().to_string();
+
+        let warnings = std::cell::RefCell::new(Vec::new());
+        apply(&[(path.as_str(), "1")], |w| {
+            warnings.borrow_mut().push(w.to_string());
+        });
+
+        assert!(!target.exists(), "the write escaped /proc/sys/");
+        assert!(warnings.borrow().iter().any(|w| w.contains("Refusing")));
     }
 }

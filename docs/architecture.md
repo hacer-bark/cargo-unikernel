@@ -53,37 +53,131 @@ flowchart TB
 The app is already embedded at build time, so the sequence is short:
 
 1. `mlockall` — lock all pages, no swap.
-2. Mount `/proc`, `/sys`, `/dev`, `/tmp`+`/var` (noexec unless
-   `[app.runtime.danger].allow_write_execute`), `/run`, `/payload`. `/var` is tmpfs unless
-   `[storage].mode = "persistent"`, in which case it's the virtio-blk device, formatted ext4
-   on first use (a device whose superblock doesn't carry this tool's volume label is wiped
-   rather than mounted — the check reads the raw device, before the kernel's ext4 driver sees
-   it), then `chown`'d to the app's uid/gid.
+2. Mount `/proc` (`hidepid=2`), `/sys`, `/dev`, `/tmp`+`/var` (noexec unless
+   `[app.runtime.danger].allow_write_execute`), `/run`, `/dev/shm`, `/payload`. Every writable
+   tmpfs carries an explicit `size=` (none defaults to half of guest RAM). `/var` is tmpfs
+   unless `[storage].mode = "persistent"`, in which case it's the virtio-blk device,
+   formatted ext4 on first use — a device whose superblock doesn't carry this tool's volume
+   label is wiped rather than mounted (checked from userspace, before the kernel's ext4
+   driver sees it) — then `chown`'d to the app's uid/gid.
 3. Bring up loopback + admin-down interfaces, apply sysctl hardening for whatever's enabled.
-4. Wait for kernel entropy, then poll (up to 30s) for a default route — skipped when
-   `[network].mode = "none"`.
+   Only `lo`'s IPv4 address is set here; everything else comes from DHCP or SLAAC — see
+   [Network addressing](#network-addressing).
+4. Wait (up to 30s) for the kernel CRNG to report itself seeded — **fatal if it doesn't**,
+   since starting the app anyway means it may generate keys from an unseeded pool. Then poll
+   (up to 30s) for an up default route — skipped when `[network].mode = "none"`.
 5. Remount `/payload` read-only and `/tmp`/`/run` back to noexec (unless
    `allow_write_execute`); `/var` is never remounted. This happens before the app exists, so
    there is no window in which a running app faces a still-writable payload mount.
 6. `exec` the app as an unprivileged child. Before `execve`, in order: apply `setrlimit`
    ceilings from `[app.runtime.limits]` (raising one above the kernel default needs
-   `CAP_SYS_RESOURCE`, so this runs before the capability drop below removes it); drop the
+   `CAP_SYS_RESOURCE`, so this runs before the capability drop removes it); drop the
    capability bounding set (`PR_CAPBSET_DROP`, while still root — dropping it needs
    `CAP_SETPCAP`); clear supplementary groups and `setgid`/`setuid` to the configured
-   uid/gid; install a mandatory classic-BPF seccomp denylist (gated on the x86_64 syscall
-   ABI, then permanently blocking `ptrace`, kernel-module loading, both mount APIs —
-   `mount(2)` and `fsopen`/`fsmount`/`move_mount` — `kexec`/`reboot`, keyring syscalls,
-   `open_by_handle_at`, clock-setting syscalls, and `memfd_create`/`memfd_secret` unless
-   `allow_write_execute` is set. Ordinary `clone`/`fork`/`execve` is untouched; namespace
-   creation via `clone` is blocked by `CONFIG_NAMESPACES=n` instead).
-7. On sev-snp builds, `/dev/sev-guest` (if present) opens to both the app and the attestation
-   server.
-8. If `[attestation].enabled` (sev-snp only): re-exec as an isolated, unprivileged
-   `run-attestation-server` child through the same privilege-drop sequence, serving SNP
-   reports on `[attestation].port` over plain blocking sockets. See
-   [`attestation_api.md`](attestation_api.md).
-9. PID 1 watchdog loop: any child death or earlier failure triggers immediate power-off — the
-   system never lingers in a degraded state.
+   uid/gid; install a mandatory classic-BPF seccomp denylist — gated on the x86_64 syscall
+   ABI, then permanently blocking `ptrace`, kernel-module loading, both mount APIs
+   (`mount(2)` and `fsopen`/`fsmount`/`move_mount`), `kexec`/`reboot`, keyring syscalls,
+   `open_by_handle_at`, clock-setting syscalls, and `memfd_create`/`memfd_secret` (unless
+   `allow_write_execute`). The filter gates on `AUDIT_ARCH_X86_64` *and* rejects any syscall
+   number carrying `__X32_SYSCALL_BIT`, since x32 reports the same arch and would otherwise
+   slip every check below it. Ordinary `clone`/`fork`/`execve` is untouched; namespace
+   creation via `clone` is blocked by `CONFIG_NAMESPACES=n` instead.
+7. On sev-snp builds, `/dev/sev-guest` (if present) opens to the app, which is what fetches
+   and binds SEV-SNP reports — the image runs no attestation service of its own. See
+   [`threat_model.md`](threat_model.md#remote-attestation-is-the-apps-job).
+8. PID 1 watchdog loop: the app's death or any earlier failure triggers immediate power-off —
+   the system never lingers in a degraded state.
+
+## Network addressing
+
+The init brings interfaces up and nothing else — no DHCPv6 client, no `rdisc6`, no IPv6
+address of its own assignment. What the guest ends up with comes from the kernel and
+whatever the hypervisor's network advertises:
+
+| Protocol | Interface | Address | Assigned by |
+|:---|:---|:---|:---|
+| IPv4 | `lo` | `127.0.0.1/8` | the init, explicitly |
+| IPv4 | NIC | whatever DHCP offers | kernel's built-in autoconfig (`ip=dhcp`) |
+| IPv6 | `lo` | `::1/128` | the kernel, when `lo` comes up |
+| IPv6 | NIC | `fe80::<IID>/64` link-local | the kernel, when the link comes up |
+| IPv6 | NIC | one global `/64` per advertised prefix | SLAAC, from router advertisements |
+| IPv6 | NIC | a fixed address of your choosing | the init, when `[network.ipv6_static]` is set |
+
+**Pin an address with `[network.ipv6_static]`** if you can't read the guest console (the
+normal case on a confidential-computing host) and need something to put in DNS beforehand:
+
+```toml
+[network]
+mode = "ipv6"
+
+[network.ipv6_static]
+address = "2001:db8:1:2::1"   # any host part in your /64; ::1 is conventional
+prefix_len = 64               # 128 for a single delegated address
+# gateway = "fe80::1"         # only if the provider sends no router advertisements
+# interface = "eth0"          # only on a multi-NIC guest
+```
+
+This is *added to* whatever SLAAC produces, not a replacement — router advertisements still
+supply the default route in the common case. `gateway` covers a provider that routes a prefix
+to the VM without advertising it; it's installed at metric 2048 (worse than the kernel's 1024
+for an advertised route) so the two stay separate routes rather than merging into a
+load-balanced multipath entry if a router advertisement does show up. Failures here are
+logged and boot continues — the guest still has its SLAAC address, and not booting is worse
+than an unplanned address. Config-time validation catches unparseable/link-local/loopback
+addresses and bad prefix lengths, since on a console-less guest a bad value otherwise
+produces an image that boots, looks healthy, and is silently unreachable.
+
+**Finding the address:** with `[network.ipv6_static]` set, it's what you configured.
+Otherwise the init logs every address it finds once the network settles, scope labelled:
+
+```
+[INIT] eth0: IPv6 2001:db8:1:2:5054:ff:fe12:3456 (global)
+[INIT] eth0: IPv6 fe80::5054:ff:fe12:3456 (link-local)
+```
+
+The `(global)` one is the address — there's only ever one per advertised prefix, no
+privacy/temporary addresses. To compute it before booting: `<the /64> + EUI-64(MAC)` (Linux
+defaults `addr_gen_mode` to EUI-64) — split the MAC in half, insert `ff:fe`, flip bit `0x02`
+of the first octet:
+
+```
+prefix  2001:db8:1:2::/64
+MAC     52:54:00:12:34:56
+           ↓ flip 0x02 in 52 → 50, insert ff:fe
+IID     5054:00ff:fe12:3456
+result  2001:db8:1:2:5054:ff:fe12:3456
+```
+
+Stable for as long as the MAC is, so it's fine to put in DNS. If the log says **`no global
+IPv6 address`**, nothing advertised a prefix on the link — usually because the provider
+routes the /64 rather than advertising it. Set `[network.ipv6_static]` with a `gateway`.
+
+<details>
+<summary>Why a /64 and never a /48, and who picks the interface identifier</summary>
+
+SLAAC (RFC 4862) concatenates the advertised prefix with a 64-bit interface identifier, so
+the prefix must be exactly 64 bits (RFC 7421) — a Prefix Information Option of any other
+length is simply not used for autoconfiguration. A provider "giving you a /48" is either
+advertising a /64 out of it on your link (works as above; the other 65535 /64s are none of
+this guest's business), or routing the whole /48 to your VM via DHCPv6-PD or a static route —
+which autoconfiguration does *not* pick up, since there's no DHCPv6 client. Use
+`[network.ipv6_static]` for the latter.
+
+The interface identifier itself — in both the link-local and SLAAC address — is derived from
+the NIC's MAC (`addr_gen_mode = eui64`, the default), which the hypervisor chose. Privacy
+extensions are off (`use_tempaddr = 0`), so nothing rotates it. On sev-snp this is worth
+stating plainly: the host already sees every packet's source address, and it also *chose*
+that address, stable for as long as the MAC is — a host-controlled correlator across boots,
+outside what SEV-SNP protects (memory, not network). Change it via
+`net.ipv6.conf.<iface>.addr_gen_mode` in `[hardening].extra_sysctls`, or add an address from
+the app.
+
+One non-obvious interaction: `[hardening.runtime].network_spoofing_protection` sets
+`net.ipv6.conf.all.forwarding=0`. That's also what keeps SLAAC working — Linux ignores router
+advertisements on a forwarding interface, so turning the guest into a router would silently
+cost it its address.
+
+</details>
 
 ## Build pipeline (host)
 
@@ -117,8 +211,8 @@ reimplementing PE/ISO assembly or kernel measurement.
   (build-only) on pushes to `main`, keeping a warm `actions/cache` entry available since
   cache scopes are otherwise isolated per tag. `--attest-provenance` adds a Sigstore-backed
   `actions/attest-build-provenance` step, gated to tag pushes — build-provenance attestation
-  of the release artifacts (distinct from SEV-SNP's `[attestation]`, which attests a
-  *running guest*). Off by default.
+  of the release artifacts — a supply-chain claim about the bytes, distinct from an app's own
+  SEV-SNP report about a *running guest*. Off by default.
 - **`cargo-unikernel release`** builds (unless `--no-build`) and publishes `dist/` via `gh` —
   the same path the generated workflow uses. What's attached and the release
   title/notes/draft come from `[release]`, so editing it changes both local and CI releases.
@@ -167,3 +261,4 @@ boot equipment is provided but no directory /EFI/BOOT`. Expected — `make_iso.s
 EFI boot image via a real El Torito boot catalog entry (Limine's documented recipe) instead
 of a `/EFI/BOOT/BOOTX64.EFI` file; UEFI firmware still finds it as a proper ESP either way. A
 literal `/EFI/BOOT` tree would silence the warning but produce an ISO nothing can boot.
+</content>

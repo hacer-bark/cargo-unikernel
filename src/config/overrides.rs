@@ -105,14 +105,12 @@ mod tests {
             kernel: Kernel::default(),
             toolchain: ToolchainPins::default(),
             hardening: Hardening::default(),
-            attestation: None,
             sev_snp: None,
             output: Output {
                 formats: vec![OutputFormat::Cpio],
                 dir: "dist/".to_string(),
             },
             release: Release::default(),
-            debug: false,
         }
     }
 
