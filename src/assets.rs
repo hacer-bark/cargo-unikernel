@@ -51,6 +51,7 @@ pub fn materialize() -> Result<PathBuf> {
 
     extract(&BUILD_ASSETS, &build_dir)?;
     extract(&GUEST_SOURCE, &guest_dir)?;
+    restore_guest_manifests(&guest_dir)?;
 
     make_scripts_executable(&build_dir)?;
     std::fs::write(&marker, b"")
@@ -73,6 +74,46 @@ fn extract(dir: &Dir<'_>, dest: &Path) -> Result<()> {
         extract(sub, dest)?;
     }
     Ok(())
+}
+
+/// Renames every extracted `Cargo.toml.dist` back to `Cargo.toml`, so the container sees a
+/// normal Cargo workspace.
+///
+/// The guest tree is checked in with that suffix in the first place because `cargo package`
+/// unconditionally excludes any subdirectory containing a literal `Cargo.toml` from the
+/// published tarball — with no `include`/`exclude` override — which would otherwise make
+/// this whole guest source vanish from every crates.io release. See `guest/setup.sh`, which
+/// does the same rename for local guest-workspace development.
+fn restore_guest_manifests(guest_dir: &Path) -> Result<()> {
+    for entry in walk(guest_dir)? {
+        if entry.file_name().is_some_and(|n| n == "Cargo.toml.dist") {
+            let restored = entry.with_extension("");
+            std::fs::rename(&entry, &restored).with_context(|| {
+                format!(
+                    "failed to rename {} to {}",
+                    entry.display(),
+                    restored.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path)?);
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 fn make_scripts_executable(build_dir: &Path) -> Result<()> {

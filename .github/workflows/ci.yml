@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: materialize guest/**/Cargo.toml
+        run: guest/setup.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -77,6 +79,8 @@ jobs:
             flags: --no-default-features --features sev-snp,net-ipv4
     steps:
       - uses: actions/checkout@v5
+      - name: materialize guest/**/Cargo.toml
+        run: guest/setup.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -92,6 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: materialize guest/**/Cargo.toml
+        run: guest/setup.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl

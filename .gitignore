@@ -1,5 +1,10 @@
 /target
 guest/target
+# Materialized by guest/setup.sh from the checked-in `Cargo.toml.dist` copies — see that
+# script for why the guest workspace can't check in real `Cargo.toml` files.
+guest/Cargo.toml
+guest/cargo-unikernel-common/Cargo.toml
+guest/cargo-unikernel-init/Cargo.toml
 /linux-*
 /rootfs
 linux.tar.xz
