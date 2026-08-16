@@ -6,7 +6,7 @@
 pub mod auto_detect;
 /// CLI-flag overrides applied on top of a loaded `Config`.
 pub mod overrides;
-/// `cargo-unikernel init` — writes a starting `cargo-unikernel.toml`.
+/// `cargo unikernel init` — writes a starting `cargo-unikernel.toml`.
 pub mod scaffold;
 
 pub use overrides::{BuildOverrides, apply_overrides};
@@ -39,7 +39,7 @@ pub fn load(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-/// Resolves the effective config + project directory for `cargo-unikernel build`:
+/// Resolves the effective config + project directory for `cargo unikernel build`:
 /// - an explicit `-c/--config` always loads that exact file (error if missing)
 /// - otherwise, `./cargo-unikernel.toml` is used if it exists
 /// - otherwise, zero-config auto-detection kicks in (see `auto_detect`)

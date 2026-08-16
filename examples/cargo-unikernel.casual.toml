@@ -1,6 +1,6 @@
 # cargo-unikernel config — "casual" profile
 #
-# Not required: `cargo-unikernel build` with no config auto-detects a Rust project and builds
+# Not required: `cargo unikernel build` with no config auto-detects a Rust project and builds
 # this same shape by default. Scaffold this only to change a default. Every field is
 # documented with its type/allowed values and default.
 

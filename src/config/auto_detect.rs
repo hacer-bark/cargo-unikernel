@@ -51,7 +51,7 @@ pub(super) fn detect(project_dir: &Path, binary_override: Option<PathBuf>) -> Re
 
         println!(
             "No cargo-unikernel.toml found — auto-detected Cargo project '{name}'. \
-             Run `cargo-unikernel init` to customize instead of relying on defaults."
+             Run `cargo unikernel init` to customize instead of relying on defaults."
         );
 
         return Ok(build_config(
@@ -76,7 +76,7 @@ pub(super) fn detect(project_dir: &Path, binary_override: Option<PathBuf>) -> Re
 
     bail!(
         "no cargo-unikernel.toml and no Cargo.toml found in {} — either run \
-         `cargo-unikernel init`, or pass `--binary <path>` to embed an existing binary",
+         `cargo unikernel init`, or pass `--binary <path>` to embed an existing binary",
         project_dir.display()
     )
 }

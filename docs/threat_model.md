@@ -66,7 +66,7 @@ measured.
 | `toolchain = "generic"` pulls in something malicious | Runs in the same pinned container; `extra_apt_packages` are Ubuntu-repo only | Only as strong as your own `build_command` — not audited |
 | Accidentally dynamically-linked binary | `readelf` fails the build immediately, naming missing libraries | Mitigated — a correctness class, not an exploit |
 | Malicious/wrong OVMF firmware | `preset = "builtin"` is baked into the CLI, never fetched; a provider-supplied `path` is always a local file, but a wrong one isn't detectable | Only as strong as the source you trust |
-| `cargo-unikernel release`'s `gh` invocation | Runs with whatever `gh auth`/CI token scope is available | Standard CI-secret hygiene; workflow scopes `contents: write` only |
+| `cargo unikernel release`'s `gh` invocation | Runs with whatever `gh auth`/CI token scope is available | Standard CI-secret hygiene; workflow scopes `contents: write` only |
 
 ### Runtime exploitation (both profiles)
 
@@ -110,7 +110,7 @@ own protocol, which is why this can't live in a generic server.
 **A workable shape:** generate a keypair at startup, set
 `REPORT_DATA = SHA-512(peer_nonce ‖ public_key)`, serve the report and public key together,
 terminate TLS on that key. The peer checks the report's signature chain, checks the measurement
-against one it computed with `cargo-unikernel measure`, recomputes the `REPORT_DATA` hash from
+against one it computed with `cargo unikernel measure`, recomputes the `REPORT_DATA` hash from
 its nonce and the key it received, and only then trusts the channel.
 
 ## Persistent storage is outside the sev-snp guarantee

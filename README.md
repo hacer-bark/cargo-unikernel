@@ -12,8 +12,7 @@
 
 > **0.0.1, pre-release.** Config schema, CLI flags, and the generated GitHub Actions workflow
 > can change between versions without warning. Pin an exact version
-> (`project.cargo_unikernel_version` in `cargo-unikernel.toml`) and re-verify on upgrade if
-> you need something stable today.
+> (`project.cargo_unikernel_version` in `cargo-unikernel.toml`) and re-verify on upgrade.
 
 ```sh
 cargo install cargo-unikernel
@@ -104,12 +103,12 @@ Zero-config always builds the `casual` profile with the Rust toolchain. To pick 
 generic build command, specific output formats, a pre-built binary, or tuned hardening:
 
 ```sh
-cargo-unikernel init # writes ./cargo-unikernel.toml
+cargo unikernel init # writes ./cargo-unikernel.toml
 nano cargo-unikernel.toml
-cargo-unikernel build
+cargo unikernel build
 ```
 
-`cargo-unikernel init --profile <casual|sev-snp>` picks the starting point. See
+`cargo unikernel init --profile <casual|sev-snp>` picks the starting point. See
 `examples/cargo-unikernel.casual.toml` and `examples/cargo-unikernel.sev-snp.toml` — each is
 a fully-commented reference covering all three app-acquisition modes.
 
@@ -135,7 +134,7 @@ capability bounding set is unconditionally dropped to empty before exec. See
 
 **Caching.** The kernel source tarball and the compiled bzImage (per kernel version +
 hardening config) are cached under `~/.cache/cargo-unikernel/` — an app-only change skips the
-kernel step entirely. `ccache` covers everything else. `cargo-unikernel github init`'s
+kernel step entirely. `ccache` covers everything else. `cargo unikernel github init`'s
 workflow caches the same directory across CI runs, and also builds (never publishes) on every
 push to `main` so a tag-triggered release always inherits a warm cache (GitHub Actions cache
 scopes are isolated per tag).
@@ -149,25 +148,25 @@ no TOCTOU gap, and for SEV-SNP the launch measurement already covers the exact a
 
 ## CLI
 
-- `cargo-unikernel build` — build the image(s); zero-config or from a config file.
-- `cargo-unikernel init` — scaffold a `cargo-unikernel.toml` when customization is needed.
-- `cargo-unikernel measure` — recompute the SEV-SNP launch measurement from already-built
+- `cargo unikernel build` — build the image(s); zero-config or from a config file.
+- `cargo unikernel init` — scaffold a `cargo-unikernel.toml` when customization is needed.
+- `cargo unikernel measure` — recompute the SEV-SNP launch measurement from already-built
   artifacts without a full rebuild (`sev-snp` profile only).
-- `cargo-unikernel doctor` — check the host toolchain (Docker, git, gh).
-- `cargo-unikernel github init` — write `.github/workflows/cargo-unikernel.yml`: a `v*` tag
+- `cargo unikernel doctor` — check the host toolchain (Docker, git, gh).
+- `cargo unikernel github init` — write `.github/workflows/cargo-unikernel.yml`: a `v*` tag
   push builds and publishes a GitHub Release automatically.
-- `cargo-unikernel release` — build (unless `--no-build`) and publish a GitHub Release via
+- `cargo unikernel release` — build (unless `--no-build`) and publish a GitHub Release via
   `gh` right now. Attached artifacts and release title/notes/draft/prerelease are
   configurable via `[release]` in `cargo-unikernel.toml`.
 
 ## CI/CD via GitHub Actions
 
-`cargo-unikernel github init` writes a workflow that, on every `v*`-glob tag push, installs
+`cargo unikernel github init` writes a workflow that, on every `v*`-glob tag push, installs
 `cargo-unikernel`, builds, and publishes a GitHub Release. It also builds (never publishes) on
 every push to `main`, purely to keep the cache warm.
 
 If `cargo-unikernel.toml` pins `project.cargo_unikernel_version`, the generated workflow
-installs that exact version instead of latest — `cargo-unikernel build` also fails closed
+installs that exact version instead of latest — `cargo unikernel build` also fails closed
 (`ValidationError::ToolVersionMismatch`) if a different version ever runs against it. Re-run
 `github init` after changing the pin.
 
@@ -189,9 +188,9 @@ Set `profile.kind = "sev-snp"` and a `[sev_snp]` section (`vcpus`, `vcpu_type`,
 `kernel_cmdline`). This is the only profile where `project.cargo_unikernel_version` is
 mandatory — a different CLI version can bundle a different pinned kernel/Dockerfile, which
 would silently change the launch measurement. `build`/`measure` refuse to run unpinned or
-under a mismatched version. `cargo-unikernel init --profile sev-snp` sets this automatically.
+under a mismatched version. `cargo unikernel init --profile sev-snp` sets this automatically.
 
-`cargo-unikernel build` then:
+`cargo unikernel build` then:
 
 1. Builds the kernel with the SEV-SNP attestation Kconfig fragment on top of the hardening
    baseline.

@@ -64,7 +64,7 @@ anywhere, any day.
 
 - **Mode A** (`path`): builds whatever's on disk right now — as reproducible as your working
   tree. For third-party verification (e.g. a trusted sev-snp measurement), build via a
-  tagged CI release (`cargo-unikernel github init` triggers on any `v*` tag) instead, so
+  tagged CI release (`cargo unikernel github init` triggers on any `v*` tag) instead, so
   "the input" is an immutable, publicly-inspectable commit rather than an uncommitted local
   tree.
 - **Mode B**: `[app.binary].path` is always a local file — `cargo-unikernel` never fetches it
@@ -92,7 +92,7 @@ anywhere, any day.
 git clone <this-app-repo>
 git checkout <the-tagged-release-you're-verifying>
 # run the equivalent build inside assets/docker/Dockerfile.reproducible yourself,
-# or just re-run `cargo-unikernel build` against the same config at that commit.
+# or just re-run `cargo unikernel build` against the same config at that commit.
 ```
 
 For sev-snp, compare the resulting `dist/sev_measurement.txt` (and inspect

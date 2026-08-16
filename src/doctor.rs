@@ -1,4 +1,4 @@
-//! `cargo-unikernel doctor` — checks the host toolchain (Docker, git, gh).
+//! `cargo unikernel doctor` — checks the host toolchain (Docker, git, gh).
 
 use anyhow::Result;
 
@@ -21,7 +21,7 @@ pub fn run() -> Result<()> {
     check("git", &["git", "--version"], &mut ok);
     let mut gh_ok = true;
     check(
-        "gh (optional, for `cargo-unikernel release`)",
+        "gh (optional, for `cargo unikernel release`)",
         &["gh", "--version"],
         &mut gh_ok,
     );
@@ -42,7 +42,7 @@ pub fn run() -> Result<()> {
         anyhow::bail!("one or more required host tools are missing — see above");
     }
     println!(
-        "\nDocker + git (+ gh, for `cargo-unikernel release`) are all this host needs — \
+        "\nDocker + git (+ gh, for `cargo unikernel release`) are all this host needs — \
          cpio/xorriso/ukify/sev-snp-measure.py run inside the pinned build container."
     );
     Ok(())

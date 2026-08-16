@@ -17,7 +17,7 @@ project":
 
 ## Rust source build (the default)
 
-Run `cargo-unikernel build` in a directory with a `Cargo.toml` and it just works — project
+Run `cargo unikernel build` in a directory with a `Cargo.toml` and it just works — project
 name, source location, and build command are all inferred. This is the only path that
 supports full auto-detection.
 

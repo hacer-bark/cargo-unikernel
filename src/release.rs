@@ -1,4 +1,4 @@
-//! `cargo-unikernel release`: build (unless `--no-build`) and publish the resulting
+//! `cargo unikernel release`: build (unless `--no-build`) and publish the resulting
 //! artifacts as a GitHub Release via the `gh` CLI.
 //!
 //! Which `dist/` assets are attached and the release body/metadata are driven by the
@@ -134,7 +134,7 @@ fn check_gh_available() -> Result<()> {
         .is_ok_and(|o| o.status.success());
     if !ok {
         bail!(
-            "the GitHub CLI (`gh`) is required for `cargo-unikernel release` — \
+            "the GitHub CLI (`gh`) is required for `cargo unikernel release` — \
              install it from https://cli.github.com and run `gh auth login`"
         );
     }

@@ -79,14 +79,14 @@ pub fn run() -> Result<()> {
                 .unwrap_or_else(|| ".".into());
             let loaded = config::load(&config_path)?;
             if loaded.profile.kind != ProfileKind::SevSnp {
-                bail!("`cargo-unikernel measure` only applies to profile.kind = \"sev-snp\"");
+                bail!("`cargo unikernel measure` only applies to profile.kind = \"sev-snp\"");
             }
             let dist = project_dir.join(loaded.output.dir.trim_end_matches('/'));
             let bzimage = dist.join(format!("{}.bzImage", loaded.project.name));
             let cpio = dist.join(format!("{}.cpio", loaded.project.name));
             if !bzimage.exists() || !cpio.exists() {
                 bail!(
-                    "no existing build artifacts found in {} — run `cargo-unikernel build` first",
+                    "no existing build artifacts found in {} — run `cargo unikernel build` first",
                     dist.display()
                 );
             }

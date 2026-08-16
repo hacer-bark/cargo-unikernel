@@ -20,7 +20,7 @@ kind = "sev-snp"
 # "binary" — skip compiling; embed an already-built binary via [app.binary] instead.
 mode = "source"
 
-# Consider building via a tagged release workflow (`cargo-unikernel github init`) so the
+# Consider building via a tagged release workflow (`cargo unikernel github init`) so the
 # measurement corresponds to an immutable, inspectable commit rather than uncommitted disk state.
 [app.source]
 path = "."

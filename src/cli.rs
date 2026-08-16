@@ -79,7 +79,7 @@ pub enum Command {
     },
 }
 
-/// `cargo-unikernel github` subcommands.
+/// `cargo unikernel github` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum GithubCommand {
     /// Write .github/workflows/cargo-unikernel.yml, which builds and publishes a release

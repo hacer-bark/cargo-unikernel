@@ -2,7 +2,7 @@ use crate::cli::ProfileArg;
 use crate::schema::{Config, OutputFormat, ProfileKind};
 use anyhow::{Result, bail};
 
-/// `cargo-unikernel build`'s CLI flags that override a loaded (or auto-detected) `Config`.
+/// `cargo unikernel build`'s CLI flags that override a loaded (or auto-detected) `Config`.
 #[derive(Debug, Default)]
 pub struct BuildOverrides {
     /// Overrides `output.formats` — parsed comma-separated format names.

@@ -13,7 +13,7 @@ binary, so the tool works from any directory after a plain `cargo install`.
 flowchart TB
     subgraph HOST["Host: cargo-unikernel binary"]
         PROJ["Your project (any dir, cargo install'd tool)"]
-        BUILD["cargo-unikernel build"]
+        BUILD["cargo unikernel build"]
         ASSETS["crate::assets::materialize()<br/>embedded via include_dir! at compile time"]
         PROJ --> BUILD
         ASSETS --> BUILD
@@ -181,7 +181,7 @@ cost it its address.
 
 ## Build pipeline (host)
 
-`cargo-unikernel build` (`src/pipeline/`):
+`cargo unikernel build` (`src/pipeline/`):
 
 1. **Config resolution** — explicit `-c`, else `./cargo-unikernel.toml`, else zero-config
    auto-detection (`Cargo.toml` → casual Mode A `path="."`; `--binary <path>` → Mode B).
@@ -206,14 +206,14 @@ reimplementing PE/ISO assembly or kernel measurement.
 
 ## GitHub integration
 
-- **`cargo-unikernel github init`** writes a workflow that, on every `v*`-glob tag push, installs
+- **`cargo unikernel github init`** writes a workflow that, on every `v*`-glob tag push, installs
   `cargo-unikernel`, builds, then `release --tag <tag> --no-build`. The same build also runs
   (build-only) on pushes to `main`, keeping a warm `actions/cache` entry available since
   cache scopes are otherwise isolated per tag. `--attest-provenance` adds a Sigstore-backed
   `actions/attest-build-provenance` step, gated to tag pushes — build-provenance attestation
   of the release artifacts — a supply-chain claim about the bytes, distinct from an app's own
   SEV-SNP report about a *running guest*. Off by default.
-- **`cargo-unikernel release`** builds (unless `--no-build`) and publishes `dist/` via `gh` —
+- **`cargo unikernel release`** builds (unless `--no-build`) and publishes `dist/` via `gh` —
   the same path the generated workflow uses. What's attached and the release
   title/notes/draft come from `[release]`, so editing it changes both local and CI releases.
 

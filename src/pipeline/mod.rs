@@ -22,7 +22,7 @@ pub fn host_dist_dir(config: &Config, project_dir: &Path) -> PathBuf {
     project_dir.join(config.output.dir.trim_end_matches('/'))
 }
 
-/// Orchestrates a full `cargo-unikernel build`.
+/// Orchestrates a full `cargo unikernel build`.
 ///
 /// # Errors
 ///

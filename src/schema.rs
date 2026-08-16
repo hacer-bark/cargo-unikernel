@@ -675,7 +675,7 @@ pub enum MeasuredBoot {
     KernelInitrd,
 }
 
-/// A boot image format `cargo-unikernel build` can produce.
+/// A boot image format `cargo unikernel build` can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
@@ -829,7 +829,7 @@ pub enum ValidationError {
          different CLI version can bundle a different pinned kernel/Dockerfile and silently \
          change the launch measurement, so sev-snp refuses to build unpinned; add \
          `cargo_unikernel_version = \"{running}\"` (the version currently running) to \
-         `[project]`, or scaffold a fresh config with `cargo-unikernel init --profile \
+         `[project]`, or scaffold a fresh config with `cargo unikernel init --profile \
          sev-snp`, which sets this automatically"
     )]
     SevSnpRequiresPinnedCliVersion {
@@ -1676,7 +1676,7 @@ mod example_file_tests {
         config.validate().expect("casual example validates");
 
         // The sev-snp example leaves `cargo_unikernel_version` commented out (like the CLI
-        // ships it) — but sev-snp now requires it set, exactly like `cargo-unikernel init
+        // ships it) — but sev-snp now requires it set, exactly like `cargo unikernel init
         // --profile sev-snp` sets it, so pin it here the same way before validating.
         let sev_snp = crate::config::scaffold::pin_tool_version(include_str!(
             "../examples/cargo-unikernel.sev-snp.toml"
