@@ -179,12 +179,11 @@ mod tests {
     use super::*;
 
     /// `init()` writes relative to the *process* cwd (`.github/workflows/...`), not a path
-    /// parameter — these tests must serialize on and restore the cwd, since `cargo test`
-    /// runs them on multiple threads within one process.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// parameter — use the crate-wide `TEST_CWD_LOCK` (shared with every other module that
+    /// does this) so cwd changes across modules serialize under `cargo test`'s multi-threaded
+    /// runner too.
     fn in_temp_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = crate::TEST_CWD_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("cu-github-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::current_dir().unwrap();

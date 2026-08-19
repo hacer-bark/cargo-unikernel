@@ -20,6 +20,13 @@ pub mod pipeline;
 pub mod release;
 pub mod schema;
 
+/// Shared across every test module that calls `std::env::set_current_dir`: the process cwd
+/// is global state, so two independent per-module locks wouldn't actually serialize against
+/// each other — tests in different files could still race on it under `cargo test`'s default
+/// multi-threaded runner.
+#[cfg(test)]
+pub(crate) static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{Cli, Command, GithubCommand};
