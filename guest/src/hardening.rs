@@ -189,7 +189,7 @@ fn apply_baseline_tuning(warn: &impl Fn(&str)) {
 }
 
 /// Applies every compiled-in hardening category, then any `extra` (path, value) pairs from
-/// `cargo-unikernel.toml`'s `hardening.extra_sysctls`.
+/// `Cargo-Unikernel.toml`'s `hardening.extra_sysctls`.
 ///
 /// Logs (but does not fail the boot on) any write error.
 pub(crate) fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {

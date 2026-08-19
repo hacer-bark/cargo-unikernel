@@ -72,6 +72,7 @@ pub fn run() -> Result<()> {
         Command::Measure {
             config: config_path,
         } => {
+            let config_path = config_path.unwrap_or_else(config::default_config_path);
             let project_dir = config_path
                 .parent()
                 .map(std::path::Path::to_path_buf)
@@ -123,7 +124,10 @@ pub fn run() -> Result<()> {
                     config,
                     attest_provenance,
                 },
-        } => github::init(&config, attest_provenance)?,
+        } => {
+            let config = config.unwrap_or_else(config::default_config_path);
+            github::init(&config, attest_provenance)?;
+        }
         Command::Release {
             config: config_path,
             tag,

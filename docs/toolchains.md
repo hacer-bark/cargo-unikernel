@@ -2,9 +2,8 @@
 
 *[docs index](README.md) · [project README](../README.md)*
 
-`cargo-unikernel` needs your app as a binary to embed in the image. Three ways to get
-there, in increasing setup and decreasing "how much has to already be true about your
-project":
+`cargo-unikernel` needs your app as a binary to embed in the image. Three ways to get there,
+in increasing setup and decreasing "how much has to already be true about your project":
 
 | | Rust source build | Generic source build | Bring your own binary |
 |:---|:---|:---|:---|
@@ -13,18 +12,18 @@ project":
 | Trust anchor | the pinned Rust toolchain | whatever `build_command` pulls in | whoever produced the binary |
 | Works with | any Cargo project | any language whose output is one binary | any already-compiled binary |
 | Extra setup | none | `build_command` + `output_binary` | local `path` |
-| Example | `cargo-unikernel.casual.toml`'s `[app.source]` | same file, `toolchain = "generic"` alternative | same file, `[app.binary]` alternative |
+| Example | `Cargo-Unikernel.casual.toml`'s `[app.source]` | same file, `toolchain = "generic"` alternative | same file, `[app.binary]` alternative |
 
 ## Rust source build (the default)
 
 Run `cargo unikernel build` in a directory with a `Cargo.toml` and it just works — project
-name, source location, and build command are all inferred. This is the only path that
-supports full auto-detection.
+name, source location, and build command are all inferred. Only this path supports full
+auto-detection.
 
 ## Generic source build (any other language)
 
-Same pipeline as the Rust path (same container, same "source never leaves your machine as
-anything but source") except the last-mile build step is a shell command you supply:
+Same pipeline as the Rust path — same container, source never leaves your machine as
+anything but source — except the last-mile build step is a shell command you supply:
 
 ```toml
 [app.source]
@@ -35,15 +34,15 @@ output_binary = "app"
 extra_apt_packages = []   # only if your toolchain isn't already in the build image
 ```
 
-**The binary must have no dynamic dependencies** — there's no dynamic linker or libc in the
-minimal rootfs to satisfy one. Statically link (`CGO_ENABLED=0` for Go, `-Dtarget=…-musl`
-for Zig, `cc -static` for C), the same way the Rust path cross-compiles to
-`x86_64-unknown-linux-musl`. This is checked automatically for every mode: the build fails
+**The binary must have no dynamic dependencies** — the minimal rootfs has no dynamic linker
+or libc to satisfy one. Statically link it (`CGO_ENABLED=0` for Go, `-Dtarget=…-musl` for
+Zig, `cc -static` for C), the same way the Rust path cross-compiles to
+`x86_64-unknown-linux-musl`. This is checked automatically in every mode: the build fails
 immediately, naming any missing shared libraries, if the binary has a dynamic-linker segment
 or `DT_NEEDED` entries — instead of shipping an image that only fails at boot.
 
 `extra_apt_packages` covers a toolchain not already in `Dockerfile.reproducible` (Go is
-already included). Limited to whatever `apt-get install` can provide in the Ubuntu build
+already included), limited to whatever `apt-get install` can provide in the Ubuntu build
 image — not a hand-rolled installer script.
 
 ## Bring your own binary

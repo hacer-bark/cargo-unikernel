@@ -1,8 +1,8 @@
 # Documentation
 
 Design, security, and build documentation for `cargo-unikernel`. The
-[project README](../README.md) covers installation, quick start, and the CLI — start there
-for day-to-day usage. These documents go deeper.
+[project README](../README.md) covers installation, quick start, and the CLI — start there.
+These documents go deeper.
 
 | Document | Covers |
 |:---|:---|
@@ -14,4 +14,5 @@ for day-to-day usage. These documents go deeper.
 **New to the project?** Read `architecture.md`, then `toolchains.md`.
 **Evaluating security posture?** Read `threat_model.md`.
 **Verifying a build or measurement?** Read `reproducible_builds.md`.
-**Proving your image to a remote peer?** Read the attestation section of `threat_model.md` — the guest exposes `/dev/sev-guest` and your app owns the protocol.
+**Proving your image to a remote peer?** See "Remote attestation is the app's job" in
+`threat_model.md` — the guest exposes `/dev/sev-guest`, your app owns the protocol.

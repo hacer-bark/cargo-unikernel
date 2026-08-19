@@ -3,10 +3,10 @@ use crate::schema::CLI_VERSION;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-const CASUAL: &str = include_str!("../../examples/cargo-unikernel.casual.toml");
-const SEV_SNP: &str = include_str!("../../examples/cargo-unikernel.sev-snp.toml");
+const CASUAL: &str = include_str!("../../examples/Cargo-Unikernel.casual.toml");
+const SEV_SNP: &str = include_str!("../../examples/Cargo-Unikernel.sev-snp.toml");
 
-/// Writes a starting `cargo-unikernel.toml` into `dir`, picked from the bundled `examples/`
+/// Writes a starting `Cargo-Unikernel.toml` into `dir`, picked from the bundled `examples/`
 /// config matching `profile`.
 ///
 /// Both bundled configs document every app-acquisition mode (`toolchain = "rust"`/
@@ -15,7 +15,7 @@ const SEV_SNP: &str = include_str!("../../examples/cargo-unikernel.sev-snp.toml"
 ///
 /// # Errors
 ///
-/// Returns an error if `dir/cargo-unikernel.toml` already exists, or if writing the file
+/// Returns an error if `dir/Cargo-Unikernel.toml` already exists, or if writing the file
 /// fails.
 pub fn scaffold(profile: ProfileArg, dir: &Path) -> Result<()> {
     let template = match profile {
@@ -26,7 +26,7 @@ pub fn scaffold(profile: ProfileArg, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory {}", dir.display()))?;
 
-    let target = dir.join("cargo-unikernel.toml");
+    let target = dir.join(super::CONFIG_FILE_NAME);
     if target.exists() {
         bail!(
             "{} already exists — remove it first if you want to re-scaffold",
@@ -81,7 +81,8 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
             scaffold(profile, &dir).unwrap();
 
-            let written = std::fs::read_to_string(dir.join("cargo-unikernel.toml")).unwrap();
+            let written =
+                std::fs::read_to_string(dir.join(crate::config::CONFIG_FILE_NAME)).unwrap();
             let config: Config = toml::from_str(&written)
                 .unwrap_or_else(|e| panic!("{label}: scaffolded config didn't parse: {e}"));
             config

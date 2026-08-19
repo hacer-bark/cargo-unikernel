@@ -1,6 +1,6 @@
 <div align="center">
   <h1>cargo-unikernel</h1>
-  <p><strong>Turn a Rust project, another language's static build, or a pre-built binary into a minimal, hardened bootable unikernel image — ISO, cpio+kernel, UKI, with an optional AMD SEV-SNP confidential-computing profile.</strong></p>
+  <p><strong>Turn a Rust project (or any static binary) into a minimal, hardened bootable unikernel — with an optional AMD SEV-SNP profile.</strong></p>
 
   [![Crates.io](https://img.shields.io/crates/v/cargo-unikernel.svg?style=for-the-badge&color=fc8d62)](https://crates.io/crates/cargo-unikernel)
   [![Docs.rs](https://img.shields.io/docsrs/cargo-unikernel?style=for-the-badge&color=66c2a5)](https://docs.rs/cargo-unikernel)
@@ -12,7 +12,7 @@
 
 > **0.0.1, pre-release.** Config schema, CLI flags, and the generated GitHub Actions workflow
 > can change between versions without warning. Pin an exact version
-> (`project.cargo_unikernel_version` in `cargo-unikernel.toml`) and re-verify on upgrade.
+> (`project.cargo_unikernel_version` in `Cargo-Unikernel.toml`) and re-verify on upgrade.
 
 ```sh
 cargo install cargo-unikernel
@@ -20,13 +20,13 @@ cd my-server/
 cargo unikernel build
 ```
 
-No config file, no template repo — `cargo install` puts the binary on `PATH`, Cargo's
-external-subcommand convention picks it up, and it drops into any project. Output is
-`.iso`, `.cpio`+kernel, UKI, or a raw app binary, with an optional AMD SEV-SNP profile.
+No config file needed — `cargo install` puts the binary on `PATH`, Cargo's external-subcommand
+convention picks it up, and it works from any project directory. Output is `.iso`, `.cpio`+kernel,
+UKI, or a raw binary, with an optional AMD SEV-SNP profile.
 
-**Any language works.** Rust is zero-config. Bring a pre-built binary in anything, or point
-the tool at a build command (Go, Zig, C, ...) for the same reproducible source build Rust
-gets. See [Bringing your app in](#bringing-your-app-in).
+**Any language works.** Rust needs zero config. Bring a pre-built binary in anything, or point
+the tool at a build command (Go, Zig, C, ...) for the same reproducible build Rust gets. See
+[Bringing your app in](#bringing-your-app-in).
 
 ## What it is
 
@@ -39,14 +39,14 @@ instant anything looks wrong. Full boot sequence: [`docs/architecture.md`](docs/
 
 A container or a general-purpose-distro VM image still carries a shell, a package manager,
 and a dynamic linker for an attacker to pivot to post-compromise. `cargo-unikernel` strips
-those out rather than locking them down — which also means no live debugging, no runtime
+those out instead of locking them down — which also means no live debugging, no runtime
 patching, and a RAM-only filesystem with no local durable state (full list:
 [Is cargo-unikernel right for your app?](#is-cargo-unikernel-right-for-your-app)). In exchange:
 
-
+| | |
 |:---|:---|
-| **Performance** | Nothing else runs on the kernel — no container runtime, no other tenant. `CONFIG_PREEMPT_NONE`, BBR congestion control, opt-in transparent hugepages, boot that polls instead of sleeping for timeouts. Small image, fast boot. Details: [architecture.md#kernel-cmdline-rationale](docs/architecture.md#kernel-cmdline-rationale). |
-| **Security** | Zero trust in the OS, because there's effectively none to trust. Read-only rootfs, `noexec` elsewhere, empty capability set before exec, a mandatory seccomp filter blocking `ptrace`/module-loading/`mount`/`kexec`/`reboot`/etc., `setrlimit` ceilings. None of it opt-in. Full catalog: [threat_model.md](docs/threat_model.md). |
+| **Performance** | Nothing else runs on the kernel — no container runtime, no other tenant. `CONFIG_PREEMPT_NONE`, BBR congestion control, opt-in transparent hugepages, boot that polls instead of sleeping. Small image, fast boot. Details: [architecture.md#kernel-cmdline-rationale](docs/architecture.md#kernel-cmdline-rationale). |
+| **Security** | Nothing to trust in the OS, because there's effectively none there. Read-only rootfs, `noexec` elsewhere, empty capability set before exec, a mandatory seccomp filter blocking `ptrace`/module-loading/`mount`/`kexec`/`reboot`/etc., `setrlimit` ceilings — none of it opt-in. Full catalog: [threat_model.md](docs/threat_model.md). |
 | **Confidential computing** | `profile.kind = "sev-snp"` gets a hardware root of trust: AMD's Secure Processor measures kernel+init+app before execution, memory is hardware-encrypted per-VM, `/dev/sev-guest` lets the app prove to a remote party this exact image is running. Puts the cloud provider and hypervisor outside the trust boundary. Details: [Confidential computing (SEV-SNP)](#confidential-computing-sev-snp). |
 
 ## How it works
@@ -54,8 +54,8 @@ patching, and a RAM-only filesystem with no local durable state (full list:
 Your project directory is mounted into a pinned build container — nothing cloned or copied.
 Inside: the kernel builds from pinned source with a curated hardening profile, the app
 compiles (or, for a pre-built binary, is verified and staged) and is checked for static
-linking, the guest init cross-compiles alongside it, everything assembles into a rootfs and
-packs into the requested formats. Every build dependency beyond your own project —
+linking, the guest init cross-compiles alongside it, and everything assembles into a rootfs
+and packs into the requested formats. Every build dependency beyond your own project —
 Dockerfile, kernel Kconfig, ISO/UKI tooling, guest init source — is embedded in the
 `cargo-unikernel` binary itself.
 
@@ -65,7 +65,7 @@ Full pipeline stage by stage: [`docs/architecture.md`](docs/architecture.md).
 
 Hard requirements, checked before committing to the tool:
 
-- **A fully static `x86_64-unknown-linux-musl` binary.** Build fails immediately, naming
+- **A fully static `x86_64-unknown-linux-musl` binary.** The build fails immediately, naming
   missing libraries, on any dynamic linker segment or `DT_NEEDED` dependency. Rust's default
   target already qualifies; other languages need `CGO_ENABLED=0` (Go), `-Dtarget=...-musl`
   (Zig), `cc -static` (C).
@@ -93,28 +93,28 @@ databases needing durable local disk, GUI apps.
 | **Bring your own binary** | A local file — never fetched over the network | Trust whatever produced the binary | `[app.binary]` |
 
 The first two are the same pipeline with a different last-mile build step — see
-`examples/cargo-unikernel.casual.toml`'s `[app.source]` for a worked Go example. The third
+`examples/Cargo-Unikernel.casual.toml`'s `[app.source]` for a worked Go example. The third
 works with anything, at the cost of trusting pre-built bytes over a verified build. Trade-offs
 in depth: [`docs/toolchains.md`](docs/toolchains.md).
 
-## Customizing with cargo-unikernel.toml
+## Customizing with Cargo-Unikernel.toml
 
 Zero-config always builds the `casual` profile with the Rust toolchain. To pick SEV-SNP, a
 generic build command, specific output formats, a pre-built binary, or tuned hardening:
 
 ```sh
-cargo unikernel init # writes ./cargo-unikernel.toml
-nano cargo-unikernel.toml
+cargo unikernel init # writes ./Cargo-Unikernel.toml
+nano Cargo-Unikernel.toml
 cargo unikernel build
 ```
 
 `cargo unikernel init --profile <casual|sev-snp>` picks the starting point. See
-`examples/cargo-unikernel.casual.toml` and `examples/cargo-unikernel.sev-snp.toml` — each is
+`examples/Cargo-Unikernel.casual.toml` and `examples/Cargo-Unikernel.sev-snp.toml` — each is
 a fully-commented reference covering all three app-acquisition modes.
 
 ## Granular control
 
-Every knob is documented inline in the example configs (`examples/cargo-unikernel.casual.toml`
+Every knob is documented inline in the example configs (`examples/Cargo-Unikernel.casual.toml`
 has the full field reference). Highlights:
 
 | Section | Controls |
@@ -149,7 +149,7 @@ no TOCTOU gap, and for SEV-SNP the launch measurement already covers the exact a
 ## CLI
 
 - `cargo unikernel build` — build the image(s); zero-config or from a config file.
-- `cargo unikernel init` — scaffold a `cargo-unikernel.toml` when customization is needed.
+- `cargo unikernel init` — scaffold a `Cargo-Unikernel.toml` when customization is needed.
 - `cargo unikernel measure` — recompute the SEV-SNP launch measurement from already-built
   artifacts without a full rebuild (`sev-snp` profile only).
 - `cargo unikernel doctor` — check the host toolchain (Docker, git, gh).
@@ -157,7 +157,7 @@ no TOCTOU gap, and for SEV-SNP the launch measurement already covers the exact a
   push builds and publishes a GitHub Release automatically.
 - `cargo unikernel release` — build (unless `--no-build`) and publish a GitHub Release via
   `gh` right now. Attached artifacts and release title/notes/draft/prerelease are
-  configurable via `[release]` in `cargo-unikernel.toml`.
+  configurable via `[release]` in `Cargo-Unikernel.toml`.
 
 ## CI/CD via GitHub Actions
 
@@ -165,7 +165,7 @@ no TOCTOU gap, and for SEV-SNP the launch measurement already covers the exact a
 `cargo-unikernel`, builds, and publishes a GitHub Release. It also builds (never publishes) on
 every push to `main`, purely to keep the cache warm.
 
-If `cargo-unikernel.toml` pins `project.cargo_unikernel_version`, the generated workflow
+If `Cargo-Unikernel.toml` pins `project.cargo_unikernel_version`, the generated workflow
 installs that exact version instead of latest — `cargo unikernel build` also fails closed
 (`ValidationError::ToolVersionMismatch`) if a different version ever runs against it. Re-run
 `github init` after changing the pin.
@@ -205,7 +205,7 @@ under a mismatched version. `cargo unikernel init --profile sev-snp` sets this a
 **Bring your own OVMF.** `preset = "builtin"` (default) uses the AMD SEV-SNP firmware baked
 into the binary, hash-pinned, never fetched over the network. Different cloud providers ship
 different OVMF builds — `[sev_snp.ovmf]` also accepts a local `path` (never a URL). See
-`examples/cargo-unikernel.sev-snp.toml`.
+`examples/Cargo-Unikernel.sev-snp.toml`.
 
 Build sev-snp via a tagged release workflow so the measurement corresponds to an immutable
 commit rather than uncommitted local state. ISO output works for sev-snp too as a
@@ -258,4 +258,3 @@ Licensed under the [0BSD license](https://github.com/hacer-bark/cargo-unikernel/
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 this crate shall be licensed as above, without any additional terms or conditions.
-</content>

@@ -1,4 +1,4 @@
-//! Zero-config "one call" build: when no `cargo-unikernel.toml` exists, figure out
+//! Zero-config "one call" build: when no `Cargo-Unikernel.toml` exists, figure out
 //! sensible defaults from whatever's in the current directory rather than making the user
 //! write a config file first.
 
@@ -50,7 +50,7 @@ pub(super) fn detect(project_dir: &Path, binary_override: Option<PathBuf>) -> Re
         );
 
         println!(
-            "No cargo-unikernel.toml found — auto-detected Cargo project '{name}'. \
+            "No Cargo-Unikernel.toml found — auto-detected Cargo project '{name}'. \
              Run `cargo unikernel init` to customize instead of relying on defaults."
         );
 
@@ -75,7 +75,7 @@ pub(super) fn detect(project_dir: &Path, binary_override: Option<PathBuf>) -> Re
     }
 
     bail!(
-        "no cargo-unikernel.toml and no Cargo.toml found in {} — either run \
+        "no Cargo-Unikernel.toml and no Cargo.toml found in {} — either run \
          `cargo unikernel init`, or pass `--binary <path>` to embed an existing binary",
         project_dir.display()
     )

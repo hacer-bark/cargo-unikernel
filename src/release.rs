@@ -2,7 +2,7 @@
 //! artifacts as a GitHub Release via the `gh` CLI.
 //!
 //! Which `dist/` assets are attached and the release body/metadata are driven by the
-//! optional `[release]` section of `cargo-unikernel.toml` (`schema::Release`) — the same
+//! optional `[release]` section of `Cargo-Unikernel.toml` (`schema::Release`) — the same
 //! config a `github init`-generated workflow passes via `--config`, so local and CI releases
 //! always agree.
 

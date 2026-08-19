@@ -1,5 +1,5 @@
 //! Generates `.github/workflows/cargo-unikernel.yml`: `cargo unikernel github init` takes
-//! a project from "has cargo-unikernel.toml" to "publishes a built image on every tag push".
+//! a project from "has Cargo-Unikernel.toml" to "publishes a built image on every tag push".
 //!
 //! The kernel download+compile is the most expensive step in the pipeline, so the generated
 //! workflow caches both the tool's own cargo install and `~/.cache/cargo-unikernel` across
@@ -229,7 +229,7 @@ mod tests {
             std::fs::write(
                 "cargo-unikernel.toml",
                 crate::config::scaffold::pin_tool_version(include_str!(
-                    "../examples/cargo-unikernel.sev-snp.toml"
+                    "../examples/Cargo-Unikernel.sev-snp.toml"
                 )),
             )
             .unwrap();

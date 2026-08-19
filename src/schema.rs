@@ -1,4 +1,4 @@
-//! `cargo-unikernel.toml` config schema + validation.
+//! `Cargo-Unikernel.toml` config schema + validation.
 //!
 //! This is a plain module of the CLI crate (not a shared library) — the guest init never
 //! reads this schema at runtime, so there's no reason to publish/depend on it as a separate
@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The full parsed and validated contents of a `cargo-unikernel.toml`.
+/// The full parsed and validated contents of a `Cargo-Unikernel.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// `[project]` — the project's name and optional pinned CLI version.
@@ -590,7 +590,7 @@ pub struct RuntimeHardening {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hardening {
     /// Reserved for future coarse presets; every category below defaults to enabled
-    /// regardless of `level` today. Kept so `cargo-unikernel.toml` has a stable place for
+    /// regardless of `level` today. Kept so `Cargo-Unikernel.toml` has a stable place for
     /// this once differentiated presets exist — set explicit per-category toggles below for
     /// control that actually takes effect right now.
     #[serde(default = "default_hardening_level")]
@@ -1673,7 +1673,7 @@ mod example_file_tests {
 
     #[test]
     fn bundled_examples_parse_and_validate() {
-        let casual = include_str!("../examples/cargo-unikernel.casual.toml");
+        let casual = include_str!("../examples/Cargo-Unikernel.casual.toml");
         let config: Config = toml::from_str(casual).expect("casual example parses");
         config.validate().expect("casual example validates");
 
@@ -1681,7 +1681,7 @@ mod example_file_tests {
         // ships it) — but sev-snp now requires it set, exactly like `cargo unikernel init
         // --profile sev-snp` sets it, so pin it here the same way before validating.
         let sev_snp = crate::config::scaffold::pin_tool_version(include_str!(
-            "../examples/cargo-unikernel.sev-snp.toml"
+            "../examples/Cargo-Unikernel.sev-snp.toml"
         ));
         let config: Config = toml::from_str(&sev_snp).expect("sev-snp example parses");
         config.validate().expect("sev-snp example validates");

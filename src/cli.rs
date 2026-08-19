@@ -19,7 +19,7 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Scaffold a cargo-unikernel.toml (optional — `build` works with zero config too)
+    /// Scaffold a Cargo-Unikernel.toml (optional — `build` works with zero config too)
     Init {
         /// Which profile to scaffold: `casual` or `sev-snp`.
         #[arg(long, value_enum, default_value = "casual")]
@@ -31,8 +31,9 @@ pub enum Command {
     /// directory: a Cargo project is compiled directly (no config needed at all); otherwise
     /// pass `--binary <path>` to embed an existing binary.
     Build {
-        /// Path to cargo-unikernel.toml. If omitted, looks for ./cargo-unikernel.toml,
-        /// and falls back to zero-config auto-detection if that doesn't exist either.
+        /// Path to Cargo-Unikernel.toml. If omitted, looks for ./Cargo-Unikernel.toml (or
+        /// the legacy ./cargo-unikernel.toml), and falls back to zero-config auto-detection
+        /// if neither exists.
         #[arg(short, long)]
         config: Option<PathBuf>,
         /// Zero-config only: embed this pre-built binary instead of compiling the cwd.
@@ -53,9 +54,10 @@ pub enum Command {
     },
     /// Recompute the SEV-SNP measurement from already-built artifacts (sev-snp profile only)
     Measure {
-        /// Path to cargo-unikernel.toml.
-        #[arg(short, long, default_value = "cargo-unikernel.toml")]
-        config: PathBuf,
+        /// Path to Cargo-Unikernel.toml. If omitted, looks for ./Cargo-Unikernel.toml, then
+        /// falls back to the legacy ./cargo-unikernel.toml.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Check the host toolchain needed to build (Docker, git, gh)
     Doctor,
@@ -67,7 +69,7 @@ pub enum Command {
     },
     /// Build (if needed) and publish a GitHub release with the built artifacts, via `gh`
     Release {
-        /// Path to cargo-unikernel.toml.
+        /// Path to Cargo-Unikernel.toml.
         #[arg(short, long)]
         config: Option<PathBuf>,
         /// Tag for the release (e.g. v1.0.0). Defaults to the current HEAD's short SHA.
@@ -83,11 +85,13 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum GithubCommand {
     /// Write .github/workflows/cargo-unikernel.yml, which builds and publishes a release
-    /// on every tag push using this project's cargo-unikernel.toml.
+    /// on every tag push using this project's Cargo-Unikernel.toml.
     Init {
-        /// Path to cargo-unikernel.toml the generated workflow will pass via `--config`.
-        #[arg(long, default_value = "cargo-unikernel.toml")]
-        config: PathBuf,
+        /// Path to Cargo-Unikernel.toml the generated workflow will pass via `--config`. If
+        /// omitted, looks for ./Cargo-Unikernel.toml, then falls back to the legacy
+        /// ./cargo-unikernel.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Also add a GitHub build-provenance attestation step for the published dist/
         /// artifacts — a Sigstore-backed proof of exactly which workflow run/commit produced
         /// them. Off by default: it requires granting the workflow `id-token: write`/

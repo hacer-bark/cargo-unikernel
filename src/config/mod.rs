@@ -1,12 +1,12 @@
-//! Loading, scaffolding, and applying CLI overrides to a `cargo-unikernel.toml`.
+//! Loading, scaffolding, and applying CLI overrides to a `Cargo-Unikernel.toml`.
 
 /// Zero-config "one call" build.
 ///
-/// Figures out a build when no `cargo-unikernel.toml` exists.
+/// Figures out a build when no `Cargo-Unikernel.toml` exists.
 pub mod auto_detect;
 /// CLI-flag overrides applied on top of a loaded `Config`.
 pub mod overrides;
-/// `cargo unikernel init` — writes a starting `cargo-unikernel.toml`.
+/// `cargo unikernel init` — writes a starting `Cargo-Unikernel.toml`.
 pub mod scaffold;
 
 pub use overrides::{BuildOverrides, apply_overrides};
@@ -16,7 +16,31 @@ use crate::schema::Config;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Reads and parses `path` as a `cargo-unikernel.toml`, then validates it.
+/// Canonical config file name, matching `Cargo.toml`'s capitalization.
+pub const CONFIG_FILE_NAME: &str = "Cargo-Unikernel.toml";
+
+/// Pre-rename file name, still read as a fallback when `CONFIG_FILE_NAME` isn't present, so
+/// existing projects keep working without an immediate rename.
+pub const LEGACY_CONFIG_FILE_NAME: &str = "cargo-unikernel.toml";
+
+/// The config path to use when none is given explicitly.
+///
+/// `CONFIG_FILE_NAME` if present, else `LEGACY_CONFIG_FILE_NAME` if only that exists, else
+/// `CONFIG_FILE_NAME` (so callers get a "file not found" error naming the current name).
+#[must_use]
+pub fn default_config_path() -> PathBuf {
+    let canonical = PathBuf::from(CONFIG_FILE_NAME);
+    if canonical.exists() {
+        return canonical;
+    }
+    let legacy = PathBuf::from(LEGACY_CONFIG_FILE_NAME);
+    if legacy.exists() {
+        return legacy;
+    }
+    canonical
+}
+
+/// Reads and parses `path` as a `Cargo-Unikernel.toml`, then validates it.
 ///
 /// # Errors
 ///
@@ -41,7 +65,8 @@ pub fn load(path: &Path) -> Result<Config> {
 
 /// Resolves the effective config + project directory for `cargo unikernel build`:
 /// - an explicit `-c/--config` always loads that exact file (error if missing)
-/// - otherwise, `./cargo-unikernel.toml` is used if it exists
+/// - otherwise, `./Cargo-Unikernel.toml` is used if it exists, falling back to the legacy
+///   `./cargo-unikernel.toml` if only that does
 /// - otherwise, zero-config auto-detection kicks in (see `auto_detect`)
 ///
 /// # Errors
@@ -58,7 +83,7 @@ pub fn resolve_for_build(
         return Ok((config, project_dir));
     }
 
-    let default_path = PathBuf::from("cargo-unikernel.toml");
+    let default_path = default_config_path();
     let project_dir = PathBuf::from(".");
     if default_path.exists() {
         let config = load(&default_path)?;
@@ -75,4 +100,56 @@ fn project_dir_of(config_path: &Path) -> PathBuf {
         .map(std::path::Path::to_path_buf)
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| ".".into())
+}
+
+#[cfg(test)]
+// Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
+// smell — this is the standard justified exception to these lints.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// `default_config_path` reads relative to the *process* cwd, not a path parameter —
+    /// these tests must serialize on and restore the cwd, since `cargo test` runs them on
+    /// multiple threads within one process.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn in_temp_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cu-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let result = f(&dir);
+        std::env::set_current_dir(original).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    fn default_config_path_prefers_the_capitalized_name_when_both_exist() {
+        in_temp_dir(|_dir| {
+            std::fs::write(CONFIG_FILE_NAME, "").unwrap();
+            std::fs::write(LEGACY_CONFIG_FILE_NAME, "").unwrap();
+            assert_eq!(default_config_path(), PathBuf::from(CONFIG_FILE_NAME));
+        });
+    }
+
+    #[test]
+    fn default_config_path_falls_back_to_the_legacy_name() {
+        in_temp_dir(|_dir| {
+            std::fs::write(LEGACY_CONFIG_FILE_NAME, "").unwrap();
+            assert_eq!(
+                default_config_path(),
+                PathBuf::from(LEGACY_CONFIG_FILE_NAME)
+            );
+        });
+    }
+
+    #[test]
+    fn default_config_path_is_the_capitalized_name_when_neither_exists() {
+        in_temp_dir(|_dir| {
+            assert_eq!(default_config_path(), PathBuf::from(CONFIG_FILE_NAME));
+        });
+    }
 }

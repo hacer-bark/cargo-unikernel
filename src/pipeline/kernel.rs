@@ -2,7 +2,7 @@
 //!
 //! The actual build stays in `assets/kernel/build_kernel.sh` (pure shell/Kconfig —
 //! reimplementing that in Rust would add code and audit surface for no security benefit);
-//! this module just knows how `cargo-unikernel.toml` maps onto the env vars that script
+//! this module just knows how `Cargo-Unikernel.toml` maps onto the env vars that script
 //! reads.
 
 use crate::schema::{KernelHardening, NetworkMode, ProfileKind, StorageMode};
