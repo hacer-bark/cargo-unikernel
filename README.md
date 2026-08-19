@@ -43,7 +43,6 @@ those out instead of locking them down — which also means no live debugging, n
 patching, and a RAM-only filesystem with no local durable state (full list:
 [Is cargo-unikernel right for your app?](#is-cargo-unikernel-right-for-your-app)). In exchange:
 
-| | |
 |:---|:---|
 | **Performance** | Nothing else runs on the kernel — no container runtime, no other tenant. `CONFIG_PREEMPT_NONE`, BBR congestion control, opt-in transparent hugepages, boot that polls instead of sleeping. Small image, fast boot. Details: [architecture.md#kernel-cmdline-rationale](docs/architecture.md#kernel-cmdline-rationale). |
 | **Security** | Nothing to trust in the OS, because there's effectively none there. Read-only rootfs, `noexec` elsewhere, empty capability set before exec, a mandatory seccomp filter blocking `ptrace`/module-loading/`mount`/`kexec`/`reboot`/etc., `setrlimit` ceilings — none of it opt-in. Full catalog: [threat_model.md](docs/threat_model.md). |
