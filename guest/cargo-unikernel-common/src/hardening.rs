@@ -4,7 +4,13 @@
 //! (`hardening-net-spoofing`, `hardening-icmp`, `hardening-tcp`, `hardening-info-leak`,
 //! `hardening-ptrace-bpf`, `hardening-kexec-fs`) instead of a runtime-checked table: a
 //! disabled category's sysctl writes are compiled out entirely, not skipped by an `if` that
-//! never triggers in a given build.
+//! never triggers in a given build. A category itself may split further into private
+//! sub-functions (e.g. `hardening-net-spoofing`'s redirect/source-route/ARP groups) purely for
+//! readability — the Cargo feature gate is always on the public per-category function, so this
+//! never changes what a toggle in `[hardening.runtime]` controls.
+//!
+//! [`apply_baseline_tuning`] is the one exception: it's not a hardening category, isn't
+//! feature-gated, and always runs — see its doc comment.
 
 fn write_sysctl(path: &str, val: &[u8], warn: &impl Fn(&str)) {
     if let Err(e) = std::fs::write(path, val) {
@@ -19,9 +25,25 @@ fn write_sysctl(path: &str, val: &[u8], warn: &impl Fn(&str)) {
     }
 }
 
-/// `rp_filter` + ICMP redirect accept/send/secure — IP spoofing / MITM redirect defense.
+/// Anti-spoofing / anti-MITM network hardening — everything here defends against a peer on the
+/// guest's network segment forging, redirecting, or route-steering traffic. Cross-checked
+/// against Kicksecure's `usr/lib/sysctl.d/990-security-misc.conf` (the audited upstream this
+/// category is aligned to); every setting below has a matching entry there unless a comment
+/// says otherwise.
 #[cfg(feature = "hardening-net-spoofing")]
 fn apply_network_spoofing_protection(warn: &impl Fn(&str)) {
+    apply_redirect_and_forwarding_protection(warn);
+    apply_source_routing_protection(warn);
+    apply_arp_hardening(warn);
+    write_sysctl("/proc/sys/net/ipv4/conf/all/log_martians", b"1", warn);
+    write_sysctl("/proc/sys/net/ipv4/conf/default/log_martians", b"1", warn);
+}
+
+/// `rp_filter`, ICMP redirect accept/send/secure (v4 and v6), and forwarding — refuses to
+/// silently double as a router between interfaces, and refuses route changes suggested by an
+/// on-link peer instead of the guest's own configuration.
+#[cfg(feature = "hardening-net-spoofing")]
+fn apply_redirect_and_forwarding_protection(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", b"1", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/default/rp_filter", b"1", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/all/accept_redirects", b"0", warn);
@@ -38,9 +60,47 @@ fn apply_network_spoofing_protection(warn: &impl Fn(&str)) {
         b"0",
         warn,
     );
+    // The IPv6 half of the same protection — a gap versus the IPv4 rules above until now. A
+    // no-op write (ENOENT, silently ignored by write_sysctl) on an IPv4-only build with no
+    // IPv6 stack compiled in.
+    write_sysctl("/proc/sys/net/ipv6/conf/all/accept_redirects", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv6/conf/default/accept_redirects",
+        b"0",
+        warn,
+    );
     // A single-purpose guest should never silently double as a router between interfaces.
     write_sysctl("/proc/sys/net/ipv4/ip_forward", b"0", warn);
     write_sysctl("/proc/sys/net/ipv6/conf/all/forwarding", b"0", warn);
+}
+
+/// Refuses IP source-routed packets (v4 and v6) — a classic spoofing primitive that lets a
+/// packet dictate its own return path instead of following normal routing.
+#[cfg(feature = "hardening-net-spoofing")]
+fn apply_source_routing_protection(warn: &impl Fn(&str)) {
+    write_sysctl("/proc/sys/net/ipv4/conf/all/accept_source_route", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv4/conf/default/accept_source_route",
+        b"0",
+        warn,
+    );
+    write_sysctl("/proc/sys/net/ipv6/conf/all/accept_source_route", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv6/conf/default/accept_source_route",
+        b"0",
+        warn,
+    );
+}
+
+/// ARP cache poisoning / spoofing defense. Modest value on a single-NIC virtio guest — most of
+/// these matter more on a multi-homed host — but free, and part of Kicksecure's audited
+/// baseline, so included for parity rather than left as a silent gap.
+#[cfg(feature = "hardening-net-spoofing")]
+fn apply_arp_hardening(warn: &impl Fn(&str)) {
+    write_sysctl("/proc/sys/net/ipv4/conf/all/arp_filter", b"1", warn);
+    write_sysctl("/proc/sys/net/ipv4/conf/all/arp_ignore", b"2", warn);
+    write_sysctl("/proc/sys/net/ipv4/conf/all/drop_gratuitous_arp", b"1", warn);
+    write_sysctl("/proc/sys/net/ipv4/conf/all/shared_media", b"0", warn);
 }
 
 /// Ignore ICMP broadcasts/bogus errors, and (optionally) all ICMP echo — Smurf-attack
@@ -108,11 +168,20 @@ fn apply_kexec_and_fs_protection(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/fs/protected_regular", b"2", warn);
 }
 
+/// Not a hardening category and not feature-gated: raises the mmap-count ceiling well above the
+/// kernel's default (~65530), which some mmap-heavy workloads (large heaps, embedded databases,
+/// JIT runtimes) exhaust in normal operation. No security trade-off either direction — this
+/// stays applied even if every `hardening.runtime` category is turned off.
+fn apply_baseline_tuning(warn: &impl Fn(&str)) {
+    write_sysctl("/proc/sys/vm/max_map_count", b"1048576", warn);
+}
+
 /// Applies every compiled-in hardening category, then any `extra` (path, value) pairs from
 /// `cargo-unikernel.toml`'s `hardening.extra_sysctls`.
 ///
 /// Logs (but does not fail the boot on) any write error.
 pub fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
+    apply_baseline_tuning(&warn);
     #[cfg(feature = "hardening-net-spoofing")]
     apply_network_spoofing_protection(&warn);
     #[cfg(feature = "hardening-icmp")]

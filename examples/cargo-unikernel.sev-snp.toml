@@ -105,7 +105,7 @@ seccomp = true                       # enables seccomp-BPF (app still installs i
 # fips = true                        # CONFIG_CRYPTO_FIPS capability — off by default, opt in for compliance
 
 [hardening.runtime]
-network_spoofing_protection = true   # rp_filter + ICMP redirect defense
+network_spoofing_protection = true   # rp_filter, redirect/source-route/ARP defense, martian logging
 icmp_hardening = true                # ignore broadcasts/bogus errors and all pings
 tcp_hardening = true                 # SYN cookies, backlog/keepalive tuning for DDoS resilience
 info_leak_restriction = true         # restricts kernel pointer/dmesg/perf-event exposure
@@ -123,6 +123,11 @@ vcpus = 2
 vcpu_type = "EPYC-Milan"
 # Baked into both the UKI's .cmdline section and the string sev-snp-measure.py hashes, so what's
 # measured and what boots can never drift apart. See docs/architecture.md's cmdline rationale.
+#
+# random.trust_cpu=on is deliberate here, unlike the casual profile: this profile's threat model
+# doesn't trust the hypervisor, so host-fed virtio-rng entropy is adversarial in this context,
+# while RDRAND/RDSEED execute on real silicon inside the encrypted guest, outside the
+# hypervisor's reach.
 kernel_cmdline = "console=ttyS0 ip=dhcp quiet loglevel=3 panic=-1 random.trust_cpu=on random.trust_bootloader=off page_alloc.shuffle=1 lockdown=confidentiality transparent_hugepage=madvise"
 # Which boot inputs sev-snp-measure.py hashes. Defaults to auto-detecting from [output].formats:
 # "uki" if a UKI is built, "kernel-initrd" otherwise. Only set explicitly if your provider's

@@ -567,7 +567,8 @@ pub struct KernelHardening {
 /// Same `None` = default-enabled semantics as `[hardening.kernel]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeHardening {
-    /// `rp_filter` + ICMP redirect accept/send/secure — IP spoofing / MITM redirect defense.
+    /// `rp_filter`, ICMP redirect accept/send/secure (v4+v6), source-route rejection (v4+v6),
+    /// ARP hardening, and martian-packet logging — IP/ARP spoofing and MITM redirect defense.
     pub network_spoofing_protection: Option<bool>,
     /// Ignore ICMP broadcasts/bogus errors and all ICMP echo (a.k.a. "stealth mode": the
     /// guest never answers pings at all).

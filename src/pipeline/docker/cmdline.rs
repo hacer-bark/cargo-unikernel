@@ -5,7 +5,7 @@ use crate::schema::{Config, NetworkMode};
 /// `docs/architecture.md`'s cmdline rationale section for why each flag is here (and what
 /// was deliberately left out).
 const CASUAL_CMDLINE_PREFIX: &str = "console=ttyS0";
-const CASUAL_CMDLINE_SUFFIX: &str = "quiet loglevel=3 panic=-1 random.trust_cpu=on \
+const CASUAL_CMDLINE_SUFFIX: &str = "quiet loglevel=3 panic=-1 random.trust_cpu=off \
      random.trust_bootloader=off page_alloc.shuffle=1 lockdown=integrity \
      transparent_hugepage=madvise init_on_alloc=1 init_on_free=1";
 
