@@ -11,6 +11,4 @@
 # extracts the embedded copy (see `extract_guest` in `src/assets.rs`).
 set -eu
 cd "$(dirname "$0")"
-for dist in Cargo.toml.dist cargo-unikernel-common/Cargo.toml.dist cargo-unikernel-init/Cargo.toml.dist; do
-    cp "$dist" "${dist%.dist}"
-done
+cp Cargo.toml.dist Cargo.toml

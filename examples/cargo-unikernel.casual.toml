@@ -114,7 +114,7 @@ seccomp = true                       # enables seccomp-BPF (app still installs i
 
 [hardening.runtime]
 # Runtime (sysctl) hardening categories, same default-true semantics. See
-# guest/cargo-unikernel-common/src/hardening.rs's `Category` enum for the exact sysctls.
+# guest/src/hardening.rs's `Category` enum for the exact sysctls.
 network_spoofing_protection = true   # rp_filter, redirect/source-route/ARP defense, martian logging
 icmp_hardening = true                # ignore broadcasts/bogus errors and all pings
 tcp_hardening = true                 # SYN cookies, backlog/keepalive tuning for DDoS resilience

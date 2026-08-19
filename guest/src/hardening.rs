@@ -180,7 +180,7 @@ fn apply_baseline_tuning(warn: &impl Fn(&str)) {
 /// `cargo-unikernel.toml`'s `hardening.extra_sysctls`.
 ///
 /// Logs (but does not fail the boot on) any write error.
-pub fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
+pub(crate) fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
     apply_baseline_tuning(&warn);
     #[cfg(feature = "hardening-net-spoofing")]
     apply_network_spoofing_protection(&warn);

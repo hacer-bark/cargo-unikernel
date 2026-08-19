@@ -9,7 +9,7 @@ use std::fmt::Write;
 /// Encodes `bytes` as a lowercase hex string, e.g. `[0xab, 0x01]` -> `"ab01"`.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     for b in bytes {
         // `write!` into a `String` never fails.
         let _ = write!(out, "{b:02x}");

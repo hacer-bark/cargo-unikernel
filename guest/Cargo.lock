@@ -3,17 +3,9 @@
 version = 4
 
 [[package]]
-name = "cargo-unikernel-common"
-version = "0.0.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "cargo-unikernel-init"
 version = "0.0.0"
 dependencies = [
- "cargo-unikernel-common",
  "libc",
 ]
 

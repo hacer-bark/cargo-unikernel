@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 ///
 /// Checked by `main.rs`'s watchdog loop before treating the app's exit as an integrity
 /// violation. An app dying because graceful shutdown asked it to isn't a compromise.
-pub static SHUTDOWN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+pub(crate) static SHUTDOWN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Write end of the self-pipe `on_sigterm` wakes: `write(2)` is one of the few calls safe to
 /// use from a signal handler, unlike condvars/channels — this is the standard self-pipe trick
@@ -82,7 +82,7 @@ extern "C" fn on_sigterm(_: libc::c_int) {
 /// The armed shutdown triggers: the SIGTERM handler is installed and every evdev device is
 /// open, so a trigger that fires before the watcher thread exists is still observed.
 #[derive(Debug)]
-pub struct ShutdownTriggers {
+pub(crate) struct ShutdownTriggers {
     devices: Vec<std::fs::File>,
 }
 
@@ -96,8 +96,12 @@ pub struct ShutdownTriggers {
 ///
 /// The SIGTERM half has no such window — PID 1 ignores signals it has no handler for — but the
 /// two triggers belong together.
+/// Turning a function pointer into the raw integer `libc::signal` expects has no stable
+/// non-`as` route on Rust today — there is no `TryFrom`/safe wrapper for a fn-pointer-to-integer
+/// conversion, so the cast lint is allowed here rather than worked around.
 #[must_use]
-pub fn arm_shutdown_triggers() -> ShutdownTriggers {
+#[allow(clippy::as_conversions)]
+pub(crate) fn arm_shutdown_triggers() -> ShutdownTriggers {
     // SAFETY: `on_sigterm`'s signature matches what the C ABI expects for a signal handler.
     unsafe {
         libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
@@ -116,7 +120,7 @@ pub fn arm_shutdown_triggers() -> ShutdownTriggers {
 ///
 /// `app_pid` is the process this init asks to exit first, before the blanket kill that follows
 /// it. `log` is called from the watcher thread, so it must be `Send`.
-pub fn spawn_watcher(
+pub(crate) fn spawn_watcher(
     triggers: ShutdownTriggers,
     app_pid: u32,
     log: impl Fn(&str) + Send + 'static,
@@ -139,7 +143,8 @@ pub fn spawn_watcher(
 #[allow(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
+    clippy::cast_possible_wrap,
+    clippy::as_conversions
 )]
 fn wait_for_trigger(devices: &[std::fs::File]) {
     use std::os::fd::{FromRawFd as _, IntoRawFd as _, OwnedFd};
@@ -158,7 +163,7 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
     let epfd_raw = epfd.as_raw_fd();
 
     // SAFETY: `pipefds` is a valid, in-scope `[c_int; 2]`; the call fills both entries.
-    let mut pipefds = [0 as libc::c_int; 2];
+    let mut pipefds: [libc::c_int; 2] = [0; 2];
     if unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
         return wait_for_trigger_polling(devices);
     }
@@ -223,7 +228,8 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
         if n < 0 {
             continue;
         }
-        for ev in &events[..n as usize] {
+        let ready = usize::try_from(n).unwrap_or(0).min(events.len());
+        for ev in events.get(..ready).unwrap_or(&[]) {
             let fd = ev.u64 as libc::c_int;
             if fd == sigterm_read_fd {
                 return;
@@ -303,14 +309,16 @@ fn power_button_pressed(file: &std::fs::File) -> bool {
 
 /// PIDs never exceed `i32::MAX` on Linux (`/proc/sys/kernel/pid_max` is capped well below
 /// that), so `pid as libc::pid_t` here is always exact.
-#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_wrap, clippy::as_conversions)]
 fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
     // SAFETY: `kill` takes a pid and a signal number, no pointers.
     unsafe {
         libc::kill(app_pid as libc::pid_t, libc::SIGTERM);
     }
 
-    let deadline = Instant::now() + SIGTERM_GRACE;
+    let deadline = Instant::now()
+        .checked_add(SIGTERM_GRACE)
+        .unwrap_or_else(Instant::now);
     while process_alive(app_pid) {
         if Instant::now() >= deadline {
             log("[WARN] The app did not exit within the grace period — force-killing it.");
@@ -330,7 +338,11 @@ fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
     unsafe {
         libc::kill(-1, libc::SIGKILL);
     }
-    wait_for_processes_to_exit(Instant::now() + KILL_SETTLE_TIMEOUT);
+    wait_for_processes_to_exit(
+        Instant::now()
+            .checked_add(KILL_SETTLE_TIMEOUT)
+            .unwrap_or_else(Instant::now),
+    );
 
     wipe_writable_state(log);
     log("Graceful shutdown complete. Powering off.");
@@ -375,7 +387,7 @@ fn wipe_writable_state(log: &impl Fn(&str)) {
 /// `reboot(2)` only returns at all if it failed, so the fallbacks below are the "the kernel
 /// refused to power us off" path: try `HALT`, and failing that exit, which from PID 1 is itself
 /// a kernel panic and stops the guest just as dead.
-pub fn force_power_off() -> ! {
+pub(crate) fn force_power_off() -> ! {
     // SAFETY: `reboot(2)` takes a plain integer command code and no pointers; PID 1 is who is
     // entitled to call it.
     unsafe {
@@ -401,7 +413,7 @@ pub fn force_power_off() -> ! {
 /// the power-off is not.
 ///
 /// Call only from PID 1; a child has neither `CAP_SYS_BOOT` nor permission to signal others.
-pub fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
+pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
     // Not just an assertion of the doc comment above: `kill(-1, SIGKILL)` below means "every
     // process I am allowed to signal", which anywhere other than a guest's PID 1 is the
     // caller's entire session. Refusing outright is the only safe response to being called
@@ -440,7 +452,11 @@ pub fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
     unsafe {
         libc::kill(-1, libc::SIGKILL);
     }
-    wait_for_processes_to_exit(Instant::now() + KILL_SETTLE_TIMEOUT);
+    wait_for_processes_to_exit(
+        Instant::now()
+            .checked_add(KILL_SETTLE_TIMEOUT)
+            .unwrap_or_else(Instant::now),
+    );
 
     wipe_writable_state(&log);
     log("Wipe complete. Powering off.");
@@ -464,7 +480,7 @@ fn wait_for_processes_to_exit(deadline: Instant) {
 }
 
 /// See [`run_graceful_shutdown`]'s cast justification.
-#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_wrap, clippy::as_conversions)]
 fn process_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing, it only checks existence/permission — `pid` is a plain
     // integer, no pointers involved.
@@ -527,7 +543,7 @@ fn scrub_dir(dir: &std::path::Path, depth: u32) {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
         if meta.is_dir() {
-            scrub_dir(&path, depth + 1);
+            scrub_dir(&path, depth.saturating_add(1));
             let _ = std::fs::remove_dir(&path);
         } else if meta.is_file() {
             let _ = overwrite_file(&path, meta.len());
@@ -543,7 +559,8 @@ fn scrub_dir(dir: &std::path::Path, depth: u32) {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::cast_possible_wrap
+    clippy::cast_possible_wrap,
+    clippy::as_conversions
 )]
 mod tests {
     use super::*;

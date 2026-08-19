@@ -1,16 +1,3 @@
 /target
 guest/target
 guest/Cargo.toml
-guest/cargo-unikernel-common/Cargo.toml
-guest/cargo-unikernel-init/Cargo.toml
-/linux-*
-/rootfs
-linux.tar.xz
-sev_measurement.txt
-usr/
-sev-snp-measure/
-dist/
-*.bzImage
-*.efi
-*.iso
-.claude

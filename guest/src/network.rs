@@ -1,223 +1,13 @@
-//! Filesystem mounting/lockdown and minimal network bring-up shared by the guest init.
+//! Network bring-up for the guest init: loopback + interface UP, optional static IPv6
+//! assignment, and waiting for a default route to settle.
 //!
-//! These functions take a `fatal` callback instead of calling a hardcoded panic/shutdown
-//! routine, so the guest init crate can decide how a boot-time mount failure terminates the
-//! VM without this crate depending on that.
-//!
-//! Network bring-up (this whole module's `net-ipv4`/`net-ipv6`-gated half) compiles to
-//! nothing at all when neither feature is enabled — `[network].mode = "none"` means no
-//! loopback/interface ioctls, no `/proc/net/route` polling, not just an early return past
-//! code that still exists in the binary.
+//! This whole module compiles to nothing at all when neither `net-ipv4` nor `net-ipv6` is
+//! enabled — `[network].mode = "none"` means no loopback/interface ioctls, no
+//! `/proc/net/route` polling, not just an early return past code that still exists in the
+//! binary.
 
-use std::ffi::CString;
-
-/// Thin wrapper over the raw `mount(2)` syscall — kept local rather than pulling in `nix` for
-/// one function: every argument here is either `None`/empty or a fixed string literal chosen by
-/// this crate, so there's no safety or ergonomics the extra dependency would have bought.
-pub(crate) fn mount(
-    source: Option<&str>,
-    target: &str,
-    fstype: Option<&str>,
-    flags: libc::c_ulong,
-    data: Option<&str>,
-) -> std::io::Result<()> {
-    let to_cstring = |s: &str| {
-        CString::new(s).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "mount() argument must not contain a NUL byte",
-            )
-        })
-    };
-    let source_c = source.map(to_cstring).transpose()?;
-    let target_c = to_cstring(target)?;
-    let fstype_c = fstype.map(to_cstring).transpose()?;
-    let data_c = data.map(to_cstring).transpose()?;
-
-    let source_ptr = source_c
-        .as_deref()
-        .map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
-    let fstype_ptr = fstype_c
-        .as_deref()
-        .map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
-    let data_ptr = data_c
-        .as_deref()
-        .map_or(std::ptr::null(), std::ffi::CStr::as_ptr)
-        .cast::<libc::c_void>();
-
-    // SAFETY: `source_ptr`/`fstype_ptr`/`data_ptr` are each either null or a valid, live
-    // NUL-terminated `CString` pointer owned by a local still in scope for the call;
-    // `target_c` likewise outlives the call.
-    let ret = unsafe { libc::mount(source_ptr, target_c.as_ptr(), fstype_ptr, flags, data_ptr) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-const NOSUID_NODEV_NOEXEC: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
-
-/// Shared by every path `danger-allow-write-execute` affects (`/tmp`, and `/var` — see
-/// `storage.rs` for the persistent-mode ext4 case): `noexec` unless that feature is compiled
-/// in, in which case the path is writable AND executable.
-///
-/// Two separate functions selected by `#[cfg]`, not one function with a runtime `if`: only
-/// the flags for whichever build was actually requested exist in the binary.
-#[cfg(feature = "danger-allow-write-execute")]
-pub(crate) const fn writable_exec_mount_flags() -> libc::c_ulong {
-    libc::MS_NOSUID | libc::MS_NODEV
-}
-#[cfg(not(feature = "danger-allow-write-execute"))]
-pub(crate) const fn writable_exec_mount_flags() -> libc::c_ulong {
-    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC
-}
-
-/// Whether `danger-allow-write-execute` is compiled in. Only ever consulted to pick a log
-/// string — the mount flags themselves go through [`writable_exec_mount_flags`], where the
-/// `#[cfg]` split keeps the unrequested build's flags out of the binary entirely.
-const ALLOW_WRITE_EXECUTE: bool = cfg!(feature = "danger-allow-write-execute");
-
-fn log_write_execute_danger(log: &impl Fn(&str), path: &str) {
-    if ALLOW_WRITE_EXECUTE {
-        log(&format!(
-            "[DANGER] danger-allow-write-execute is compiled in — {path} will be writable AND executable."
-        ));
-    }
-}
-
-/// Mounts /proc, /sys, /dev(+pts, +shm), /tmp, /run, /var(+tmp) and `payload_dir`, then brings
-/// up networking.
-///
-/// Sysctl hardening is applied separately by the caller via `hardening::apply`. Calls
-/// `fatal(msg)` (never returns) on any mount failure.
-pub fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: fn(&str) -> !) {
-    log("Mounting essential filesystems...");
-    log_write_execute_danger(&log, "/tmp");
-
-    // Ordered: each entry's target must already exist, which for /dev/pts, /dev/shm and
-    // /var/tmp means the filesystem carrying it is mounted by an earlier entry.
-    let base: &[(&str, &str, &str, libc::c_ulong, Option<&str>)] = &[
-        // `hidepid=2`: the app is the only unprivileged process here, and everything else in
-        // /proc belongs to PID 1 — so this hides the init's cmdline (which comes from the
-        // host-supplied kernel command line) and its /proc entries from the app entirely,
-        // rather than relying on PID 1's non-dumpable bit to cover each one individually.
-        (
-            "proc",
-            "/proc",
-            "proc",
-            NOSUID_NODEV_NOEXEC,
-            Some("hidepid=2"),
-        ),
-        ("sysfs", "/sys", "sysfs", NOSUID_NODEV_NOEXEC, None),
-        (
-            "devtmpfs",
-            "/dev",
-            "devtmpfs",
-            libc::MS_NOSUID | libc::MS_NOEXEC,
-            None,
-        ),
-        // /tmp — writable scratch; NOEXEC unless danger-allow-write-execute is compiled in.
-        // 1777, not 1700: the mount root belongs to root and the app runs as an unprivileged
-        // uid, so anything narrower leaves the app unable to write to /tmp at all. The sticky
-        // bit is what keeps that from also meaning "any process may unlink another's files".
-        (
-            "tmpfs",
-            "/tmp",
-            "tmpfs",
-            writable_exec_mount_flags(),
-            Some("size=64m,mode=1777"),
-        ),
-        (
-            "tmpfs",
-            "/run",
-            "tmpfs",
-            NOSUID_NODEV_NOEXEC,
-            Some("size=16m,mode=0755"),
-        ),
-        // `size=64m` to match /tmp rather than taking tmpfs's default, which is *half of guest
-        // RAM* — without it this is the one writable mount an app can grow until the guest OOMs,
-        // and the one the shutdown scrub then has to zero against its deadline.
-        (
-            "tmpfs",
-            "/dev/shm",
-            "tmpfs",
-            NOSUID_NODEV_NOEXEC,
-            Some("size=64m,mode=1777"),
-        ),
-    ];
-    for &(source, target, fstype, flags, data) in base {
-        let _ = std::fs::create_dir_all(target);
-        mount(Some(source), target, Some(fstype), flags, data)
-            .unwrap_or_else(|e| fatal(&format!("Failed to mount {target}: {e}")));
-    }
-
-    // Best-effort, unlike the table above: a guest with no pty support is fine, nothing here
-    // needs one. Carries the same nosuid/noexec floor as everything else regardless — being
-    // optional is not a reason for it to be the one mount an app could exec from.
-    let _ = std::fs::create_dir("/dev/pts");
-    let _ = mount(
-        Some("devpts"),
-        "/dev/pts",
-        Some("devpts"),
-        libc::MS_NOSUID | libc::MS_NOEXEC,
-        Some("mode=0620,ptmxmode=0666"),
-    );
-
-    let _ = std::fs::create_dir_all("/var");
-    log_write_execute_danger(&log, "/var");
-    #[cfg(feature = "storage-persistent")]
-    crate::storage::mount_persistent_var(&log, fatal);
-    #[cfg(not(feature = "storage-persistent"))]
-    mount(
-        Some("tmpfs"),
-        "/var",
-        Some("tmpfs"),
-        writable_exec_mount_flags(),
-        Some("mode=0755"),
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to mount /var: {e}")));
-
-    let _ = std::fs::create_dir_all("/var/tmp");
-    mount(
-        Some("tmpfs"),
-        "/var/tmp",
-        Some("tmpfs"),
-        NOSUID_NODEV_NOEXEC,
-        Some("size=64m,mode=1777"),
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to mount /var/tmp: {e}")));
-
-    // The app binary is already baked into payload_dir by the build pipeline, so a fresh
-    // tmpfs mount here would hide it. Bind-mount it onto itself instead: preserves contents
-    // while turning it into a distinct mountpoint, which lockdown_filesystem() needs to
-    // remount read-only later. No NOEXEC: the app binary must be executable from here.
-    mount(
-        Some(payload_dir),
-        payload_dir,
-        None::<&str>,
-        libc::MS_BIND,
-        None::<&str>,
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to bind-mount {payload_dir}: {e}")));
-    mount(
-        None::<&str>,
-        payload_dir,
-        None::<&str>,
-        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV,
-        None::<&str>,
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to remount {payload_dir}: {e}")));
-
-    #[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
-    init_networking(&log);
-    #[cfg(not(any(feature = "net-ipv4", feature = "net-ipv6")))]
-    log("Networking disabled ([network].mode = \"none\") — no NIC, skipping bring-up.");
-
-    log("Filesystem environment ready.");
-}
-
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
-fn init_networking(log: &impl Fn(&str)) {
+/// Brings up loopback and every other interface the kernel already knows about.
+pub(crate) fn init_networking(log: &impl Fn(&str)) {
     log("Initializing network interfaces...");
 
     #[cfg(feature = "net-ipv4")]
@@ -237,7 +27,6 @@ fn init_networking(log: &impl Fn(&str)) {
 
 /// Every interface the kernel currently knows about except loopback, which every caller here
 /// handles separately.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 fn non_loopback_interfaces() -> impl Iterator<Item = String> {
     std::fs::read_dir("/sys/class/net")
         .into_iter()
@@ -259,7 +48,7 @@ fn non_loopback_interfaces() -> impl Iterator<Item = String> {
 /// and are the reason a guest whose console you *can* read is worth booting once before relying
 /// on this in an image whose console you can't.
 #[cfg(feature = "net-ipv6")]
-pub fn configure_static_ipv6(static_v6: &str, gateway: &str, interface: &str, log: &impl Fn(&str)) {
+pub(crate) fn configure_static_ipv6(static_v6: &str, gateway: &str, interface: &str, log: &impl Fn(&str)) {
     if static_v6.is_empty() {
         return;
     }
@@ -380,7 +169,11 @@ fn interface_index(name: &str) -> std::io::Result<libc::c_int> {
 /// Returns the errno-carrying error untouched rather than wrapping it in a labelled one:
 /// `io::Error::new` discards `raw_os_error()`, and the caller distinguishes `EEXIST` from a real
 /// failure by exactly that. Callers name the operation in their own message instead.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::as_conversions
+)]
 fn inet6_ioctl<T>(request: libc::c_ulong, arg: &mut T) -> std::io::Result<()> {
     // SAFETY: `sock` is checked non-negative before use and closed on every exit path; `arg` is
     // a live, correctly-shaped struct borrowed mutably for the call's duration.
@@ -479,19 +272,18 @@ fn add_ipv6_default_route(name: &str, gateway: std::net::Ipv6Addr) -> std::io::R
 /// bring-up and address readback are the same four steps every time — open a control socket,
 /// stamp the name in, run an ioctl, read the union back — so they share this buffer type and
 /// the helper below rather than repeating that per ioctl.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 type IfReq = [u8; 40];
 /// Offset of the union (`ifr_flags`, `ifr_addr`, …) within [`IfReq`].
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 const IFR_UNION: usize = 16;
 
 /// Builds an [`IfReq`] naming `name`, truncated to 15 bytes so the trailing NUL always fits.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 fn ifreq_for(name: &str) -> IfReq {
     let mut ifr = [0u8; 40];
     let bytes = name.as_bytes();
     let len = bytes.len().min(15);
-    ifr[..len].copy_from_slice(&bytes[..len]);
+    if let (Some(dst), Some(src)) = (ifr.get_mut(..len), bytes.get(..len)) {
+        dst.copy_from_slice(src);
+    }
     ifr
 }
 
@@ -503,8 +295,11 @@ fn ifreq_for(name: &str) -> IfReq {
 ///
 /// The socket's own address family doesn't have to match what's configured on the interface, so
 /// `AF_INET` works for the IPv6 paths too. `label` names the ioctl in the error message.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::as_conversions
+)]
 fn ifreq_ioctl(request: libc::c_ulong, ifr: &mut IfReq, label: &str) -> Result<(), String> {
     // SAFETY: `sock` is checked non-negative before use and closed on every exit path; `ifr` is
     // a live, fixed-size buffer matching `struct ifreq`'s layout, borrowed mutably for the
@@ -527,7 +322,7 @@ fn ifreq_ioctl(request: libc::c_ulong, ifr: &mut IfReq, label: &str) -> Result<(
 /// `AF_INET` is a small, fixed uapi constant (2) that always fits `sa_family_t` — the narrowing
 /// here is exact, never lossy.
 #[cfg(feature = "net-ipv4")]
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn configure_loopback_v4() -> Result<(), String> {
     let mut ifr = ifreq_for("lo");
 
@@ -556,8 +351,11 @@ fn configure_loopback_v4() -> Result<(), String> {
 ///
 /// `IFF_UP`/`IFF_RUNNING` are small, fixed uapi constants (0x1, 0x40) that always fit
 /// `ifr_flags`' narrower type — the narrowing here is exact, never lossy.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::as_conversions
+)]
 fn ensure_interface_up(name: &str) -> Result<bool, String> {
     let mut ifr = ifreq_for(name);
     ifreq_ioctl(libc::SIOCGIFFLAGS, &mut ifr, "SIOCGIFFLAGS")?;
@@ -584,8 +382,11 @@ fn interface_ipv4_addr(name: &str) -> Option<String> {
     ifreq_ioctl(libc::SIOCGIFADDR, &mut ifr, "SIOCGIFADDR").ok()?;
     // `struct sockaddr_in` starts at the union; the IPv4 address itself is at offset 4 within
     // it (after sin_family, sin_port).
-    let o = &ifr[IFR_UNION + 4..IFR_UNION + 8];
-    Some(format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]))
+    let o = ifr.get(IFR_UNION + 4..IFR_UNION + 8)?;
+    let &[octet0, octet1, octet2, octet3] = o else {
+        return None;
+    };
+    Some(format!("{octet0}.{octet1}.{octet2}.{octet3}"))
 }
 
 /// Reads back every IPv6 address (SLAAC-assigned or otherwise) currently on `name`, by
@@ -610,8 +411,9 @@ fn interface_ipv6_addrs(name: &str) -> Vec<std::net::Ipv6Addr> {
                 return None;
             }
             let mut bytes = [0u8; 16];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&addr_hex[i * 2..i * 2 + 2], 16).ok()?;
+            for (byte, chunk) in bytes.iter_mut().zip(addr_hex.as_bytes().chunks(2)) {
+                let chunk = std::str::from_utf8(chunk).ok()?;
+                *byte = u8::from_str_radix(chunk, 16).ok()?;
             }
             Some(std::net::Ipv6Addr::from(bytes))
         })
@@ -635,7 +437,6 @@ const fn is_global_unicast_v6(addr: &std::net::Ipv6Addr) -> bool {
 
 /// Logs the current address(es) (or lack thereof) of every non-loopback interface, for
 /// whichever protocol(s) are compiled in.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 fn log_interface_addresses(log: &impl Fn(&str)) {
     for name in non_loopback_interfaces() {
         #[cfg(feature = "net-ipv4")]
@@ -703,7 +504,6 @@ fn has_default_route_v6() -> bool {
     })
 }
 
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 fn has_default_route() -> bool {
     #[cfg(feature = "net-ipv4")]
     if has_default_route_v4() {
@@ -721,14 +521,15 @@ fn has_default_route() -> bool {
 ///
 /// Returns as soon as one appears, bounded by `max_wait` so a DHCP/SLAAC that never settles
 /// can't hang the boot.
-#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
-pub fn wait_for_network_settle(
+pub(crate) fn wait_for_network_settle(
     max_wait: std::time::Duration,
     poll_interval: std::time::Duration,
     log: impl Fn(&str),
 ) {
     log("Waiting for network to settle (polling for a default route)...");
-    let deadline = std::time::Instant::now() + max_wait;
+    let deadline = std::time::Instant::now()
+        .checked_add(max_wait)
+        .unwrap_or_else(std::time::Instant::now);
     while std::time::Instant::now() < deadline {
         if has_default_route() {
             log("Network settled (default route present).");
@@ -741,81 +542,15 @@ pub fn wait_for_network_settle(
     log_interface_addresses(&log);
 }
 
-/// `/tmp`'s remount flags for [`lockdown_filesystem`] — mirrors [`writable_exec_mount_flags`],
-/// minus the initial mount-only flags. `/var` needs no equivalent remount: it's never
-/// remounted read-only or noexec after its initial mount, so whatever
-/// [`writable_exec_mount_flags`] gave it at mount time (see `prepare_system_env`) simply
-/// persists for the rest of the boot.
-const fn tmp_remount_flags() -> libc::c_ulong {
-    libc::MS_REMOUNT | writable_exec_mount_flags()
-}
-
-/// The claim is about *paths*, deliberately: this seals the file-backed routes to executing new
-/// code (every writable mount is `noexec`, and `seccomp.rs` denies `memfd_create`/`memfd_secret`
-/// so an anonymous file can't be `execveat`'d past those flags). It is not W^X — an app can
-/// still `mmap`/`mprotect` anonymous `PROT_WRITE|PROT_EXEC` memory and run whatever it puts
-/// there, which no mount flag can see. Filtering `mmap`'s protection argument is the only thing
-/// that would close it, and doing so breaks every JIT and several allocators, so it isn't done.
-fn log_lockdown_complete(log: &impl Fn(&str)) {
-    if ALLOW_WRITE_EXECUTE {
-        log(
-            "[DANGER] Filesystem lockdown complete, EXCEPT /tmp and /var: \
-             danger-allow-write-execute is compiled in, so both remain writable+executable for \
-             the rest of this boot.",
-        );
-    } else {
-        log("Filesystem lockdown complete. No writable+executable paths remain.");
-    }
-}
-
-/// Remounts `payload_dir` read-only and (unless `danger-allow-write-execute` is compiled in)
-/// `/tmp` noexec, sealing off all writable+executable paths.
-///
-/// `/run` is remounted noexec unconditionally. Calls `fatal(msg)` (never returns) on any
-/// remount failure.
-pub fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: fn(&str) -> !) {
-    log("Locking down filesystem...");
-
-    // payload_dir is a bind mount — remounting it read-only requires MS_BIND alongside
-    // MS_REMOUNT, or the kernel ignores the flag change.
-    mount(
-        None::<&str>,
-        payload_dir,
-        None::<&str>,
-        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
-        None::<&str>,
-    )
-    .unwrap_or_else(|e| {
-        fatal(&format!(
-            "Failed to lockdown {payload_dir} to Read-Only: {e}"
-        ))
-    });
-
-    mount(
-        None::<&str>,
-        "/tmp",
-        None::<&str>,
-        tmp_remount_flags(),
-        Some("size=64m,mode=1777"),
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to remount /tmp: {e}")));
-
-    mount(
-        None::<&str>,
-        "/run",
-        None::<&str>,
-        libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-        Some("size=16m,mode=0755"),
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to remount /run noexec: {e}")));
-
-    log_lockdown_complete(&log);
-}
-
 #[cfg(all(test, feature = "net-ipv6"))]
 // Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
 // smell — this is the standard justified exception to these lints.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::as_conversions
+)]
 mod ipv6_tests {
     use super::*;
 

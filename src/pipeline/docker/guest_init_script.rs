@@ -22,7 +22,7 @@ pub(super) fn script_guest_init_build(config: &Config) -> String {
     let _ = write!(
         s,
         "cargo build --locked --release --target x86_64-unknown-linux-musl \
-         --manifest-path /assets-guest/cargo-unikernel-init/Cargo.toml {features_flag}\n\n"
+         --manifest-path /assets-guest/Cargo.toml {features_flag}\n\n"
     );
     s
 }

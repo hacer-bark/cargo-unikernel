@@ -539,7 +539,7 @@ mod tests {
             .find("readelf -l \"$APP_BIN\"")
             .expect("static-link check must run");
         let guest_init_build_pos = script
-            .find("--manifest-path /assets-guest/cargo-unikernel-init/Cargo.toml")
+            .find("--manifest-path /assets-guest/Cargo.toml")
             .expect("guest init must be built");
         assert!(static_check_pos < guest_init_build_pos);
         // Must actually abort the build, not just warn.

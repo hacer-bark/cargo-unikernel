@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 /// templates.
 static BUILD_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets");
 
-/// The guest-side source (`cargo-unikernel-init` + `cargo-unikernel-common`), cross-
-/// compiled inside the container for every build. Not a Cargo dependency of this crate —
-/// only ever needed as source text to hand to `cargo build` inside the container.
+/// The guest-side source (`cargo-unikernel-init`), cross-compiled inside the container for
+/// every build. Not a Cargo dependency of this crate — only ever needed as source text to
+/// hand to `cargo build` inside the container.
 static GUEST_SOURCE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/guest");
 
 /// Extracts the embedded assets/guest source into a cache directory, returning its path.
@@ -135,7 +135,7 @@ fn content_fingerprint() -> String {
     hash_dir(&BUILD_ASSETS, &mut hasher);
     hash_dir(&GUEST_SOURCE, &mut hasher);
     let digest = hasher.finalize();
-    crate::hex::encode(&digest[..8])
+    crate::hex::encode(digest.get(..8).unwrap_or(&digest))
 }
 
 fn hash_dir(dir: &Dir<'_>, hasher: &mut Sha256) {

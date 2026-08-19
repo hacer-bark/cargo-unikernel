@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Hacer-Bark <hacer.bark@proton.me>"]
-license = "MIT OR Apache-2.0"
+license = "0BSD"
 description = "Turn a Rust project, another language's static build, or a pre-built binary into a minimal, hardened bootable unikernel image — ISO, cpio+kernel, UKI, with an optional AMD SEV-SNP confidential-computing profile."
 repository = "https://github.com/hacer-bark/cargo-unikernel"
 homepage = "https://github.com/hacer-bark/cargo-unikernel"
@@ -29,8 +29,8 @@ include_dir = "0.7"
 
 [lints.rust]
 warnings = "deny"
-future_incompatible = "deny"
-unused = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
@@ -46,3 +46,12 @@ expect_used = "deny"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
+exit = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+
+[lints.rustdoc]
+all = "deny"
+broken_intra_doc_links = "deny"

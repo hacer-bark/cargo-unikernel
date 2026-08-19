@@ -131,7 +131,7 @@ fn wipe_and_format(fatal: fn(&str) -> !) {
 ///
 /// Fatal on any failure — `[storage].mode = "persistent"` is an explicit promise, so silently
 /// falling back to RAM would violate it invisibly.
-pub fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
+pub(crate) fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
     if device_carries_our_marker() {
         log("[storage] /dev/vda carries this image's volume label — reusing existing /var.");
     } else {
@@ -165,7 +165,7 @@ pub fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
 /// submount — so unmounting it first is what makes the `/var` unmount able to succeed at all
 /// rather than silently returning `EBUSY`. Returns whether `/var` itself came away cleanly.
 #[must_use]
-pub fn unmount_var() -> bool {
+pub(crate) fn unmount_var() -> bool {
     umount(VAR_TMP);
     umount(MOUNT_TARGET)
 }
@@ -173,7 +173,13 @@ pub fn unmount_var() -> bool {
 #[cfg(test)]
 // Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
 // smell — this is the standard justified exception to these lints.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
 

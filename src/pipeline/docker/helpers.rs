@@ -50,7 +50,7 @@ pub fn sha256_hex_of_file(path: &Path) -> Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        hasher.update(buf.get(..n).unwrap_or_default());
     }
     Ok(crate::hex::encode(&hasher.finalize()))
 }
@@ -165,7 +165,7 @@ pub(super) fn rustflags_export() -> String {
 #[cfg(test)]
 // Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
 // smell — this is the standard justified exception to these lints.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

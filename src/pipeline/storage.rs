@@ -29,7 +29,11 @@ pub fn stage(config: &Config, project_dir: &Path) -> Result<()> {
     }
     let file = std::fs::File::create(&path)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    file.set_len(u64::from(config.storage.size_mib) * 1024 * 1024)
+    file.set_len(
+        u64::from(config.storage.size_mib)
+            .saturating_mul(1024)
+            .saturating_mul(1024),
+    )
         .with_context(|| format!("failed to size {}", path.display()))?;
     Ok(())
 }

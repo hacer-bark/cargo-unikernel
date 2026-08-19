@@ -4,7 +4,7 @@
 
   [![Crates.io](https://img.shields.io/crates/v/cargo-unikernel.svg?style=for-the-badge&color=fc8d62)](https://crates.io/crates/cargo-unikernel)
   [![Docs.rs](https://img.shields.io/docsrs/cargo-unikernel?style=for-the-badge&color=66c2a5)](https://docs.rs/cargo-unikernel)
-  [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-8da0cb.svg?style=for-the-badge)](#license)
+  [![License](https://img.shields.io/badge/license-0BSD-8da0cb.svg?style=for-the-badge)](#license)
   [![CI](https://img.shields.io/github/actions/workflow/status/hacer-bark/cargo-unikernel/ci.yml?label=CI&style=for-the-badge&color=e78ac3)](https://github.com/hacer-bark/cargo-unikernel/actions/workflows/ci.yml)
 </div>
 
@@ -254,14 +254,8 @@ Start at [`docs/README.md`](docs/README.md) for the full index. Direct links:
 
 ## License
 
-Licensed under either of
-
-- [Apache License, Version 2.0](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE-APACHE)
-- [MIT license](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE-MIT)
-
-at your option.
+Licensed under the [0BSD license](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-this crate, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions.
+this crate shall be licensed as above, without any additional terms or conditions.
 </content>

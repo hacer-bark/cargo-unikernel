@@ -2,14 +2,52 @@
 //! build time (see `cargo-unikernel`'s rootfs pipeline), so there is no runtime fetch,
 //! signature check, or secure-time bootstrap here — the SEV-SNP launch measurement (or the
 //! image's own hash, for casual builds) already covers the exact app bytes.
+//!
+//! `unsafe` is unavoidable and expected throughout this crate — it wraps raw Linux syscalls
+//! (`mount`, `ioctl`, `prctl`, signal handling) that have no safe abstraction available in a
+//! `no_std`-adjacent, dependency-minimal PID-1 binary. What is not acceptable is a runtime
+//! panic: every fallible path here either returns a `Result` or takes a `fatal: fn(&str) -> !`
+//! callback so the caller can trigger the guest's own wipe-and-power-off shutdown protocol
+//! instead of unwinding.
 
 #![forbid(unsafe_op_in_unsafe_fn, elided_lifetimes_in_paths)]
+// Conflicts with rustc's `unreachable_pub` (denied below) in a binary-only crate: every module
+// here is private, so `unreachable_pub` wants cross-module items marked `pub(crate)` while this
+// lint wants the exact same items marked plain `pub` instead. Keeping `pub(crate)` is the more
+// honest signal (it says "crate-internal API", not "nothing external could ever depend on this"),
+// so this is the lint that loses the standoff.
+#![allow(clippy::redundant_pub_crate)]
+
+mod entropy;
+mod hardening;
+mod mounts;
+#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
+mod network;
+mod seccomp;
+mod shutdown;
+#[cfg(feature = "storage-persistent")]
+mod storage;
 
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+
+/// Writes `len` zero bytes to `sink`, reusing one caller-supplied `zeros` buffer rather than
+/// allocating per call — both callers (scrubbing a tmpfs file, wiping a whole block device)
+/// are on paths where an allocation sized to the target would be absurd.
+fn write_zeros(sink: &mut impl std::io::Write, len: u64, zeros: &[u8]) -> std::io::Result<()> {
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(zeros.len());
+        sink.write_all(zeros.get(..n).unwrap_or(zeros))?;
+        remaining = remaining.saturating_sub(u64::try_from(n).unwrap_or(remaining));
+    }
+    Ok(())
+}
 
 const PAYLOAD_DIR: &str = env!("CARGO_UNIKERNEL_PAYLOAD_DIR");
 const APP_PATH: &str = env!("CARGO_UNIKERNEL_APP_PATH");
@@ -113,7 +151,7 @@ fn non_pid1_fatal_exit(message: &str) -> ! {
 /// Wiping rather than powering off on the spot: a bare `reboot(2)` leaves every tmpfs page the
 /// app wrote sitting in guest RAM, and a fatal error is not a reason to protect that data less
 /// carefully than an orderly stop does. The wipe cannot delay the power-off unboundedly — see
-/// [`cargo_unikernel_common::shutdown::wipe_and_power_off`] for the deadline and re-entry
+/// [`crate::shutdown::wipe_and_power_off`] for the deadline and re-entry
 /// guarantees that make "try to clean up" safe on a path that only runs when something is
 /// already wrong.
 ///
@@ -132,7 +170,7 @@ fn fatal_shutdown(message: &str) -> ! {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    cargo_unikernel_common::shutdown::wipe_and_power_off(log);
+    crate::shutdown::wipe_and_power_off(log);
 }
 
 /// Marks PID 1 non-dumpable, so `/proc/1/mem`/`maps` stay unreadable.
@@ -203,7 +241,11 @@ fn drop_privileges(uid: u32, gid: u32) -> impl Fn() -> std::io::Result<()> {
 ///
 /// `RLIMIT_*` are small, fixed uapi constants that always fit `c_int` — the narrowing casts
 /// below are exact, never lossy.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::as_conversions
+)]
 fn apply_resource_limits() -> std::io::Result<()> {
     set_rlimit(
         libc::RLIMIT_NOFILE as libc::c_int,
@@ -232,7 +274,7 @@ fn apply_resource_limits() -> std::io::Result<()> {
 /// `c_int`); this crate only targets musl but must still type-check on a glibc host. Every
 /// `resource` passed in is a small, non-negative `RLIMIT_*` constant, so the conversion is
 /// always exact regardless of which one applies.
-#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_sign_loss, clippy::as_conversions)]
 fn set_rlimit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: value,
@@ -252,12 +294,12 @@ fn set_rlimit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
 /// A failure here surfaces through `Command::spawn()` into `fatal_shutdown`: booting without
 /// the filter silently in place would be worse than refusing to boot.
 fn install_seccomp_baseline() -> std::io::Result<()> {
-    cargo_unikernel_common::seccomp::install_baseline_denylist()
+    crate::seccomp::install_baseline_denylist()
 }
 
 /// Checks the embedded app binary is present and makes it read-only + executable.
 ///
-/// Split out of [`spawn_app`] so it runs *before* [`cargo_unikernel_common::mounts::lockdown_filesystem`]
+/// Split out of [`spawn_app`] so it runs *before* [`crate::mounts::lockdown_filesystem`]
 /// seals `PAYLOAD_DIR`
 /// read-only — this `chmod` would fail against an already-locked-down mount.
 fn prepare_app_binary() {
@@ -327,13 +369,17 @@ fn expose_sev_guest_device() {
 ///
 /// PIDs never exceed `i32::MAX` on Linux (`pid_max` is capped well below that), so the
 /// `u32`/`pid_t` conversions below are always exact.
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::as_conversions
+)]
 fn watchdog_loop(app_pid: u32) -> ! {
     loop {
         let mut status = 0;
         // SAFETY: `status` is a valid, in-scope `i32`, written only within this call.
         let pid = unsafe { libc::waitpid(-1, std::ptr::addr_of_mut!(status), 0) };
-        let shutting_down = cargo_unikernel_common::shutdown::SHUTDOWN_IN_PROGRESS
+        let shutting_down = crate::shutdown::SHUTDOWN_IN_PROGRESS
             .load(std::sync::atomic::Ordering::SeqCst);
 
         if pid <= 0 {
@@ -374,22 +420,22 @@ fn main() {
     println!("[INIT] cargo-unikernel guest init starting (PID 1)...");
     set_self_non_dumpable(|w| log(&format!("[WARN] {w}")));
 
-    cargo_unikernel_common::mounts::prepare_system_env(PAYLOAD_DIR, log, fatal_shutdown);
+    crate::mounts::prepare_system_env(PAYLOAD_DIR, log, fatal_shutdown);
 
     // Armed here rather than alongside `spawn_watcher` below: evdev only queues events for a
     // client from the moment it opens the device, and everything between this line and that one
     // (the entropy and network-settle waits alone allow 30s each) is time a hypervisor's
     // graceful-stop request would otherwise land in and be lost.
-    let shutdown_triggers = cargo_unikernel_common::shutdown::arm_shutdown_triggers();
+    let shutdown_triggers = crate::shutdown::arm_shutdown_triggers();
     let (uid, gid) = app_ids();
     chown_var_for_app(uid, gid, fatal_shutdown);
 
     let extra_sysctls = parse_pairs(EXTRA_SYSCTLS, "[hardening].extra_sysctls");
-    cargo_unikernel_common::hardening::apply(&extra_sysctls, |w| {
+    crate::hardening::apply(&extra_sysctls, |w| {
         log(&format!("[WARN] {w}"));
     });
 
-    cargo_unikernel_common::entropy::wait_for_entropy(log, fatal_shutdown);
+    crate::entropy::wait_for_entropy(log, fatal_shutdown);
 
     #[cfg(feature = "sev-snp")]
     expose_sev_guest_device();
@@ -398,7 +444,7 @@ fn main() {
     // gateway is the only thing that installs one where the provider routes a prefix instead of
     // advertising it. Doing this afterwards would mean always paying the full 30s timeout there.
     #[cfg(feature = "net-ipv6")]
-    cargo_unikernel_common::mounts::configure_static_ipv6(
+    crate::network::configure_static_ipv6(
         IPV6_STATIC,
         IPV6_GATEWAY,
         IPV6_IFACE,
@@ -406,7 +452,7 @@ fn main() {
     );
 
     #[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
-    cargo_unikernel_common::mounts::wait_for_network_settle(
+    crate::network::wait_for_network_settle(
         std::time::Duration::from_secs(30),
         std::time::Duration::from_millis(100),
         log,
@@ -415,14 +461,14 @@ fn main() {
     // Lockdown before the app exists, so "the payload is read-only" holds for the app's whole
     // lifetime instead of depending on file ownership during a window before the remount.
     prepare_app_binary();
-    cargo_unikernel_common::mounts::lockdown_filesystem(PAYLOAD_DIR, log, fatal_shutdown);
+    crate::mounts::lockdown_filesystem(PAYLOAD_DIR, log, fatal_shutdown);
 
     let app_pid = spawn_app();
 
     // Spawned only now that the app exists: `Command::pre_exec` runs between `fork()` and
     // `execve()`, where only async-signal-safe work is sound, and forking a process that
     // already has other threads is what makes that a real constraint rather than a formality.
-    cargo_unikernel_common::shutdown::spawn_watcher(shutdown_triggers, app_pid, log);
+    crate::shutdown::spawn_watcher(shutdown_triggers, app_pid, log);
 
     log("Boot sequence complete. System operational. PID 1 entering watchdog mode.");
     watchdog_loop(app_pid);

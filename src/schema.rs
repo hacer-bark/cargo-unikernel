@@ -563,7 +563,8 @@ pub struct KernelHardening {
 /// `[hardening.runtime]` — sysctl hardening categories, applied by the guest at boot.
 ///
 /// Each one maps to a Cargo feature compiled into `cargo-unikernel-init` (not a runtime
-/// toggle) — see `cargo-unikernel-common::hardening` for exactly what each category applies.
+/// toggle) — see `cargo-unikernel-init`'s `hardening` module for exactly what each category
+/// applies.
 /// Same `None` = default-enabled semantics as `[hardening.kernel]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeHardening {

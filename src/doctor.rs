@@ -18,11 +18,12 @@ pub fn run() -> Result<()> {
             ok = false;
         }
     }
-    check("git", &["git", "--version"], &mut ok);
+    check("git", "git", &["--version"], &mut ok);
     let mut gh_ok = true;
     check(
         "gh (optional, for `cargo unikernel release`)",
-        &["gh", "--version"],
+        "gh",
+        &["--version"],
         &mut gh_ok,
     );
 
@@ -34,7 +35,7 @@ pub fn run() -> Result<()> {
     println!(
         "Runtime sysctl hardening table lives at: {}",
         assets_dir
-            .join("guest/cargo-unikernel-common/src/hardening.rs")
+            .join("guest/src/hardening.rs")
             .display()
     );
 
@@ -48,9 +49,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn check(name: &str, cmd: &[&str], ok: &mut bool) {
-    let found = std::process::Command::new(cmd[0])
-        .args(&cmd[1..])
+fn check(name: &str, program: &str, args: &[&str], ok: &mut bool) {
+    let found = std::process::Command::new(program)
+        .args(args)
         .output()
         .is_ok_and(|o| o.status.success());
     if found {

@@ -26,7 +26,7 @@ const POLL_TIMEOUT_MS: libc::c_int = 250;
 /// Every reachable failure here is fatal for the same reason, including an unopenable
 /// `/dev/random` — a guest that can't even ask the question can't be said to have gotten an
 /// answer.
-pub fn wait_for_entropy(log: impl Fn(&str), fatal: fn(&str) -> !) {
+pub(crate) fn wait_for_entropy(log: impl Fn(&str), fatal: fn(&str) -> !) {
     log("Waiting for kernel entropy pool (CRNG) to initialize...");
     let file = match std::fs::File::open("/dev/random") {
         Ok(f) => f,
@@ -36,7 +36,9 @@ pub fn wait_for_entropy(log: impl Fn(&str), fatal: fn(&str) -> !) {
         )),
     };
 
-    let deadline = Instant::now() + MAX_WAIT;
+    let deadline = Instant::now()
+        .checked_add(MAX_WAIT)
+        .unwrap_or_else(Instant::now);
     while Instant::now() < deadline {
         let mut fds = libc::pollfd {
             fd: file.as_raw_fd(),

@@ -36,7 +36,7 @@
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!(
-    "cargo-unikernel-common's seccomp filter is x86_64-only (see AUDIT_ARCH_X86_64 below)"
+    "cargo-unikernel-init's seccomp filter is x86_64-only (see AUDIT_ARCH_X86_64 below)"
 );
 
 use std::io;
@@ -175,6 +175,16 @@ const _: () = assert!(
 );
 
 /// The two source lists flattened into one array, so [`PROGRAM`] can index it in const context.
+///
+/// Every index below is in bounds as a direct consequence of the `while` conditions guarding
+/// it (`i < BASELINE_SYSCALLS.len()`, then `j < WRITE_EXECUTE_SYSCALLS.len()` with `i` fixed at
+/// `BASELINE_SYSCALLS.len()`, and `DENIED_LEN` defined as their sum) — and this all runs at
+/// compile time, so a bound that ever did slip would fail the build, not the running guest.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 const DENIED: [i64; DENIED_LEN] = {
     let mut out = [0i64; DENIED_LEN];
     let mut i = 0;
@@ -200,9 +210,17 @@ const DENIED: [i64; DENIED_LEN] = {
 /// caller runs it from a `Command::pre_exec` closure — between `fork()` and `execve()`, where a
 /// `malloc` can deadlock against a lock another thread held at fork time.
 ///
-/// Every cast below is in range as a direct consequence of the `DENIED_LEN <= 250` assertion
-/// above, which is why the truncation/sign-loss lints are allowed here rather than per site.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// Every cast and index below is in range as a direct consequence of the `DENIED_LEN <= 250`
+/// assertion above, which is why those lints are allowed here rather than per site — and, as
+/// with [`DENIED`], this all runs at compile time, so a bound that ever did slip would fail the
+/// build, not the running guest.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions
+)]
 const PROGRAM: [SockFilter; PROGRAM_LEN] = {
     const NOP: SockFilter = SockFilter {
         code: 0,
@@ -285,8 +303,8 @@ const PR_SET_SECCOMP: libc::c_int = 22;
 /// # Errors
 ///
 /// Returns an error if either underlying `prctl()` call fails.
-#[allow(clippy::cast_possible_truncation)]
-pub fn install_baseline_denylist() -> io::Result<()> {
+#[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+pub(crate) fn install_baseline_denylist() -> io::Result<()> {
     let fprog = SockFprog {
         len: PROGRAM_LEN as u16,
         filter: PROGRAM.as_ptr(),
@@ -320,7 +338,9 @@ pub fn install_baseline_denylist() -> io::Result<()> {
     clippy::expect_used,
     clippy::panic,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::as_conversions
 )]
 mod tests {
     use super::*;

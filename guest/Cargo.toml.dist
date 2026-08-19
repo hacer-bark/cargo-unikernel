@@ -1,17 +1,37 @@
-[workspace]
-resolver = "2"
-members = ["cargo-unikernel-common", "cargo-unikernel-init"]
-
-[workspace.package]
+[package]
+name = "cargo-unikernel-init"
 version = "0.0.0"
 publish = false
 edition = "2024"
 authors = ["Hacer-Bark <hacer.bark@proton.me>"]
-license = "MIT OR Apache-2.0"
+license = "0BSD"
+description = "Minimal guest PID-1 embedded into cargo-unikernel images."
+readme = "README.md"
 repository = "https://github.com/hacer-bark/cargo-unikernel"
 homepage = "https://github.com/hacer-bark/cargo-unikernel"
 keywords = ["unikernel", "sev-snp", "guest", "pid1"]
 categories = ["os"]
+
+[[bin]]
+name = "cargo-unikernel-init"
+path = "src/main.rs"
+
+[features]
+default = []
+sev-snp = []
+net-ipv4 = []
+net-ipv6 = []
+hardening-net-spoofing = []
+hardening-icmp = []
+hardening-tcp = []
+hardening-info-leak = []
+hardening-ptrace-bpf = []
+hardening-kexec-fs = []
+danger-allow-write-execute = []
+storage-persistent = []
+
+[dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
@@ -19,3 +39,30 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[lints.rust]
+warnings = "deny"
+future_incompatible = "deny"
+unused = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
+cargo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+
+[lints.rustdoc]
+all = "deny"
+broken_intra_doc_links = "deny"
