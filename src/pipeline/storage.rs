@@ -34,7 +34,7 @@ pub fn stage(config: &Config, project_dir: &Path) -> Result<()> {
             .saturating_mul(1024)
             .saturating_mul(1024),
     )
-        .with_context(|| format!("failed to size {}", path.display()))?;
+    .with_context(|| format!("failed to size {}", path.display()))?;
     Ok(())
 }
 

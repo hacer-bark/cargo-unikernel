@@ -48,7 +48,12 @@ fn non_loopback_interfaces() -> impl Iterator<Item = String> {
 /// and are the reason a guest whose console you *can* read is worth booting once before relying
 /// on this in an image whose console you can't.
 #[cfg(feature = "net-ipv6")]
-pub(crate) fn configure_static_ipv6(static_v6: &str, gateway: &str, interface: &str, log: &impl Fn(&str)) {
+pub(crate) fn configure_static_ipv6(
+    static_v6: &str,
+    gateway: &str,
+    interface: &str,
+    log: &impl Fn(&str),
+) {
     if static_v6.is_empty() {
         return;
     }

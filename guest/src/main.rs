@@ -379,8 +379,8 @@ fn watchdog_loop(app_pid: u32) -> ! {
         let mut status = 0;
         // SAFETY: `status` is a valid, in-scope `i32`, written only within this call.
         let pid = unsafe { libc::waitpid(-1, std::ptr::addr_of_mut!(status), 0) };
-        let shutting_down = crate::shutdown::SHUTDOWN_IN_PROGRESS
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let shutting_down =
+            crate::shutdown::SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst);
 
         if pid <= 0 {
             let err = std::io::Error::last_os_error();
@@ -444,12 +444,7 @@ fn main() {
     // gateway is the only thing that installs one where the provider routes a prefix instead of
     // advertising it. Doing this afterwards would mean always paying the full 30s timeout there.
     #[cfg(feature = "net-ipv6")]
-    crate::network::configure_static_ipv6(
-        IPV6_STATIC,
-        IPV6_GATEWAY,
-        IPV6_IFACE,
-        &log,
-    );
+    crate::network::configure_static_ipv6(IPV6_STATIC, IPV6_GATEWAY, IPV6_IFACE, &log);
 
     #[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
     crate::network::wait_for_network_settle(

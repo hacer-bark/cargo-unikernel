@@ -78,13 +78,21 @@ fn apply_redirect_and_forwarding_protection(warn: &impl Fn(&str)) {
 /// packet dictate its own return path instead of following normal routing.
 #[cfg(feature = "hardening-net-spoofing")]
 fn apply_source_routing_protection(warn: &impl Fn(&str)) {
-    write_sysctl("/proc/sys/net/ipv4/conf/all/accept_source_route", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv4/conf/all/accept_source_route",
+        b"0",
+        warn,
+    );
     write_sysctl(
         "/proc/sys/net/ipv4/conf/default/accept_source_route",
         b"0",
         warn,
     );
-    write_sysctl("/proc/sys/net/ipv6/conf/all/accept_source_route", b"0", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv6/conf/all/accept_source_route",
+        b"0",
+        warn,
+    );
     write_sysctl(
         "/proc/sys/net/ipv6/conf/default/accept_source_route",
         b"0",
@@ -99,7 +107,11 @@ fn apply_source_routing_protection(warn: &impl Fn(&str)) {
 fn apply_arp_hardening(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/net/ipv4/conf/all/arp_filter", b"1", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/all/arp_ignore", b"2", warn);
-    write_sysctl("/proc/sys/net/ipv4/conf/all/drop_gratuitous_arp", b"1", warn);
+    write_sysctl(
+        "/proc/sys/net/ipv4/conf/all/drop_gratuitous_arp",
+        b"1",
+        warn,
+    );
     write_sysctl("/proc/sys/net/ipv4/conf/all/shared_media", b"0", warn);
 }
 

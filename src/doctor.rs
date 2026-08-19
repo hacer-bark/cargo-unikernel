@@ -34,9 +34,7 @@ pub fn run() -> Result<()> {
     );
     println!(
         "Runtime sysctl hardening table lives at: {}",
-        assets_dir
-            .join("guest/src/hardening.rs")
-            .display()
+        assets_dir.join("guest/src/hardening.rs").display()
     );
 
     if !ok {
