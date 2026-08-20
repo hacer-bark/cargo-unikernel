@@ -11,11 +11,6 @@
 //! instead of unwinding.
 
 #![forbid(unsafe_op_in_unsafe_fn, elided_lifetimes_in_paths)]
-// Conflicts with rustc's `unreachable_pub` (denied below) in a binary-only crate: every module
-// here is private, so `unreachable_pub` wants cross-module items marked `pub(crate)` while this
-// lint wants the exact same items marked plain `pub` instead. Keeping `pub(crate)` is the more
-// honest signal (it says "crate-internal API", not "nothing external could ever depend on this"),
-// so this is the lint that loses the standoff.
 #![allow(clippy::redundant_pub_crate)]
 
 mod entropy;
