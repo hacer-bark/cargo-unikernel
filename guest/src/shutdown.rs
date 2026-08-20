@@ -162,18 +162,13 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
     let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
     let epfd_raw = epfd.as_raw_fd();
 
-    // SAFETY: `pipefds` is a valid, in-scope `[c_int; 2]`; the call fills both entries.
-    let mut pipefds: [libc::c_int; 2] = [0; 2];
-    if unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+    // `std::io::pipe()` creates the pair (CLOEXEC, atomically, like `pipe2`) without any raw fd
+    // handling on this end — no `unsafe` needed to own what it hands back.
+    let Ok((sigterm_read, sigterm_write)) = std::io::pipe() else {
         return wait_for_trigger_polling(devices);
-    }
-    // SAFETY: both were just created by `pipe2`, are non-negative, and are not owned elsewhere.
-    let (sigterm_read, sigterm_write) = unsafe {
-        (
-            OwnedFd::from_raw_fd(pipefds[0]),
-            OwnedFd::from_raw_fd(pipefds[1]),
-        )
     };
+    set_nonblocking(&sigterm_read);
+    set_nonblocking(&sigterm_write);
     let sigterm_read_fd = sigterm_read.as_raw_fd();
 
     let register = |fd: libc::c_int| {
@@ -220,7 +215,10 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
         register(device.as_raw_fd());
     }
 
-    let mut events: [libc::epoll_event; 16] = unsafe { std::mem::zeroed() };
+    // `epoll_wait` overwrites every slot it fills before this array is read, so a zeroed
+    // starting value (rather than `mem::zeroed()`) is all it needs — plain-old-data, no unsafe
+    // required to produce it.
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
     loop {
         // SAFETY: `events` is a valid, in-scope buffer of the given length; `-1` blocks with no
         // timeout. A spurious `EINTR` wakeup just loops back into another wait.
@@ -272,7 +270,9 @@ fn find_input_event_devices() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn set_nonblocking(file: &std::fs::File) {
+/// Generic over anything holding a raw fd — shared by the evdev devices and the self-pipe ends
+/// in [`wait_for_trigger`], rather than one copy of this fcntl pair per fd type.
+fn set_nonblocking(file: &impl AsRawFd) {
     // SAFETY: reads/sets file status flags on an already-open, valid fd; no pointers involved.
     unsafe {
         let fd = file.as_raw_fd();
@@ -316,9 +316,7 @@ fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
         libc::kill(app_pid as libc::pid_t, libc::SIGTERM);
     }
 
-    let deadline = Instant::now()
-        .checked_add(SIGTERM_GRACE)
-        .unwrap_or_else(Instant::now);
+    let deadline = crate::deadline_after(SIGTERM_GRACE);
     while process_alive(app_pid) {
         if Instant::now() >= deadline {
             log("[WARN] The app did not exit within the grace period — force-killing it.");
@@ -345,11 +343,7 @@ fn kill_wipe_and_power_off(log: &impl Fn(&str), final_message: &str) -> ! {
     unsafe {
         libc::kill(-1, libc::SIGKILL);
     }
-    wait_for_processes_to_exit(
-        Instant::now()
-            .checked_add(KILL_SETTLE_TIMEOUT)
-            .unwrap_or_else(Instant::now),
-    );
+    wait_for_processes_to_exit(crate::deadline_after(KILL_SETTLE_TIMEOUT));
 
     wipe_writable_state(log);
     log(final_message);

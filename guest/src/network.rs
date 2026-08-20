@@ -166,28 +166,31 @@ fn interface_index(name: &str) -> std::io::Result<libc::c_int> {
     ]))
 }
 
-/// Runs one ioctl on a throwaway `AF_INET6` socket — which, unlike the `AF_INET` one
-/// [`ifreq_ioctl`] uses, is required here: the IPv6 address and route ioctls are dispatched by
-/// the socket's family, not by the request number.
-#[cfg(feature = "net-ipv6")]
+/// Runs one ioctl on a throwaway `SOCK_DGRAM` socket of the given `family`, closing it on every
+/// exit path. Shared by [`inet6_ioctl`] and [`ifreq_ioctl`] — every ioctl in this module is
+/// "open a control socket, run one ioctl on it, close it", so this is the one place that gets
+/// the socket's lifetime right rather than two independent copies of the same unsafe sequence.
 ///
-/// Returns the errno-carrying error untouched rather than wrapping it in a labelled one:
-/// `io::Error::new` discards `raw_os_error()`, and the caller distinguishes `EEXIST` from a real
-/// failure by exactly that. Callers name the operation in their own message instead.
+/// `arg` must be a valid pointer for `request`'s ioctl to read and/or write for the call's
+/// duration — each caller's own struct/buffer documents why that holds for it.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::as_conversions
 )]
-fn inet6_ioctl<T>(request: libc::c_ulong, arg: &mut T) -> std::io::Result<()> {
-    // SAFETY: `sock` is checked non-negative before use and closed on every exit path; `arg` is
-    // a live, correctly-shaped struct borrowed mutably for the call's duration.
+unsafe fn socket_ioctl(
+    family: libc::c_int,
+    request: libc::c_ulong,
+    arg: *mut libc::c_void,
+) -> std::io::Result<()> {
+    // SAFETY: `sock` is checked non-negative before use and closed on every exit path; `arg`'s
+    // validity is the caller's obligation, documented on this function.
     unsafe {
-        let sock = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        let sock = libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
         if sock < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let ret = libc::ioctl(sock, request as _, std::ptr::from_mut(arg));
+        let ret = libc::ioctl(sock, request as _, arg);
         let err = std::io::Error::last_os_error();
         libc::close(sock);
         if ret < 0 {
@@ -195,6 +198,19 @@ fn inet6_ioctl<T>(request: libc::c_ulong, arg: &mut T) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Runs one ioctl on a throwaway `AF_INET6` socket — which, unlike the `AF_INET` one
+/// [`ifreq_ioctl`] uses, is required here: the IPv6 address and route ioctls are dispatched by
+/// the socket's family, not by the request number.
+///
+/// Returns the errno-carrying error untouched rather than wrapping it in a labelled one:
+/// `io::Error::new` discards `raw_os_error()`, and the caller distinguishes `EEXIST` from a real
+/// failure by exactly that. Callers name the operation in their own message instead.
+#[cfg(feature = "net-ipv6")]
+fn inet6_ioctl<T>(request: libc::c_ulong, arg: &mut T) -> std::io::Result<()> {
+    // SAFETY: `arg` is a live, correctly-shaped struct borrowed mutably for the call's duration.
+    unsafe { socket_ioctl(libc::AF_INET6, request, std::ptr::from_mut(arg).cast()) }
 }
 
 #[cfg(feature = "net-ipv6")]
@@ -231,12 +247,29 @@ struct In6RtMsg {
 
 /// Both structs are passed straight to the kernel, so a layout that drifts from the uapi one
 /// wouldn't fail to compile — it would silently write the prefix length into the wrong field.
-/// The sizes are the cheap half of pinning that down; the offsets below are the rest. Verified
-/// against `linux/ipv6.h` and `linux/ipv6_route.h` on `x86_64`.
+/// Checked at compile time via `offset_of!` rather than only in a `#[cfg(test)]` runtime check,
+/// so an unbuilt-and-untested configuration can't ship a struct that has quietly drifted from
+/// the kernel's layout. Verified against `linux/ipv6.h` and `linux/ipv6_route.h` on `x86_64`.
 #[cfg(feature = "net-ipv6")]
 const _: () = {
+    use std::mem::offset_of;
+
     assert!(size_of::<In6IfReq>() == 24);
+    assert!(offset_of!(In6IfReq, addr) == 0);
+    assert!(offset_of!(In6IfReq, prefix_len) == 16);
+    assert!(offset_of!(In6IfReq, ifindex) == 20);
+
     assert!(size_of::<In6RtMsg>() == 80);
+    assert!(offset_of!(In6RtMsg, dst) == 0);
+    assert!(offset_of!(In6RtMsg, src) == 16);
+    assert!(offset_of!(In6RtMsg, gateway) == 32);
+    assert!(offset_of!(In6RtMsg, rtmsg_type) == 48);
+    assert!(offset_of!(In6RtMsg, dst_len) == 52);
+    assert!(offset_of!(In6RtMsg, src_len) == 54);
+    assert!(offset_of!(In6RtMsg, metric) == 56);
+    assert!(offset_of!(In6RtMsg, info) == 64);
+    assert!(offset_of!(In6RtMsg, flags) == 72);
+    assert!(offset_of!(In6RtMsg, ifindex) == 76);
 };
 
 /// Deliberately *worse* than the 1024 the kernel gives a router-advertisement default route.
@@ -300,28 +333,11 @@ fn ifreq_for(name: &str) -> IfReq {
 ///
 /// The socket's own address family doesn't have to match what's configured on the interface, so
 /// `AF_INET` works for the IPv6 paths too. `label` names the ioctl in the error message.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::as_conversions
-)]
 fn ifreq_ioctl(request: libc::c_ulong, ifr: &mut IfReq, label: &str) -> Result<(), String> {
-    // SAFETY: `sock` is checked non-negative before use and closed on every exit path; `ifr` is
-    // a live, fixed-size buffer matching `struct ifreq`'s layout, borrowed mutably for the
-    // call's duration.
-    unsafe {
-        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
-        if sock < 0 {
-            return Err(format!("socket(): {}", std::io::Error::last_os_error()));
-        }
-        let ret = libc::ioctl(sock, request as _, ifr.as_mut_ptr());
-        let err = std::io::Error::last_os_error();
-        libc::close(sock);
-        if ret < 0 {
-            return Err(format!("{label}: {err}"));
-        }
-    }
-    Ok(())
+    // SAFETY: `ifr` is a live, fixed-size buffer matching `struct ifreq`'s layout, borrowed
+    // mutably for the call's duration.
+    unsafe { socket_ioctl(libc::AF_INET, request, ifr.as_mut_ptr().cast()) }
+        .map_err(|e| format!("{label}: {e}"))
 }
 
 /// `AF_INET` is a small, fixed uapi constant (2) that always fits `sa_family_t` — the narrowing
@@ -532,9 +548,7 @@ pub(crate) fn wait_for_network_settle(
     log: impl Fn(&str),
 ) {
     log("Waiting for network to settle (polling for a default route)...");
-    let deadline = std::time::Instant::now()
-        .checked_add(max_wait)
-        .unwrap_or_else(std::time::Instant::now);
+    let deadline = crate::deadline_after(max_wait);
     while std::time::Instant::now() < deadline {
         if has_default_route() {
             log("Network settled (default route present).");
@@ -550,60 +564,9 @@ pub(crate) fn wait_for_network_settle(
 #[cfg(all(test, feature = "net-ipv6"))]
 // Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
 // smell — this is the standard justified exception to these lints.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::as_conversions
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod ipv6_tests {
     use super::*;
-
-    /// Offsets, not just sizes: two structs of the right total size with fields in the wrong
-    /// places would compile, pass the `const` size assertions, and quietly misconfigure the
-    /// network of a guest whose console nobody can read. Values are from `linux/ipv6.h` and
-    /// `linux/ipv6_route.h` on `x86_64`.
-    #[test]
-    fn kernel_struct_field_offsets_match_the_uapi_layout() {
-        let ifreq = In6IfReq {
-            addr: [0u8; 16],
-            prefix_len: 0,
-            ifindex: 0,
-        };
-        let base = std::ptr::from_ref(&ifreq) as usize;
-        assert_eq!(std::ptr::from_ref(&ifreq.addr) as usize - base, 0);
-        assert_eq!(std::ptr::from_ref(&ifreq.prefix_len) as usize - base, 16);
-        assert_eq!(std::ptr::from_ref(&ifreq.ifindex) as usize - base, 20);
-
-        let rt = In6RtMsg {
-            dst: [0u8; 16],
-            src: [0u8; 16],
-            gateway: [0u8; 16],
-            rtmsg_type: 0,
-            dst_len: 0,
-            src_len: 0,
-            metric: 0,
-            _pad: 0,
-            info: 0,
-            flags: 0,
-            ifindex: 0,
-        };
-        let base = std::ptr::from_ref(&rt) as usize;
-        for (offset, actual) in [
-            (0, std::ptr::from_ref(&rt.dst) as usize),
-            (16, std::ptr::from_ref(&rt.src) as usize),
-            (32, std::ptr::from_ref(&rt.gateway) as usize),
-            (48, std::ptr::from_ref(&rt.rtmsg_type) as usize),
-            (52, std::ptr::from_ref(&rt.dst_len) as usize),
-            (54, std::ptr::from_ref(&rt.src_len) as usize),
-            (56, std::ptr::from_ref(&rt.metric) as usize),
-            (64, std::ptr::from_ref(&rt.info) as usize),
-            (72, std::ptr::from_ref(&rt.flags) as usize),
-            (76, std::ptr::from_ref(&rt.ifindex) as usize),
-        ] {
-            assert_eq!(actual - base, offset, "in6_rtmsg field moved");
-        }
-    }
 
     #[test]
     fn static_ipv6_spec_parses_or_is_rejected() {

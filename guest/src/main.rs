@@ -44,6 +44,16 @@ fn write_zeros(sink: &mut impl std::io::Write, len: u64, zeros: &[u8]) -> std::i
     Ok(())
 }
 
+/// `Instant::now() + timeout`, saturating to "now" instead of panicking if the addition would
+/// overflow. Shared by every bounded wait in this crate (entropy, network settle, shutdown
+/// timeouts) so there is exactly one place that gets this idiom right, rather than one
+/// `checked_add`/`unwrap_or_else` pair per call site to keep in sync.
+fn deadline_after(timeout: std::time::Duration) -> std::time::Instant {
+    std::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(std::time::Instant::now)
+}
+
 const PAYLOAD_DIR: &str = env!("CARGO_UNIKERNEL_PAYLOAD_DIR");
 const APP_PATH: &str = env!("CARGO_UNIKERNEL_APP_PATH");
 const APP_UID: &str = env!("CARGO_UNIKERNEL_APP_UID");
@@ -105,13 +115,8 @@ fn log(msg: &str) {
 /// runs as an unprivileged, non-root uid/gid, so without this it could never write into `/var`
 /// at all, in either storage mode.
 fn chown_var_for_app(uid: u32, gid: u32, fatal: fn(&str) -> !) {
-    // SAFETY: `c"/var"` is a `'static` NUL-terminated C string literal.
-    let ret = unsafe { libc::chown(c"/var".as_ptr(), uid, gid) };
-    if ret != 0 {
-        fatal(&format!(
-            "Failed to chown /var to the app's uid/gid: {}",
-            std::io::Error::last_os_error()
-        ));
+    if let Err(e) = std::os::unix::fs::chown("/var", Some(uid), Some(gid)) {
+        fatal(&format!("Failed to chown /var to the app's uid/gid: {e}"));
     }
 }
 

@@ -36,9 +36,7 @@ pub(crate) fn wait_for_entropy(log: impl Fn(&str), fatal: fn(&str) -> !) {
         )),
     };
 
-    let deadline = Instant::now()
-        .checked_add(MAX_WAIT)
-        .unwrap_or_else(Instant::now);
+    let deadline = crate::deadline_after(MAX_WAIT);
     while Instant::now() < deadline {
         let mut fds = libc::pollfd {
             fd: file.as_raw_fd(),
