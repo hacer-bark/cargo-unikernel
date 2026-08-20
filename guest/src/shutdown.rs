@@ -332,9 +332,16 @@ fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
     // repopulate what the scrub is about to clear, and would keep its own anonymous memory alive
     // right up to the power-off — the same reason the fatal path in `wipe_and_power_off` kills
     // the whole process table before wiping.
-    //
-    // SAFETY: `kill(2)` takes a pid and a signal number, no pointers. `-1` means every process
-    // this one may signal, which the kernel defines as excluding PID 1 itself.
+    kill_wipe_and_power_off(log, "Graceful shutdown complete. Powering off.");
+}
+
+/// Shared tail of [`run_graceful_shutdown`] and [`wipe_and_power_off`]: `SIGKILL`s every
+/// remaining process, waits for them to actually leave the process table, scrubs writable
+/// state, logs `final_message`, then powers off. Never returns.
+///
+/// SAFETY: `kill(2)` takes a pid and a signal number, no pointers. `-1` means every process
+/// this one may signal, which the kernel defines as excluding PID 1 itself.
+fn kill_wipe_and_power_off(log: &impl Fn(&str), final_message: &str) -> ! {
     unsafe {
         libc::kill(-1, libc::SIGKILL);
     }
@@ -345,8 +352,8 @@ fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
     );
 
     wipe_writable_state(log);
-    log("Graceful shutdown complete. Powering off.");
-    force_power_off();
+    log(final_message);
+    force_power_off()
 }
 
 /// Zeroes every writable path the guest owns, then commits it.
@@ -447,20 +454,7 @@ pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
     SHUTDOWN_IN_PROGRESS.store(true, Ordering::SeqCst);
 
     log("Killing every remaining process before the wipe...");
-    // SAFETY: `kill(2)` takes a pid and a signal number, no pointers. `-1` means every process
-    // this one may signal, which from PID 1 as root is everything except itself.
-    unsafe {
-        libc::kill(-1, libc::SIGKILL);
-    }
-    wait_for_processes_to_exit(
-        Instant::now()
-            .checked_add(KILL_SETTLE_TIMEOUT)
-            .unwrap_or_else(Instant::now),
-    );
-
-    wipe_writable_state(&log);
-    log("Wipe complete. Powering off.");
-    force_power_off()
+    kill_wipe_and_power_off(&log, "Wipe complete. Powering off.")
 }
 
 /// Waits, bounded by `deadline`, for every other process to leave the process table.
