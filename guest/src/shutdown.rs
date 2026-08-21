@@ -133,34 +133,33 @@ pub(crate) fn spawn_watcher(
     });
 }
 
+/// Registers `fd` for readability on `epfd`, tagging the event with `fd`'s own number so the
+/// wait loop can tell which source fired without a lookup table. Generic over the concrete fd
+/// type (a `PipeReader` and a `File` don't share one) rather than a closure, since closures
+/// can't be generic in Rust.
+fn register_for_epoll(epfd: &rustix::fd::OwnedFd, fd: &impl std::os::fd::AsFd) -> bool {
+    let raw = fd.as_fd().as_raw_fd();
+    rustix::event::epoll::add(
+        epfd,
+        fd,
+        rustix::event::epoll::EventData::new_u64(u64::from(u32::try_from(raw).unwrap_or(0))),
+        rustix::event::epoll::EventFlags::IN,
+    )
+    .is_ok()
+}
+
 /// Blocks in `epoll_wait` until either trigger fires, rather than polling both on a timer —
 /// this thread costs zero CPU for as long as the guest just sits idle, which for most of a
 /// unikernel's lifetime is the whole point.
-///
-/// File descriptors are always small non-negative `c_int`s in this function, and the epoll
-/// event buffer length is a fixed fits-in-`i32` constant — the following casts are all exact,
-/// never truncating/wrapping/losing sign in practice.
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::as_conversions
-)]
 fn wait_for_trigger(devices: &[std::fs::File]) {
-    use std::os::fd::{FromRawFd as _, IntoRawFd as _, OwnedFd};
+    use rustix::event::epoll;
+    use std::os::fd::IntoRawFd as _;
 
-    // SAFETY: a plain integer flags argument; the returned fd (or -1 on error) is checked below.
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
+    let Ok(epfd) = epoll::create(epoll::CreateFlags::CLOEXEC) else {
         // Falls back to the old polling behaviour rather than blocking forever on a broken
         // epoll — this should never happen in practice.
         return wait_for_trigger_polling(devices);
-    }
-    // Owned from here on, so every `return` below closes it — there are five, and this function
-    // is the only thing that ever holds this descriptor.
-    // SAFETY: `epfd` was just created, is non-negative, and is not owned by anything else.
-    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
-    let epfd_raw = epfd.as_raw_fd();
+    };
 
     // `std::io::pipe()` creates the pair (CLOEXEC, atomically, like `pipe2`) without any raw fd
     // handling on this end — no `unsafe` needed to own what it hands back.
@@ -171,25 +170,9 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
     set_nonblocking(&sigterm_write);
     let sigterm_read_fd = sigterm_read.as_raw_fd();
 
-    let register = |fd: libc::c_int| {
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: fd as u64,
-        };
-        // SAFETY: `epfd_raw` is the just-created epoll instance; `ev` is a valid, in-scope event
-        // struct only read for the duration of this call; `fd` is a live, open descriptor.
-        unsafe {
-            libc::epoll_ctl(
-                epfd_raw,
-                libc::EPOLL_CTL_ADD,
-                fd,
-                std::ptr::addr_of_mut!(ev),
-            )
-        }
-    };
     // Registered before the fd is published to the handler below, so the one path that can still
     // give up on epoll is also the last one where closing the pipe is safe.
-    if register(sigterm_read_fd) != 0 {
+    if !register_for_epoll(&epfd, &sigterm_read) {
         return wait_for_trigger_polling(devices);
     }
 
@@ -212,23 +195,18 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
     }
 
     for device in devices {
-        register(device.as_raw_fd());
+        let _ = register_for_epoll(&epfd, device);
     }
 
-    // `epoll_wait` overwrites every slot it fills before this array is read, so a zeroed
-    // starting value (rather than `mem::zeroed()`) is all it needs — plain-old-data, no unsafe
-    // required to produce it.
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+    let mut events: Vec<epoll::Event> = Vec::with_capacity(16);
     loop {
-        // SAFETY: `events` is a valid, in-scope buffer of the given length; `-1` blocks with no
-        // timeout. A spurious `EINTR` wakeup just loops back into another wait.
-        let n = unsafe { libc::epoll_wait(epfd_raw, events.as_mut_ptr(), events.len() as i32, -1) };
-        if n < 0 {
+        // A spurious `EINTR` wakeup just loops back into another wait, same as any other error.
+        events.clear();
+        if epoll::wait(&epfd, rustix::buffer::spare_capacity(&mut events), None).is_err() {
             continue;
         }
-        let ready = usize::try_from(n).unwrap_or(0).min(events.len());
-        for ev in events.get(..ready).unwrap_or(&[]) {
-            let fd = ev.u64 as libc::c_int;
+        for ev in &events {
+            let fd = libc::c_int::try_from(ev.data.u64()).unwrap_or(-1);
             if fd == sigterm_read_fd {
                 return;
             }
@@ -307,13 +285,14 @@ fn power_button_pressed(file: &std::fs::File) -> bool {
     }
 }
 
-/// PIDs never exceed `i32::MAX` on Linux (`/proc/sys/kernel/pid_max` is capped well below
-/// that), so `pid as libc::pid_t` here is always exact.
-#[allow(clippy::cast_possible_wrap, clippy::as_conversions)]
 fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
-    // SAFETY: `kill` takes a pid and a signal number, no pointers.
-    unsafe {
-        libc::kill(app_pid as libc::pid_t, libc::SIGTERM);
+    // `app_pid` came from `Command::spawn()`, so it is always a real, positive, in-range pid —
+    // the `Option`/`Result` chain here is about staying panic-free, not a case expected to fail.
+    if let Some(pid) = i32::try_from(app_pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
     }
 
     let deadline = crate::deadline_after(SIGTERM_GRACE);
@@ -337,12 +316,13 @@ fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
 /// remaining process, waits for them to actually leave the process table, scrubs writable
 /// state, logs `final_message`, then powers off. Never returns.
 ///
-/// SAFETY: `kill(2)` takes a pid and a signal number, no pointers. `-1` means every process
-/// this one may signal, which the kernel defines as excluding PID 1 itself.
+/// `kill_process_group(Pid::INIT, ...)` is `kill(-1, ...)`: every process this one may signal,
+/// which the kernel defines as excluding PID 1 itself.
 fn kill_wipe_and_power_off(log: &impl Fn(&str), final_message: &str) -> ! {
-    unsafe {
-        libc::kill(-1, libc::SIGKILL);
-    }
+    let _ = rustix::process::kill_process_group(
+        rustix::process::Pid::INIT,
+        rustix::process::Signal::KILL,
+    );
     wait_for_processes_to_exit(crate::deadline_after(KILL_SETTLE_TIMEOUT));
 
     wipe_writable_state(log);
@@ -377,10 +357,7 @@ fn wipe_writable_state(log: &impl Fn(&str)) {
     #[cfg(not(feature = "storage-persistent"))]
     scrub_dir(std::path::Path::new("/var"), 0);
 
-    // SAFETY: `sync(2)` takes no arguments.
-    unsafe {
-        libc::sync();
-    }
+    rustix::fs::sync();
 }
 
 /// Powers the VM off immediately, with no cleanup of any kind. Never returns.
@@ -389,12 +366,8 @@ fn wipe_writable_state(log: &impl Fn(&str)) {
 /// refused to power us off" path: try `HALT`, and failing that exit, which from PID 1 is itself
 /// a kernel panic and stops the guest just as dead.
 pub(crate) fn force_power_off() -> ! {
-    // SAFETY: `reboot(2)` takes a plain integer command code and no pointers; PID 1 is who is
-    // entitled to call it.
-    unsafe {
-        libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
-        libc::reboot(libc::LINUX_REBOOT_CMD_HALT);
-    }
+    let _ = rustix::system::reboot(rustix::system::RebootCommand::PowerOff);
+    let _ = rustix::system::reboot(rustix::system::RebootCommand::Halt);
     std::process::exit(1);
 }
 
@@ -457,22 +430,22 @@ pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
 /// zombie still answers `kill(pid, 0)`, so without reaping the probe below would never clear.
 fn wait_for_processes_to_exit(deadline: Instant) {
     while Instant::now() < deadline {
-        // SAFETY: `WNOHANG` never blocks; a null status pointer means "don't report status".
-        while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
-        // SAFETY: signal 0 sends nothing, it only probes for existence/permission.
-        if unsafe { libc::kill(-1, 0) } != 0 {
+        while matches!(
+            rustix::process::wait(rustix::process::WaitOptions::NOHANG),
+            Ok(Some(_))
+        ) {}
+        if rustix::process::test_kill_process_group(rustix::process::Pid::INIT).is_err() {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// See [`run_graceful_shutdown`]'s cast justification.
-#[allow(clippy::cast_possible_wrap, clippy::as_conversions)]
 fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 sends nothing, it only checks existence/permission — `pid` is a plain
-    // integer, no pointers involved.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
 }
 
 /// Fixed and reused across files rather than one `vec![0; len]` per file — scrubbing a full

@@ -181,12 +181,10 @@ fn fatal_shutdown(message: &str) -> ! {
 /// covered instead by `yama ptrace_scope=3`, the seccomp `ptrace`/`process_vm_readv`/`writev`
 /// entries, `CONFIG_COREDUMP=n`, and `CONFIG_PROC_MEM_NO_FORCE=y`.
 fn set_self_non_dumpable(warn: impl Fn(&str)) {
-    // SAFETY: plain integer arguments, no pointers.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        warn(&format!(
-            "Failed to mark PID 1 non-dumpable: {}",
-            std::io::Error::last_os_error()
-        ));
+    if let Err(e) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        warn(&format!("Failed to mark PID 1 non-dumpable: {e}"));
     }
 }
 
@@ -239,53 +237,38 @@ fn drop_privileges(uid: u32, gid: u32) -> impl Fn() -> std::io::Result<()> {
 /// material out of swap) but stays bounded — unlimited would let a compromised app pin all of
 /// guest RAM.
 ///
-/// `RLIMIT_*` are small, fixed uapi constants that always fit `c_int` — the narrowing casts
-/// below are exact, never lossy.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::as_conversions
-)]
 fn apply_resource_limits() -> std::io::Result<()> {
+    use rustix::process::Resource;
+
     set_rlimit(
-        libc::RLIMIT_NOFILE as libc::c_int,
+        Resource::Nofile,
         baked(LIMIT_NOFILE, "CARGO_UNIKERNEL_LIMIT_NOFILE"),
     )?;
     set_rlimit(
-        libc::RLIMIT_NPROC as libc::c_int,
+        Resource::Nproc,
         baked(LIMIT_NPROC, "CARGO_UNIKERNEL_LIMIT_NPROC"),
     )?;
     set_rlimit(
-        libc::RLIMIT_MEMLOCK as libc::c_int,
+        Resource::Memlock,
         baked::<u64>(LIMIT_MEMLOCK_MB, "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB")
             .saturating_mul(1024 * 1024),
     )?;
     let as_mb: u64 = baked(LIMIT_AS_MB, "CARGO_UNIKERNEL_LIMIT_AS_MB");
     if as_mb > 0 {
-        set_rlimit(
-            libc::RLIMIT_AS as libc::c_int,
-            as_mb.saturating_mul(1024 * 1024),
-        )?;
+        set_rlimit(Resource::As, as_mb.saturating_mul(1024 * 1024))?;
     }
     Ok(())
 }
 
-/// `resource as _`: `setrlimit`'s parameter type differs across libcs (glibc: `c_uint`; musl:
-/// `c_int`); this crate only targets musl but must still type-check on a glibc host. Every
-/// `resource` passed in is a small, non-negative `RLIMIT_*` constant, so the conversion is
-/// always exact regardless of which one applies.
-#[allow(clippy::cast_sign_loss, clippy::as_conversions)]
-fn set_rlimit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: value,
-        rlim_max: value,
-    };
-    // SAFETY: `limit` is a valid, in-scope `libc::rlimit`, only read for the call's duration.
-    let ret = unsafe { libc::setrlimit(resource as _, std::ptr::addr_of!(limit)) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+fn set_rlimit(resource: rustix::process::Resource, value: u64) -> std::io::Result<()> {
+    rustix::process::setrlimit(
+        resource,
+        rustix::process::Rlimit {
+            current: Some(value),
+            maximum: Some(value),
+        },
+    )
+    .map_err(Into::into)
 }
 
 /// Runs after fork, before exec — installs the mandatory baseline seccomp denylist on the app
@@ -293,8 +276,8 @@ fn set_rlimit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
 ///
 /// A failure here surfaces through `Command::spawn()` into `fatal_shutdown`: booting without
 /// the filter silently in place would be worse than refusing to boot.
-fn install_seccomp_baseline() -> std::io::Result<()> {
-    crate::seccomp::install_baseline_denylist()
+fn install_seccomp_baseline(program: &seccompiler::BpfProgram) -> std::io::Result<()> {
+    crate::seccomp::install_baseline_denylist(program)
 }
 
 /// Checks the embedded app binary is present and makes it read-only + executable.
@@ -318,6 +301,11 @@ fn prepare_app_binary() {
 fn spawn_app() -> u32 {
     log("Spawning embedded app as child process...");
 
+    // Built here, before the fork below, and moved into the `pre_exec` closure that installs
+    // it: `seccomp::build_baseline_denylist` allocates, which is unsound to do between `fork()`
+    // and `execve()` — see its own doc comment.
+    let seccomp_program = crate::seccomp::build_baseline_denylist(fatal_shutdown);
+
     // SAFETY: `pre_exec` closures run in the forked child between `fork()` and `execve()`,
     // where only async-signal-safe operations are sound; each closure here calls only a fixed,
     // small number of setrlimit/setgroups/setgid/setuid/seccomp syscalls.
@@ -328,7 +316,7 @@ fn spawn_app() -> u32 {
             .envs(parse_pairs(APP_ENV, "[app.runtime].env"))
             .pre_exec(apply_resource_limits)
             .pre_exec(drop_privileges(uid, gid))
-            .pre_exec(install_seccomp_baseline)
+            .pre_exec(move || install_seccomp_baseline(&seccomp_program))
             .spawn()
             .unwrap_or_else(|e| fatal_shutdown(&format!("Failed to spawn app: {e}")))
     };
@@ -367,31 +355,27 @@ fn expose_sev_guest_device() {
 /// and has to reap them, or they accumulate as zombies. A result that isn't `app_pid` is one of
 /// those — not the supervised process, so not a compromise.
 ///
-/// PIDs never exceed `i32::MAX` on Linux (`pid_max` is capped well below that), so the
-/// `u32`/`pid_t` conversions below are always exact.
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::as_conversions
-)]
 fn watchdog_loop(app_pid: u32) -> ! {
     loop {
-        let mut status = 0;
-        // SAFETY: `status` is a valid, in-scope `i32`, written only within this call.
-        let pid = unsafe { libc::waitpid(-1, std::ptr::addr_of_mut!(status), 0) };
         let shutting_down =
             crate::shutdown::SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst);
 
-        if pid <= 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ECHILD) && !shutting_down {
+        let pid = match rustix::process::wait(rustix::process::WaitOptions::empty()) {
+            Ok(Some((pid, _status))) => pid,
+            Err(rustix::io::Errno::CHILD) if !shutting_down => {
                 fatal_shutdown("No supervised processes remain. System integrity compromised.");
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            continue;
-        }
+            // `Ok(None)` only happens with `NOHANG`, which this blocking call never sets, but
+            // handling it the same as any other transient error (retry) beats assuming it can't
+            // happen.
+            Ok(None) | Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+        };
+        let pid = u32::try_from(pid.as_raw_pid()).unwrap_or(0);
 
-        if pid as u32 != app_pid {
+        if pid != app_pid {
             continue;
         }
         if shutting_down {
@@ -407,11 +391,13 @@ fn watchdog_loop(app_pid: u32) -> ! {
 }
 
 fn main() {
-    // SAFETY: plain integer flags, no pointers. Failure is ignored: best-effort, a guest
-    // without the memory to lock everything should still boot.
-    unsafe {
-        let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT);
-    }
+    // Failure is ignored: best-effort, a guest without the memory to lock everything should
+    // still boot.
+    let _ = rustix::mm::mlockall(
+        rustix::mm::MlockAllFlags::CURRENT
+            | rustix::mm::MlockAllFlags::FUTURE
+            | rustix::mm::MlockAllFlags::ONFAULT,
+    );
 
     if !is_pid1() {
         non_pid1_fatal_exit("This binary is the guest's init and only runs as PID 1");

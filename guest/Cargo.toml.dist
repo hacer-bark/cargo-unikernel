@@ -32,6 +32,8 @@ storage-persistent = []
 
 [dependencies]
 libc = "0.2"
+rustix = { version = "1", default-features = false, features = ["std", "mount", "process", "event", "net", "mm", "system", "fs"] }
+seccompiler = "0.5"
 
 [profile.release]
 opt-level = 3

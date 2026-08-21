@@ -34,14 +34,6 @@ const MKE2FS_PATH: &str = "/sbin/mke2fs";
 /// and checked straight off the raw device before any mount. The label is 16 bytes, NUL-padded.
 const VOLUME_LABEL: &[u8] = b"CUKINIT";
 
-fn umount(target: &str) -> bool {
-    let Ok(c) = std::ffi::CString::new(target) else {
-        return false;
-    };
-    // SAFETY: `c` is a valid, live NUL-terminated `CString` for the duration of this call.
-    unsafe { libc::umount2(c.as_ptr(), 0) == 0 }
-}
-
 /// Byte offset of the ext4 superblock. Fixed by the on-disk format: the first 1024 bytes are
 /// reserved for a boot sector.
 const SUPERBLOCK_OFFSET: u64 = 1024;
@@ -143,9 +135,9 @@ pub(crate) fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
     }
 
     mount(
-        Some(DEVICE_PATH),
+        DEVICE_PATH,
         MOUNT_TARGET,
-        Some("ext4"),
+        "ext4",
         writable_exec_mount_flags(),
         None,
     )
@@ -166,8 +158,8 @@ pub(crate) fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
 /// rather than silently returning `EBUSY`. Returns whether `/var` itself came away cleanly.
 #[must_use]
 pub(crate) fn unmount_var() -> bool {
-    umount(VAR_TMP);
-    umount(MOUNT_TARGET)
+    let _ = crate::mounts::unmount(VAR_TMP);
+    crate::mounts::unmount(MOUNT_TARGET)
 }
 
 #[cfg(test)]

@@ -5,54 +5,61 @@
 //! These functions take a `fatal` callback instead of calling a hardcoded panic/shutdown
 //! routine, so this module can decide how a boot-time mount failure terminates the VM without
 //! depending on that routine directly.
+//!
+//! `mount(2)` itself goes through `rustix::mount` rather than a hand-rolled `libc::mount` FFI
+//! call: rustix's implementation is the one place that gets the raw-pointer/NUL-terminated
+//! argument handling right, audited far beyond what one function in this crate could be.
 
+use rustix::mount::MountFlags;
 use std::ffi::CString;
 
-/// Thin wrapper over the raw `mount(2)` syscall — kept local rather than pulling in `nix` for
-/// one function: every argument here is either `None`/empty or a fixed string literal chosen by
-/// this crate, so there's no safety or ergonomics the extra dependency would have bought.
-pub(crate) fn mount(
-    source: Option<&str>,
-    target: &str,
-    fstype: Option<&str>,
-    flags: libc::c_ulong,
-    data: Option<&str>,
-) -> std::io::Result<()> {
-    let to_cstring = |s: &str| {
-        CString::new(s).map_err(|_| {
+/// `data` as a `CString`, for the one argument `rustix::mount::mount` still takes as an
+/// `Option<&CStr>` rather than a generic `path::Arg` — every other argument here is a fixed
+/// string literal chosen by this crate, so only this one ever needs the conversion.
+fn mount_data(data: Option<&str>) -> std::io::Result<Option<CString>> {
+    data.map(|d| {
+        CString::new(d).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "mount() argument must not contain a NUL byte",
+                "mount() data must not contain a NUL byte",
             )
         })
-    };
-    let source_c = source.map(to_cstring).transpose()?;
-    let target_c = to_cstring(target)?;
-    let fstype_c = fstype.map(to_cstring).transpose()?;
-    let data_c = data.map(to_cstring).transpose()?;
-
-    let source_ptr = source_c
-        .as_deref()
-        .map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
-    let fstype_ptr = fstype_c
-        .as_deref()
-        .map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
-    let data_ptr = data_c
-        .as_deref()
-        .map_or(std::ptr::null(), std::ffi::CStr::as_ptr)
-        .cast::<libc::c_void>();
-
-    // SAFETY: `source_ptr`/`fstype_ptr`/`data_ptr` are each either null or a valid, live
-    // NUL-terminated `CString` pointer owned by a local still in scope for the call;
-    // `target_c` likewise outlives the call.
-    let ret = unsafe { libc::mount(source_ptr, target_c.as_ptr(), fstype_ptr, flags, data_ptr) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    })
+    .transpose()
 }
 
-const NOSUID_NODEV_NOEXEC: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+/// `mount(source, target, fstype, flags, data)`.
+pub(crate) fn mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: MountFlags,
+    data: Option<&str>,
+) -> std::io::Result<()> {
+    let data = mount_data(data)?;
+    rustix::mount::mount(source, target, fstype, flags, data.as_deref()).map_err(Into::into)
+}
+
+/// `mount(source, target, NULL, MS_BIND, NULL)`.
+fn bind_mount(source: &str, target: &str) -> std::io::Result<()> {
+    rustix::mount::mount_bind(source, target).map_err(Into::into)
+}
+
+/// `mount(NULL, target, NULL, MS_REMOUNT | flags, data)`.
+fn remount(target: &str, flags: MountFlags, data: &str) -> std::io::Result<()> {
+    rustix::mount::mount_remount(target, flags, data).map_err(Into::into)
+}
+
+/// `umount2(target, 0)`. Used by `storage.rs` to flush `/var`'s journal before power-off.
+#[cfg(feature = "storage-persistent")]
+#[must_use]
+pub(crate) fn unmount(target: &str) -> bool {
+    rustix::mount::unmount(target, rustix::mount::UnmountFlags::empty()).is_ok()
+}
+
+const NOSUID_NODEV_NOEXEC: MountFlags = MountFlags::NOSUID
+    .union(MountFlags::NODEV)
+    .union(MountFlags::NOEXEC);
 
 /// Shared by every path `danger-allow-write-execute` affects (`/tmp`, and `/var` — see
 /// `storage.rs` for the persistent-mode ext4 case): `noexec` unless that feature is compiled
@@ -61,12 +68,14 @@ const NOSUID_NODEV_NOEXEC: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | li
 /// Two separate functions selected by `#[cfg]`, not one function with a runtime `if`: only
 /// the flags for whichever build was actually requested exist in the binary.
 #[cfg(feature = "danger-allow-write-execute")]
-pub(crate) const fn writable_exec_mount_flags() -> libc::c_ulong {
-    libc::MS_NOSUID | libc::MS_NODEV
+pub(crate) const fn writable_exec_mount_flags() -> MountFlags {
+    MountFlags::NOSUID.union(MountFlags::NODEV)
 }
 #[cfg(not(feature = "danger-allow-write-execute"))]
-pub(crate) const fn writable_exec_mount_flags() -> libc::c_ulong {
-    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC
+pub(crate) const fn writable_exec_mount_flags() -> MountFlags {
+    MountFlags::NOSUID
+        .union(MountFlags::NODEV)
+        .union(MountFlags::NOEXEC)
 }
 
 /// Whether `danger-allow-write-execute` is compiled in. Only ever consulted to pick a log
@@ -93,7 +102,7 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
 
     // Ordered: each entry's target must already exist, which for /dev/pts, /dev/shm and
     // /var/tmp means the filesystem carrying it is mounted by an earlier entry.
-    let base: &[(&str, &str, &str, libc::c_ulong, Option<&str>)] = &[
+    let base: &[(&str, &str, &str, MountFlags, Option<&str>)] = &[
         // `hidepid=2`: the app is the only unprivileged process here, and everything else in
         // /proc belongs to PID 1 — so this hides the init's cmdline (which comes from the
         // host-supplied kernel command line) and its /proc entries from the app entirely,
@@ -110,7 +119,7 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
             "devtmpfs",
             "/dev",
             "devtmpfs",
-            libc::MS_NOSUID | libc::MS_NOEXEC,
+            MountFlags::NOSUID.union(MountFlags::NOEXEC),
             None,
         ),
         // /tmp — writable scratch; NOEXEC unless danger-allow-write-execute is compiled in.
@@ -144,7 +153,7 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     ];
     for &(source, target, fstype, flags, data) in base {
         let _ = std::fs::create_dir_all(target);
-        mount(Some(source), target, Some(fstype), flags, data)
+        mount(source, target, fstype, flags, data)
             .unwrap_or_else(|e| fatal(&format!("Failed to mount {target}: {e}")));
     }
 
@@ -153,10 +162,10 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     // optional is not a reason for it to be the one mount an app could exec from.
     let _ = std::fs::create_dir("/dev/pts");
     let _ = mount(
-        Some("devpts"),
+        "devpts",
         "/dev/pts",
-        Some("devpts"),
-        libc::MS_NOSUID | libc::MS_NOEXEC,
+        "devpts",
+        MountFlags::NOSUID.union(MountFlags::NOEXEC),
         Some("mode=0620,ptmxmode=0666"),
     );
 
@@ -166,9 +175,9 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     crate::storage::mount_persistent_var(&log, fatal);
     #[cfg(not(feature = "storage-persistent"))]
     mount(
-        Some("tmpfs"),
+        "tmpfs",
         "/var",
-        Some("tmpfs"),
+        "tmpfs",
         writable_exec_mount_flags(),
         Some("mode=0755"),
     )
@@ -176,9 +185,9 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
 
     let _ = std::fs::create_dir_all("/var/tmp");
     mount(
-        Some("tmpfs"),
+        "tmpfs",
         "/var/tmp",
-        Some("tmpfs"),
+        "tmpfs",
         NOSUID_NODEV_NOEXEC,
         Some("size=64m,mode=1777"),
     )
@@ -188,20 +197,14 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     // tmpfs mount here would hide it. Bind-mount it onto itself instead: preserves contents
     // while turning it into a distinct mountpoint, which lockdown_filesystem() needs to
     // remount read-only later. No NOEXEC: the app binary must be executable from here.
-    mount(
-        Some(payload_dir),
+    bind_mount(payload_dir, payload_dir)
+        .unwrap_or_else(|e| fatal(&format!("Failed to bind-mount {payload_dir}: {e}")));
+    remount(
         payload_dir,
-        None::<&str>,
-        libc::MS_BIND,
-        None::<&str>,
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to bind-mount {payload_dir}: {e}")));
-    mount(
-        None::<&str>,
-        payload_dir,
-        None::<&str>,
-        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV,
-        None::<&str>,
+        MountFlags::BIND
+            .union(MountFlags::NOSUID)
+            .union(MountFlags::NODEV),
+        "",
     )
     .unwrap_or_else(|e| fatal(&format!("Failed to remount {payload_dir}: {e}")));
 
@@ -218,8 +221,8 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
 /// remounted read-only or noexec after its initial mount, so whatever
 /// [`writable_exec_mount_flags`] gave it at mount time (see `prepare_system_env`) simply
 /// persists for the rest of the boot.
-const fn tmp_remount_flags() -> libc::c_ulong {
-    libc::MS_REMOUNT | writable_exec_mount_flags()
+const fn tmp_remount_flags() -> MountFlags {
+    writable_exec_mount_flags()
 }
 
 /// The claim is about *paths*, deliberately: this seals the file-backed routes to executing new
@@ -250,12 +253,13 @@ pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: 
 
     // payload_dir is a bind mount — remounting it read-only requires MS_BIND alongside
     // MS_REMOUNT, or the kernel ignores the flag change.
-    mount(
-        None::<&str>,
+    remount(
         payload_dir,
-        None::<&str>,
-        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
-        None::<&str>,
+        MountFlags::BIND
+            .union(MountFlags::RDONLY)
+            .union(MountFlags::NOSUID)
+            .union(MountFlags::NODEV),
+        "",
     )
     .unwrap_or_else(|e| {
         fatal(&format!(
@@ -263,21 +267,15 @@ pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: 
         ))
     });
 
-    mount(
-        None::<&str>,
-        "/tmp",
-        None::<&str>,
-        tmp_remount_flags(),
-        Some("size=64m,mode=1777"),
-    )
-    .unwrap_or_else(|e| fatal(&format!("Failed to remount /tmp: {e}")));
+    remount("/tmp", tmp_remount_flags(), "size=64m,mode=1777")
+        .unwrap_or_else(|e| fatal(&format!("Failed to remount /tmp: {e}")));
 
-    mount(
-        None::<&str>,
+    remount(
         "/run",
-        None::<&str>,
-        libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-        Some("size=16m,mode=0755"),
+        MountFlags::NOSUID
+            .union(MountFlags::NODEV)
+            .union(MountFlags::NOEXEC),
+        "size=16m,mode=0755",
     )
     .unwrap_or_else(|e| fatal(&format!("Failed to remount /run noexec: {e}")));
 

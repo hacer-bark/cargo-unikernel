@@ -1,5 +1,26 @@
-//! Mandatory classic-BPF seccomp denylist installed on the app child process. Never on PID 1
-//! itself, which still needs `mount()`/`reboot()`.
+//! Mandatory seccomp denylist installed on the app child process. Never on PID 1 itself, which
+//! still needs `mount()`/`reboot()`.
+//!
+//! Two independently-installed filters, stacked: Linux seccomp filters all run for every
+//! syscall, and the kernel takes the *most restrictive* result across them. That means each
+//! filter only has to get its own, narrow job right:
+//!
+//! - [`install_arch_gate`]: a tiny, hand-rolled classic-BPF program — 6 instructions, no
+//!   denylist — that kills anything arriving via the wrong syscall ABI (`AUDIT_ARCH_X86_64`
+//!   mismatch, or the x32 ABI's `__X32_SYSCALL_BIT`). No published crate covers this check: it
+//!   isn't a filter *rule* in the usual sense, it's a property of the raw syscall number itself,
+//!   and every general-purpose seccomp library we could find (including [`seccompiler`], see
+//!   below) leaves it to the caller. Small and static enough to hand-verify, and covered by
+//!   kernel-exercised tests below.
+//! - [`build_baseline_denylist`] / [`install_baseline_denylist`]: the actual per-syscall
+//!   denylist, built and compiled to BPF by [`seccompiler`] (`rust-vmm`, the same crate
+//!   Firecracker uses for its own seccomp jailing) rather than hand-rolled — the classic-BPF
+//!   jump-table arithmetic that construction needs is exactly the kind of thing worth trusting
+//!   to a battle-tested implementation instead of one more hand-rolled copy.
+//!
+//! Because a *filter* here always means "kill on match, otherwise allow", the two compose
+//! correctly regardless of install order: an x32-tagged syscall is killed by the arch gate
+//! before the denylist's checks (which don't know about x32 at all) are even relevant.
 //!
 //! Denylist rather than allowlist: a wrong allowlist silently breaks every app this tool
 //! builds, which is worse than "not exhaustive." Each entry has no legitimate use in a
@@ -28,11 +49,11 @@
 //! it, but that file documents re-enabling it via `extra_kernel_config` — without the entries
 //! below, doing so would silently forfeit every other denial in this list.
 //!
-//! The BPF construction (arch gate, x32 gate, jump encoding, terminal ALLOW/KILL) is exercised
-//! against the kernel the tests run on — `the_kernel_accepts_the_filter_*` /
-//! `a_denied_syscall_actually_kills_the_process` fork a child, install this exact program, and
-//! check both halves of it. That covers the encoding, not the boot path: the filter has not yet
-//! been exercised inside a booted guest.
+//! Both filters are exercised against the kernel the tests run on — `the_kernel_accepts_the_*` /
+//! `a_denied_syscall_actually_kills_the_process` / `an_x32_tagged_syscall_is_killed_by_the_arch_gate`
+//! fork a child, install both filters exactly as `spawn_app` does, and check the outcome. That
+//! covers the encoding, not the boot path: the filters have not yet been exercised inside a
+//! booted guest.
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!(
@@ -82,8 +103,10 @@ const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 ///
 /// The arch gate above is necessary but *not* sufficient: x32 reports `AUDIT_ARCH_X86_64` too,
 /// and distinguishes itself only by setting this bit in the syscall number. So `ptrace` arrives
-/// as `0x4000_0065`, matches none of the `JEQ`s below, and falls through to `RET ALLOW` — one
-/// bit lifting every denial in this file at once.
+/// as `0x4000_0065`, matches no denylist entry, and would fall through to `ALLOW` — one bit
+/// lifting every denial in this file at once. This is a well-documented class of seccomp
+/// bypass (see e.g. the `firejail` and `kafel` issue trackers) that generic seccomp-BPF
+/// compilers, `seccompiler` included, leave to the caller rather than handle for every user.
 ///
 /// `CONFIG_X86_X32_ABI=disable` (legacy-subsystems.config) closes it at the kernel level, but
 /// that whole fragment is opt-out via `hardening.kernel.disable_legacy_subsystems = false`, so
@@ -98,6 +121,96 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+/// The whole of the arch/x32-ABI gate: load `arch`, kill unless it's `AUDIT_ARCH_X86_64`; load
+/// `nr`, kill if the x32 bit is set; otherwise allow (leaving the actual decision to whichever
+/// other filter is stacked behind this one — see the module doc). Six fixed instructions, so
+/// this is written as literals rather than built by a loop: there is no per-syscall list here
+/// for a loop to iterate over.
+const ARCH_GATE_PROGRAM: [SockFilter; 6] = [
+    SockFilter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_ARCH_OFFSET,
+    },
+    // Falls through (jt = 0) to the nr load on a match; on any other ABI, jumps to KILL
+    // (index 5), relative to the instruction after this one (index 2): jf = 5 - 2 = 3.
+    SockFilter {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt: 0,
+        jf: 3,
+        k: AUDIT_ARCH_X86_64,
+    },
+    SockFilter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_NR_OFFSET,
+    },
+    // Jumps to KILL (index 5) for anything at or above the x32 bit, relative to the instruction
+    // after this one (index 4): jt = 5 - 4 = 1. Falls through to ALLOW otherwise.
+    SockFilter {
+        code: BPF_JMP | BPF_JGE | BPF_K,
+        jt: 1,
+        jf: 0,
+        k: X32_SYSCALL_BIT,
+    },
+    SockFilter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    },
+    SockFilter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_KILL_PROCESS,
+    },
+];
+
+// PR_SET_SECCOMP = 22 — hardcoded rather than trusting `libc` to export the name for every
+// target; a long-stable uapi constant (linux/prctl.h).
+const PR_SET_SECCOMP: libc::c_int = 22;
+
+/// Installs [`ARCH_GATE_PROGRAM`] on the *calling* process via the classic `prctl(PR_SET_SECCOMP,
+/// …)` interface — the older sibling of the `seccomp(2)` syscall `seccompiler` uses internally,
+/// equally valid, and all this six-instruction program needs.
+///
+/// Call only from inside a `Command::pre_exec` closure, never from PID 1 itself.
+/// `PR_SET_NO_NEW_PRIVS` is required by the kernel before any unprivileged `seccomp()`/`prctl()`
+/// call succeeds; installing it twice (once here, once inside `seccompiler::apply_filter`) is
+/// harmless — the flag is one-way and idempotent. Allocation-free and syscall-only, as anything
+/// running between `fork()` and `execve()` must be: [`ARCH_GATE_PROGRAM`] is a `const`, so this
+/// is a `.rodata` blob the installer just points at.
+#[allow(clippy::as_conversions)]
+fn install_arch_gate() -> io::Result<()> {
+    const _: () = assert!(ARCH_GATE_PROGRAM.len() == 6);
+    let fprog = SockFprog {
+        len: 6,
+        filter: ARCH_GATE_PROGRAM.as_ptr(),
+    };
+
+    // SAFETY: `fprog` outlives the call (a stack local; its raw pointer is only read for the
+    // syscall's duration) and points at a `'static` program. Both return values are checked.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::prctl(
+            PR_SET_SECCOMP,
+            SECCOMP_MODE_FILTER,
+            std::ptr::addr_of!(fprog) as libc::c_ulong,
+            0,
+            0,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 /// `memfd_create`/`memfd_secret` + `execveat(fd, "", AT_EMPTY_PATH)` runs an anonymous
 /// in-memory *binary*, invisible to every `noexec` mount flag in `mounts.rs`. This is what
@@ -160,174 +273,48 @@ const BASELINE_SYSCALLS: &[i64] = &[
     libc::SYS_adjtimex,
 ];
 
-const DENIED_LEN: usize = BASELINE_SYSCALLS.len() + WRITE_EXECUTE_SYSCALLS.len();
-/// Total filter length: 2 (arch load + check) + 2 (nr load + x32 gate) + one `JEQ` per denied
-/// syscall + 2 (`RET ALLOW`, `RET KILL`).
-const PROGRAM_LEN: usize = DENIED_LEN + 6;
-
-/// `PROGRAM_LEN` is `DENIED_LEN + 6`, and [`PROGRAM`] encodes the KILL instruction's index in a
-/// `u8`, so `DENIED_LEN + 5` must still fit one — 250 is the real ceiling, not 255. Checked at
-/// compile time rather than at boot: a denylist that outgrew the encoding would otherwise
-/// build a silently-truncated, broken filter, and refusing to *compile* beats refusing to boot.
-const _: () = assert!(
-    DENIED_LEN <= 250,
-    "seccomp denylist has outgrown the classic-BPF u8 jump field"
-);
-
-/// The two source lists flattened into one array, so [`PROGRAM`] can index it in const context.
+/// Builds the compiled BPF program for the baseline denylist. Must be called *before* `fork()`
+/// — `seccompiler::SeccompFilter::new` allocates (its rule map is a `BTreeMap`), which is unsound
+/// to do between `fork()` and `execve()` in a process with other threads: an allocator lock
+/// another thread held at fork time is never released in the forked child, so the next
+/// allocation there can deadlock. `fatal` is called (and never returns) if construction fails,
+/// which given the fixed inputs here only a bug in this crate could cause.
 ///
-/// Every index below is in bounds as a direct consequence of the `while` conditions guarding
-/// it (`i < BASELINE_SYSCALLS.len()`, then `j < WRITE_EXECUTE_SYSCALLS.len()` with `i` fixed at
-/// `BASELINE_SYSCALLS.len()`, and `DENIED_LEN` defined as their sum) — and this all runs at
-/// compile time, so a bound that ever did slip would fail the build, not the running guest.
-#[allow(
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::as_conversions
-)]
-const DENIED: [i64; DENIED_LEN] = {
-    let mut out = [0i64; DENIED_LEN];
-    let mut i = 0;
-    while i < BASELINE_SYSCALLS.len() {
-        out[i] = BASELINE_SYSCALLS[i];
-        i += 1;
-    }
-    let mut j = 0;
-    while j < WRITE_EXECUTE_SYSCALLS.len() {
-        out[i + j] = WRITE_EXECUTE_SYSCALLS[j];
-        j += 1;
-    }
-    out
-};
+/// Call once in the parent (see `main.rs::spawn_app`), then move the result into the
+/// `pre_exec` closure that calls [`install_baseline_denylist`] — which performs no allocation of
+/// its own, satisfying the fork/exec constraint from the other side.
+pub(crate) fn build_baseline_denylist(fatal: fn(&str) -> !) -> seccompiler::BpfProgram {
+    let rules = BASELINE_SYSCALLS
+        .iter()
+        .chain(WRITE_EXECUTE_SYSCALLS)
+        .map(|&nr| (nr, Vec::new()))
+        .collect();
 
-/// The BPF program: an `AUDIT_ARCH_X86_64` gate first (kills on any other syscall ABI), then the
-/// syscall number load and an [`X32_SYSCALL_BIT`] gate (kills on the x32 ABI, which shares the
-/// `AUDIT_ARCH` value), then one `JEQ` per denylisted syscall (jump to the trailing KILL on a
-/// match, fall through otherwise), ending in `RET ALLOW`.
-///
-/// Built in const context, so the filter is a `.rodata` blob the installer just points at. This
-/// is what makes [`install_baseline_denylist`] allocation-free, which matters because its only
-/// caller runs it from a `Command::pre_exec` closure — between `fork()` and `execve()`, where a
-/// `malloc` can deadlock against a lock another thread held at fork time.
-///
-/// Every cast and index below is in range as a direct consequence of the `DENIED_LEN <= 250`
-/// assertion above, which is why those lints are allowed here rather than per site — and, as
-/// with [`DENIED`], this all runs at compile time, so a bound that ever did slip would fail the
-/// build, not the running guest.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::as_conversions
-)]
-const PROGRAM: [SockFilter; PROGRAM_LEN] = {
-    const NOP: SockFilter = SockFilter {
-        code: 0,
-        jt: 0,
-        jf: 0,
-        k: 0,
-    };
-    let mut program = [NOP; PROGRAM_LEN];
-    let kill_index = (PROGRAM_LEN - 1) as u8;
+    let filter = seccompiler::SeccompFilter::new(
+        rules,
+        seccompiler::SeccompAction::Allow,
+        seccompiler::SeccompAction::KillProcess,
+        seccompiler::TargetArch::x86_64,
+    )
+    .unwrap_or_else(|e| fatal(&format!("Failed to build the seccomp denylist filter: {e}")));
 
-    program[0] = SockFilter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_DATA_ARCH_OFFSET,
-    };
-    // Falls through (jt = 0) to the nr load on a match; on any other ABI, jumps straight to
-    // KILL, relative to the instruction after this one (index 2).
-    program[1] = SockFilter {
-        code: BPF_JMP | BPF_JEQ | BPF_K,
-        jt: 0,
-        jf: kill_index - 2,
-        k: AUDIT_ARCH_X86_64,
-    };
-    program[2] = SockFilter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_DATA_NR_OFFSET,
-    };
-    // Jumps to KILL for anything at or above the x32 bit, falls through to the denylist for the
-    // ordinary 64-bit numbers below it. Relative to the instruction after this one (index 4).
-    program[3] = SockFilter {
-        code: BPF_JMP | BPF_JGE | BPF_K,
-        jt: kill_index - 4,
-        jf: 0,
-        k: X32_SYSCALL_BIT,
-    };
+    seccompiler::BpfProgram::try_from(filter)
+        .unwrap_or_else(|e| fatal(&format!("Failed to compile the seccomp denylist to BPF: {e}")))
+}
 
-    let mut i = 0;
-    while i < DENIED_LEN {
-        let index = 4 + i;
-        program[index] = SockFilter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            // Relative jump-if-true, measured from the instruction *after* this one, so it
-            // lands exactly on the KILL instruction.
-            jt: kill_index - (index as u8) - 1,
-            jf: 0,
-            k: DENIED[i] as u32,
-        };
-        i += 1;
-    }
-
-    program[PROGRAM_LEN - 2] = SockFilter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_ALLOW,
-    };
-    program[PROGRAM_LEN - 1] = SockFilter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_KILL_PROCESS,
-    };
-    program
-};
-
-// PR_SET_SECCOMP = 22 — hardcoded rather than trusting `libc` to export the name for every
-// target; a long-stable uapi constant (linux/prctl.h).
-const PR_SET_SECCOMP: libc::c_int = 22;
-
-/// Installs the baseline denylist on the *calling* process.
+/// Installs [`install_arch_gate`]'s six-instruction ABI gate, then `program` (from
+/// [`build_baseline_denylist`]) as a second, independently-consulted filter — Linux seccomp
+/// filters stack, and the kernel takes the most restrictive result across all of them, so an
+/// x32-tagged syscall never reaches the second filter's checks at all.
 ///
 /// Call only from inside a `Command::pre_exec` closure, never from PID 1 itself.
-/// `PR_SET_NO_NEW_PRIVS` is required by the kernel before any unprivileged `seccomp()` call
-/// succeeds. Allocation-free and syscall-only, as anything running between `fork()` and
-/// `execve()` must be — see [`PROGRAM`].
 ///
 /// # Errors
 ///
-/// Returns an error if either underlying `prctl()` call fails.
-#[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
-pub(crate) fn install_baseline_denylist() -> io::Result<()> {
-    let fprog = SockFprog {
-        len: PROGRAM_LEN as u16,
-        filter: PROGRAM.as_ptr(),
-    };
-
-    // SAFETY: `fprog` outlives the call (a stack local; its raw pointer is only read for the
-    // syscall's duration) and points at a `'static` program. Both return values are checked.
-    unsafe {
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::prctl(
-            PR_SET_SECCOMP,
-            SECCOMP_MODE_FILTER,
-            std::ptr::addr_of!(fprog) as libc::c_ulong,
-            0,
-            0,
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+/// Returns an error if installing either filter fails.
+pub(crate) fn install_baseline_denylist(program: &seccompiler::BpfProgram) -> io::Result<()> {
+    install_arch_gate()?;
+    seccompiler::apply_filter(program).map_err(io::Error::other)
 }
 
 #[cfg(test)]
@@ -346,125 +333,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn program_starts_with_an_arch_gate_before_loading_the_syscall_number() {
-        let kill_index = PROGRAM_LEN - 1;
-
-        let arch_load = &PROGRAM[0];
+    fn arch_gate_starts_with_an_arch_check_before_loading_the_syscall_number() {
+        let arch_load = &ARCH_GATE_PROGRAM[0];
         assert_eq!(arch_load.code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(arch_load.k, SECCOMP_DATA_ARCH_OFFSET);
 
-        let arch_check = &PROGRAM[1];
+        let arch_check = &ARCH_GATE_PROGRAM[1];
         assert_eq!(arch_check.code, BPF_JMP | BPF_JEQ | BPF_K);
         assert_eq!(arch_check.k, AUDIT_ARCH_X86_64);
         assert_eq!(
             arch_check.jt, 0,
             "must fall through to the nr load on a match"
         );
-        let landing_index = 2 + arch_check.jf as usize;
         assert_eq!(
-            landing_index, kill_index,
-            "mismatched arch must jump to KILL"
+            2 + arch_check.jf as usize,
+            5,
+            "mismatched arch must jump to the KILL instruction (index 5)"
         );
 
-        let nr_load = &PROGRAM[2];
+        let nr_load = &ARCH_GATE_PROGRAM[2];
         assert_eq!(nr_load.code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(nr_load.k, SECCOMP_DATA_NR_OFFSET);
     }
 
-    /// x32 shares `AUDIT_ARCH_X86_64`, so the arch gate lets it through and every `JEQ` below
-    /// misses by the one set bit — without this instruction the whole denylist is one ABI away
-    /// from being a no-op.
+    /// x32 shares `AUDIT_ARCH_X86_64`, so the arch check alone lets it through — without this
+    /// instruction the whole gate is one ABI away from being a no-op.
     #[test]
-    fn x32_syscalls_are_killed_before_reaching_the_denylist() {
-        let kill_index = PROGRAM_LEN - 1;
-
-        let x32_gate = &PROGRAM[3];
+    fn arch_gate_kills_the_x32_abi() {
+        let x32_gate = &ARCH_GATE_PROGRAM[3];
         assert_eq!(x32_gate.code, BPF_JMP | BPF_JGE | BPF_K);
         assert_eq!(x32_gate.k, X32_SYSCALL_BIT);
         assert_eq!(
             x32_gate.jf, 0,
-            "an ordinary 64-bit number must fall through into the denylist"
+            "an ordinary 64-bit number must fall through to ALLOW"
         );
-        let landing_index = 4 + x32_gate.jt as usize;
-        assert_eq!(landing_index, kill_index, "an x32 number must jump to KILL");
-
-        // The gate has to sit after the nr load and before the first syscall check, or it is
-        // testing the wrong word / running too late to matter.
-        assert_eq!(PROGRAM[2].k, SECCOMP_DATA_NR_OFFSET);
-        assert_eq!(PROGRAM[4].code, BPF_JMP | BPF_JEQ | BPF_K);
-
-        // One comparison covers every entry only because all of them sit below the threshold
-        // on the 64-bit ABI — an entry above it would be killed there too, not just via x32.
-        for &nr in &DENIED {
-            assert!(
-                (nr as u32) < X32_SYSCALL_BIT,
-                "syscall {nr} sits at or above the x32 gate's threshold"
-            );
-        }
-    }
-
-    #[test]
-    fn program_ends_with_allow_then_kill() {
-        let last = PROGRAM[PROGRAM_LEN - 1];
-        assert_eq!(last.code, BPF_RET | BPF_K);
-        assert_eq!(last.k, SECCOMP_RET_KILL_PROCESS);
-        let second_last = PROGRAM[PROGRAM_LEN - 2];
-        assert_eq!(second_last.code, BPF_RET | BPF_K);
-        assert_eq!(second_last.k, SECCOMP_RET_ALLOW);
-    }
-
-    #[test]
-    fn every_check_jumps_exactly_to_the_kill_instruction() {
-        let kill_index = PROGRAM_LEN - 1;
-
-        for (i, &syscall_nr) in DENIED.iter().enumerate() {
-            // 0/1 are the arch gate, 2 is the nr LD, 3 is the x32 gate.
-            let instr_index = 4 + i;
-            let instr = &PROGRAM[instr_index];
-            assert_eq!(instr.code, BPF_JMP | BPF_JEQ | BPF_K, "check #{i}");
-            assert_eq!(
-                instr.k, syscall_nr as u32,
-                "check #{i} compares wrong syscall"
-            );
-            assert_eq!(instr.jf, 0, "check #{i} must fall through on no-match");
-            // jt is relative to the *next* instruction (instr_index + 1).
-            let landing_index = (instr_index + 1) + instr.jt as usize;
-            assert_eq!(
-                landing_index, kill_index,
-                "check #{i}'s jt doesn't land on the KILL instruction"
-            );
-        }
-    }
-
-    /// Guards the two `.rodata` slots the loop above never writes: a `PROGRAM_LEN` that drifted
-    /// out of step with `DENIED` would leave a zeroed `NOP` filler in the middle of the filter,
-    /// which the kernel reads as `BPF_LD | BPF_W | BPF_IMM` rather than rejecting.
-    #[test]
-    fn program_has_no_filler_instructions_left_in_it() {
-        assert_eq!(PROGRAM_LEN, DENIED.len() + 6);
-        assert!(
-            PROGRAM.iter().all(|instr| instr.code != 0),
-            "a NOP filler survived into the filter"
+        assert_eq!(
+            4 + x32_gate.jt as usize,
+            5,
+            "an x32 number must jump to the KILL instruction (index 5)"
         );
+    }
+
+    #[test]
+    fn arch_gate_ends_with_allow_then_kill() {
+        assert_eq!(ARCH_GATE_PROGRAM[4].code, BPF_RET | BPF_K);
+        assert_eq!(ARCH_GATE_PROGRAM[4].k, SECCOMP_RET_ALLOW);
+        assert_eq!(ARCH_GATE_PROGRAM[5].code, BPF_RET | BPF_K);
+        assert_eq!(ARCH_GATE_PROGRAM[5].k, SECCOMP_RET_KILL_PROCESS);
+    }
+
+    fn denied() -> Vec<i64> {
+        BASELINE_SYSCALLS
+            .iter()
+            .chain(WRITE_EXECUTE_SYSCALLS)
+            .copied()
+            .collect()
     }
 
     #[test]
     fn denylist_has_no_duplicate_syscalls() {
-        let mut sorted = DENIED;
+        let mut sorted = denied();
         sorted.sort_unstable();
-        let mut deduped = sorted.to_vec();
+        let mut deduped = sorted.clone();
         deduped.dedup();
-        assert_eq!(
-            deduped.len(),
-            DENIED.len(),
-            "denylist contains a duplicate syscall"
-        );
+        assert_eq!(deduped.len(), sorted.len(), "denylist has a duplicate");
     }
 
     /// The `mount(2)`-free mount API (`fsopen`/`fsconfig`/`fsmount`/`move_mount`) is a complete
     /// second path to the same result if left open.
     #[test]
     fn denylist_covers_the_mount_free_mount_api() {
+        let denied = denied();
         for syscall in [
             libc::SYS_mount,
             libc::SYS_umount2,
@@ -477,7 +416,7 @@ mod tests {
             libc::SYS_mount_setattr,
         ] {
             assert!(
-                DENIED.contains(&syscall),
+                denied.contains(&syscall),
                 "syscall {syscall} must be denied — the mount API is only closed as a set"
             );
         }
@@ -487,13 +426,14 @@ mod tests {
     /// any one of these open would hand back everything else this filter denies.
     #[test]
     fn denylist_covers_the_io_uring_entry_points() {
+        let denied = denied();
         for syscall in [
             libc::SYS_io_uring_setup,
             libc::SYS_io_uring_enter,
             libc::SYS_io_uring_register,
         ] {
             assert!(
-                DENIED.contains(&syscall),
+                denied.contains(&syscall),
                 "syscall {syscall} must be denied — io_uring bypasses seccomp by design"
             );
         }
@@ -506,8 +446,9 @@ mod tests {
     #[test]
     #[cfg(not(feature = "danger-allow-write-execute"))]
     fn denylist_blocks_executing_a_new_program_image_from_memory_by_default() {
-        assert!(DENIED.contains(&libc::SYS_memfd_create));
-        assert!(DENIED.contains(&libc::SYS_memfd_secret));
+        let denied = denied();
+        assert!(denied.contains(&libc::SYS_memfd_create));
+        assert!(denied.contains(&libc::SYS_memfd_secret));
     }
 
     /// The mirror of the test above: opting into `danger-allow-write-execute` is opting into
@@ -515,35 +456,42 @@ mod tests {
     #[test]
     #[cfg(feature = "danger-allow-write-execute")]
     fn danger_allow_write_execute_permits_anonymous_executable_memory() {
-        assert!(!DENIED.contains(&libc::SYS_memfd_create));
-        assert!(!DENIED.contains(&libc::SYS_memfd_secret));
+        let denied = denied();
+        assert!(!denied.contains(&libc::SYS_memfd_create));
+        assert!(!denied.contains(&libc::SYS_memfd_secret));
     }
 
     /// `execve`/`execveat` must stay allowed: this filter is installed in a `pre_exec` closure,
     /// so denying either would kill every child at the exec that starts it.
     #[test]
     fn denylist_never_blocks_the_exec_that_follows_it() {
-        assert!(!DENIED.contains(&libc::SYS_execve));
-        assert!(!DENIED.contains(&libc::SYS_execveat));
+        let denied = denied();
+        assert!(!denied.contains(&libc::SYS_execve));
+        assert!(!denied.contains(&libc::SYS_execveat));
     }
 
-    /// Runs `body` in a forked child that has this filter installed, and reports how it died.
+    fn never_returns(_: &str) -> ! {
+        panic!("build_baseline_denylist should not fail for this crate's fixed inputs")
+    }
+
+    /// Runs `body` in a forked child that has both filters installed exactly as `spawn_app`
+    /// does, and reports how it died.
     ///
-    /// The array assertions above check the jump arithmetic against the encoding this file
-    /// believes in; only the kernel can say whether it agrees. A filter it rejects, or one whose
-    /// jumps land a slot off, is the difference between "denied syscalls kill" and "nothing is
-    /// denied at all" — and both spellings pass a purely structural test.
-    ///
-    /// The child touches only syscalls between `fork()` and `_exit()`, so the usual
-    /// fork-in-a-threaded-process constraint is satisfied.
-    fn exit_status_under_filter(body: impl FnOnce()) -> libc::c_int {
+    /// The array assertions above check the arch gate's jump arithmetic against the encoding
+    /// this file believes in; only the kernel can say whether it — and the filter
+    /// `seccompiler` compiles — actually behave that way once installed. The child touches only
+    /// syscalls between `fork()` and `_exit()`, so the usual fork-in-a-threaded-process
+    /// constraint is satisfied; the denylist itself is built before the fork, per
+    /// [`build_baseline_denylist`]'s own requirement.
+    fn exit_status_under_both_filters(body: impl FnOnce()) -> libc::c_int {
+        let program = build_baseline_denylist(never_returns);
         // SAFETY: the child path below calls only async-signal-safe syscalls and never returns
         // to the test harness; the parent only waits on the pid it just created.
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
             if pid == 0 {
-                if install_baseline_denylist().is_err() {
+                if install_baseline_denylist(&program).is_err() {
                     libc::_exit(97);
                 }
                 body();
@@ -556,8 +504,8 @@ mod tests {
     }
 
     #[test]
-    fn the_kernel_accepts_the_filter_and_allows_an_undenied_syscall() {
-        let status = exit_status_under_filter(|| {
+    fn the_kernel_accepts_both_filters_and_allows_an_undenied_syscall() {
+        let status = exit_status_under_both_filters(|| {
             // SAFETY: `getpid` takes no arguments and cannot fail.
             unsafe {
                 libc::getpid();
@@ -565,13 +513,13 @@ mod tests {
         });
         assert!(
             libc::WIFEXITED(status),
-            "child died instead of exiting — the kernel rejected the filter, or a jump lands on \
+            "child died instead of exiting — the kernel rejected a filter, or a jump lands on \
              KILL for a syscall that isn't denied"
         );
         assert_eq!(
             libc::WEXITSTATUS(status),
             0,
-            "97 means prctl() refused the program outright"
+            "97 means installing one of the filters failed outright"
         );
     }
 
@@ -579,7 +527,7 @@ mod tests {
     fn a_denied_syscall_actually_kills_the_process() {
         // `personality` is denied, takes one harmless argument, and has no side effect worth
         // caring about in a child that is about to die either way.
-        let status = exit_status_under_filter(|| {
+        let status = exit_status_under_both_filters(|| {
             // SAFETY: a plain integer argument, no pointers. Never returns — the filter's
             // `SECCOMP_RET_KILL_PROCESS` takes the process down at the syscall boundary.
             unsafe {
@@ -592,6 +540,27 @@ mod tests {
         );
         // `SECCOMP_RET_KILL_PROCESS` kills without running a handler, but the wait status still
         // reports `SIGSYS` as the terminating signal, not `SIGKILL`.
+        assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
+    }
+
+    /// The whole point of stacking the two filters: `personality` isn't on the denylist under
+    /// its x32-tagged number (`seccompiler`'s compiled filter only ever compares the plain
+    /// 64-bit numbers in [`BASELINE_SYSCALLS`]), so if this test passed only because of the
+    /// denylist, removing the arch gate would silently reopen every entry in it via x32.
+    #[test]
+    fn an_x32_tagged_syscall_is_killed_by_the_arch_gate_not_the_denylist() {
+        let status = exit_status_under_both_filters(|| {
+            // SAFETY: a plain integer argument, no pointers. `getpid` is never denied by the
+            // denylist under either number — if this dies, it's the arch gate's x32 check.
+            unsafe {
+                libc::syscall(libc::SYS_getpid | i64::from(X32_SYSCALL_BIT));
+            }
+        });
+        assert!(
+            libc::WIFSIGNALED(status),
+            "an x32-tagged syscall number must be killed by the arch gate, even for a syscall \
+             that's otherwise always allowed"
+        );
         assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
     }
 }

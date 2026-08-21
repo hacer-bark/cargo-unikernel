@@ -1,13 +1,15 @@
 //! Blocks until the kernel's CRNG has enough entropy to be considered initialized.
 
-use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 /// A blocking read on `/dev/random` has no bound; RDSEED/RDRAND or virtio-rng
 /// (`CONFIG_HW_RANDOM_VIRTIO`) initializes the CRNG in under a second, so a wait this long
 /// means something is actually wrong, not merely slow.
 const MAX_WAIT: Duration = Duration::from_secs(30);
-const POLL_TIMEOUT_MS: libc::c_int = 250;
+const POLL_TIMEOUT: rustix::event::Timespec = rustix::event::Timespec {
+    tv_sec: 0,
+    tv_nsec: 250_000_000,
+};
 
 /// Waits, up to [`MAX_WAIT`], for the kernel's CRNG to report itself initialized, and refuses to
 /// start the app if it doesn't.
@@ -38,27 +40,23 @@ pub(crate) fn wait_for_entropy(log: impl Fn(&str), fatal: fn(&str) -> !) {
 
     let deadline = crate::deadline_after(MAX_WAIT);
     while Instant::now() < deadline {
-        let mut fds = libc::pollfd {
-            fd: file.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `fds` is a valid, in-scope `pollfd` for a live descriptor, written only for
-        // this call's duration; the count matches the single element passed.
-        let ret = unsafe { libc::poll(std::ptr::addr_of_mut!(fds), 1, POLL_TIMEOUT_MS) };
-        if ret < 0 {
-            let e = std::io::Error::last_os_error();
-            // A signal interrupting the wait is not a failure — poll again.
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            fatal(&format!(
+        let mut fds = [rustix::event::PollFd::new(
+            &file,
+            rustix::event::PollFlags::IN,
+        )];
+        match rustix::event::poll(&mut fds, Some(&POLL_TIMEOUT)) {
+            // `Ok(0)` is a plain timeout; a signal interrupting the wait (`EINTR`) isn't a
+            // failure either — both just loop back and poll again.
+            Ok(0) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => fatal(&format!(
                 "poll() on /dev/random failed: {e} — cannot confirm the kernel CRNG is seeded"
-            ));
-        }
-        if ret > 0 && fds.revents & libc::POLLIN != 0 {
-            log("Entropy pool ready.");
-            return;
+            )),
+            Ok(_) => {
+                if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+                    log("Entropy pool ready.");
+                    return;
+                }
+            }
         }
     }
 
