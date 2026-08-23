@@ -298,8 +298,11 @@ pub(crate) fn build_baseline_denylist(fatal: fn(&str) -> !) -> seccompiler::BpfP
     )
     .unwrap_or_else(|e| fatal(&format!("Failed to build the seccomp denylist filter: {e}")));
 
-    seccompiler::BpfProgram::try_from(filter)
-        .unwrap_or_else(|e| fatal(&format!("Failed to compile the seccomp denylist to BPF: {e}")))
+    seccompiler::BpfProgram::try_from(filter).unwrap_or_else(|e| {
+        fatal(&format!(
+            "Failed to compile the seccomp denylist to BPF: {e}"
+        ))
+    })
 }
 
 /// Installs [`install_arch_gate`]'s six-instruction ABI gate, then `program` (from

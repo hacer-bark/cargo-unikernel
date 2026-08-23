@@ -12,7 +12,7 @@ source you think it was.
 
 | Component | How it's pinned | Overridable? |
 |:---|:---|:---|
-| Base OS | Ubuntu 24.04, locked by SHA-256 digest | No |
+| Base OS | Ubuntu 26.04, locked by SHA-256 digest | No |
 | `apt` packages (gcc, binutils, musl-tools, …) | Frozen `snapshot.ubuntu.com` mirror timestamp, not the live archive | `[toolchain].apt_snapshot` |
 | Rust compiler | Fixed version via `rustup --default-toolchain` | `[toolchain].rust_version` |
 | musl libc | Ubuntu's `musl-tools`, same pinned snapshot | Via `apt_snapshot` |

@@ -83,7 +83,7 @@ mode = "ram"
 
 [kernel]
 # Linux kernel version to build. Tarball and compiled bzImage are cached by version+config.
-version = "6.18.33"
+version = "6.18.45"
 # Optional: pin the expected sha256 of the kernel.org tarball. Build fails on mismatch.
 # sha256 = "…"
 
@@ -91,9 +91,9 @@ version = "6.18.33"
 # Overrides the reproducible-build toolchain this CLI otherwise pins. All optional; see
 # docs/reproducible_builds.md — overriding one means reproducible given that pin, not this
 # CLI version's defaults.
-# apt_snapshot = "20260801T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
-# rust_version = "1.97.0"             # rustup --default-toolchain version
-# limine_version = "12.4.1"           # ISO bootloader release tag
+# apt_snapshot = "20260820T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
+# rust_version = "1.98.0"             # rustup --default-toolchain version
+# limine_version = "12.6.0"           # ISO bootloader release tag
 # limine_sha256 = "…"                 # recommended if limine_version is set
 # e2fsprogs_version = "1.47.4"        # mke2fs release (storage.mode = "persistent" only)
 # e2fsprogs_sha256 = "…"              # recommended if e2fsprogs_version is set
