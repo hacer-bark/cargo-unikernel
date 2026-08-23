@@ -84,7 +84,9 @@ fn get_attestation_report(report_data: [u8; SNP_REPORT_USER_DATA_SIZE]) -> Resul
         return Err(format!("firmware returned report status {status:#x}"));
     }
     if report_size == 0 || 32 + report_size > resp.data.len() {
-        return Err(format!("implausible report_size {report_size} in response header"));
+        return Err(format!(
+            "implausible report_size {report_size} in response header"
+        ));
     }
     Ok(resp.data[32..32 + report_size].to_vec())
 }
@@ -200,9 +202,12 @@ fn serve(listener: TcpListener) {
 /// Binds an IPv6-only listener so it doesn't fight the IPv4 listener over the same port —
 /// Linux's dual-stack default (bindv6only=0) would otherwise let `[::]` claim v4 traffic too.
 fn bind_ipv6_only(port: &str) -> TcpListener {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, None).expect("failed to create IPv6 socket");
+    let socket =
+        Socket::new(Domain::IPV6, Type::STREAM, None).expect("failed to create IPv6 socket");
     socket.set_only_v6(true).expect("failed to set IPV6_V6ONLY");
-    let addr = format!("[::]:{port}").parse::<std::net::SocketAddr>().unwrap();
+    let addr = format!("[::]:{port}")
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
     socket.bind(&addr.into()).expect("failed to bind IPv6 PORT");
     socket.listen(128).expect("failed to listen on IPv6 socket");
     socket.into()

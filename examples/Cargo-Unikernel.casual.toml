@@ -91,7 +91,7 @@ version = "6.18.33"
 # Overrides the reproducible-build toolchain this CLI otherwise pins. All optional; see
 # docs/reproducible_builds.md — overriding one means reproducible given that pin, not this
 # CLI version's defaults.
-# apt_snapshot = "20260701T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
+# apt_snapshot = "20260801T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
 # rust_version = "1.97.0"             # rustup --default-toolchain version
 # limine_version = "12.4.1"           # ISO bootloader release tag
 # limine_sha256 = "…"                 # recommended if limine_version is set

@@ -26,15 +26,15 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 # because a historical snapshot's own Release file has a short-lived Valid-Until date that
 # has long since passed by the time anyone builds this image.
 #
-# The snapshot timestamp must be on or after whatever point release the pinned base image
-# digest above was itself built from — apt will refuse to *downgrade* already-installed
-# packages (gcc-14-base, libc6, libssl3t64, ...) to match an older snapshot, and fails the
-# whole install with "unmet dependencies" instead. If you ever bump the base image digest,
-# re-verify this timestamp is still >= the versions already baked into that image.
+# The dist-upgrade step right below forces every package already on the base image down
+# (or up) to match this timestamp, so SNAPSHOT_TS no longer has to stay >= whatever point
+# release the pinned base image digest was built from — any SNAPSHOT_TS/base-digest pair
+# works, including rebuilding against an old SNAPSHOT_TS years after the base digest above
+# was published.
 #
 # Overridable via `[toolchain].apt_snapshot` in cargo-unikernel.toml (`--build-arg
 # SNAPSHOT_TS=...`, see pipeline::docker::build_args_for) — see docs/reproducible_builds.md.
-ARG SNAPSHOT_TS=20260701T000000Z
+ARG SNAPSHOT_TS=20260801T000000Z
 RUN rm -f /etc/apt/sources.list.d/ubuntu.sources && \
     printf 'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble main restricted universe multiverse\n\
 deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble-updates main restricted universe multiverse\n\
@@ -43,6 +43,17 @@ deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s noble-backports
     "$SNAPSHOT_TS" "$SNAPSHOT_TS" "$SNAPSHOT_TS" "$SNAPSHOT_TS" \
     > /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
+
+# Force every package already on the base image (openssl, libc, ...) to the snapshot's
+# versions, not just the ones we explicitly install below. Without this, a package baked
+# into the base image can be *newer* than SNAPSHOT_TS — apt refuses to downgrade an
+# already-installed package to satisfy a dependency, so `apt-get install` later fails with
+# "unmet dependencies" (this happened with libssl3t64 vs. libssl-dev). --allow-downgrades
+# makes SNAPSHOT_TS the single source of truth for every package version regardless of
+# which base image digest or how much later this is rebuilt, so the exact same Dockerfile
+# keeps producing an identical package set even years from now, independent of whatever
+# `ubuntu:24.04` digest happens to be pinned above.
+RUN apt-get update && apt-get -y --allow-downgrades dist-upgrade
 
 # Install build dependencies exactly as we need them
 #
