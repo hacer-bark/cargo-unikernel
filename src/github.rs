@@ -111,23 +111,30 @@ jobs:
           restore-keys: |
             ${{{{ runner.os }}}}-cargo-install-
 
-      # Caches the build pipeline's own state: the downloaded kernel source tarball, the
-      # fingerprinted bzImage cache (skips reconfigure+recompile entirely when nothing
-      # kernel-config-relevant changed), ccache's object cache, and the guest/app cargo
-      # registry+target dirs used inside the build container. This is what actually avoids
-      # re-downloading/recompiling the kernel on every run — keyed on this project's config
-      # so a hardening/kernel-version change invalidates it, with a broader restore-key
-      # fallback so ccache/cargo-registry contents still get reused even then.
+      - name: Install cargo-unikernel
+        run: {install_cmd}
+
+      # `~/.cache/cargo-unikernel` holds ccache's object cache alongside the downloaded
+      # kernel source and cargo registry — the installed cargo-unikernel version has to be
+      # part of the cache key, not just this project's config, or a version bump that
+      # changes the pinned toolchain (Dockerfile, kernel version, gcc, ...) can restore a
+      # ccache directory built under the *previous* toolchain via the restore-keys fallback
+      # below. ccache is supposed to reject a cross-toolchain hit on its own, but relying on
+      # that instead of just keying the cache correctly can produce a build that silently
+      # differs from a clean one. Restore-keys still falls back across just this project's
+      # config changes *within* the same cargo-unikernel version, since ccache/kernel-source
+      # reuse there is genuinely safe.
+      - name: Resolve installed cargo-unikernel version
+        id: cargo-unikernel-version
+        run: echo "version=$(cargo-unikernel --version)" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo-unikernel build state (kernel source, ccache, cargo registry)
         uses: actions/cache@v6
         with:
           path: ~/.cache/cargo-unikernel
-          key: ${{{{ runner.os }}}}-cargo-unikernel-${{{{ hashFiles('{config_arg}') }}}}
+          key: ${{{{ runner.os }}}}-cargo-unikernel-${{{{ steps.cargo-unikernel-version.outputs.version }}}}-${{{{ hashFiles('{config_arg}') }}}}
           restore-keys: |
-            ${{{{ runner.os }}}}-cargo-unikernel-
-
-      - name: Install cargo-unikernel
-        run: {install_cmd}
+            ${{{{ runner.os }}}}-cargo-unikernel-${{{{ steps.cargo-unikernel-version.outputs.version }}}}-
 
       - name: Build image
         run: cargo unikernel build --config {config_arg}
@@ -252,7 +259,7 @@ mod tests {
             let workflow =
                 std::fs::read_to_string(".github/workflows/cargo-unikernel.yml").unwrap();
             assert!(workflow.contains("cargo install cargo-unikernel --locked\n"));
-            assert!(!workflow.contains("--version"));
+            assert!(!workflow.contains("cargo install cargo-unikernel --version"));
         });
     }
 
