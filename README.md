@@ -244,6 +244,9 @@ guest/        SEPARATE nested workspace: cargo-unikernel-init (the
 examples/     fully-commented starting configs for each profile x
               app-acquisition mode (rust source / generic source /
               pre-built binary)
+sev-snp-server-example/
+              standalone demo app built with cargo-unikernel itself: an
+              attestation-serving HTTP server showing off the sev-snp profile
 docs/         architecture, toolchain trade-offs, threat model,
               reproducible-builds notes
 ```

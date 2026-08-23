@@ -1,0 +1,10 @@
+[package]
+name = "sev-snp-server"
+version = "0.0.1"
+publish = false
+edition = "2024"
+description = "Showcase app for cargo-unikernel's sev-snp profile: an HTTP server that serves /attestation reports straight from /dev/sev-guest."
+
+[dependencies]
+libc = "0.2"
+socket2 = "0.5"

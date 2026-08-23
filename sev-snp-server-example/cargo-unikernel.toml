@@ -1,0 +1,156 @@
+# cargo-unikernel config — "sev-snp" profile
+#
+# Full AMD SEV-SNP confidential-computing stack: deterministic build and a launch measurement
+# covering kernel+initramfs+app. Unlike casual, sev-snp always requires this file — zero-config
+# auto-detection only produces casual builds.
+#
+# Proving that measurement to a remote peer is the app's job: this profile leaves
+# /dev/sev-guest readable to it, and the app binds the report to whatever its own protocol
+# authenticates with. There is no [attestation] section — see docs/threat_model.md.
+
+[project]
+cargo_unikernel_version = "0.0.1"
+# Used for output filenames (dist/<name>.iso etc.). Required.
+name = "sev-snp-server"
+
+[profile]
+kind = "sev-snp"
+
+[app]
+# "source" — compile from source inside the pinned, reproducible build container (below).
+# "binary" — skip compiling; embed an already-built binary via [app.binary] instead.
+mode = "source"
+
+# Consider building via a tagged release workflow (`cargo-unikernel github init`) so the
+# measurement corresponds to an immutable, inspectable commit rather than uncommitted disk state.
+[app.source]
+path = "."
+# "rust" — cargo build, cross-compiled to musl. "generic" — supply build_command + output_binary.
+toolchain = "rust"
+package_path = "."
+cargo_profile = "release"
+features = []
+
+# toolchain = "generic": shell command in the container that must leave a statically-linked
+# binary at `output_binary`. Worked example — a Go server:
+# build_command = "CGO_ENABLED=0 GOOS=linux go build -o app ."
+# output_binary = "app"
+# extra_apt_packages = []   # apt-get install for a toolchain not already in the build image
+
+# [app.binary]   # only used when [app].mode = "binary" instead of "source"
+# path = "./target/release/my-server"     # local file only — never fetched over the network
+
+[app.runtime]
+env = { PORT = "8000" }
+# uid/gid the app runs as inside the guest (never root). Defaults to 65534:65534.
+uid = 65534
+gid = 65534
+
+# [app.runtime.danger]
+# Mounts /tmp and /var writable+executable. Off by default; only enable if the app needs it.
+# allow_write_execute = true
+
+# [app.runtime.limits]
+# setrlimit ceilings applied before exec. Shown with defaults.
+# max_open_files = 65536     # RLIMIT_NOFILE
+# max_processes = 2048       # RLIMIT_NPROC
+# max_memory_mb = 0          # RLIMIT_AS in MiB; 0 = no cap
+# max_locked_memory_mb = 64  # RLIMIT_MEMLOCK in MiB — how much the app may mlock
+
+[network]
+# "ipv4", "ipv6", "dual", or "none" — compile-time choice; unselected protocols aren't built in.
+# IPv4 addresses come from DHCP (kernel `ip=dhcp`); IPv6 comes from SLAAC, which means one
+# global /64 per advertised prefix and no address at all from a routed /48 or /56 — there is no
+# DHCPv6-PD client here. See docs/architecture.md#network-addressing.
+mode = "dual"
+
+# A SLAAC address is derived from the MAC the hypervisor picked, so you cannot know it before
+# boot — and on a guest whose console you cannot read, that means no address you could have put
+# in DNS. Uncomment to pin one instead. Assigned in addition to SLAAC, not instead of it.
+[network.ipv6_static]
+address = "2602:f992:60:a4::1"   # any host part in your /64; ::1 is the conventional pick
+prefix_len = 64                 # 128 for a single delegated address
+gateway = "fe80::1"             # common convention for a routed-vSwitch provider; untested with a valid client so far
+# interface = "eth0"            # only on a multi-NIC guest
+
+[storage]
+# "ram" (default): /var is wiped every reboot. "persistent": /var lives on a virtio-blk disk;
+# an untrusted/foreign device is wiped and reformatted rather than trusted.
+mode = "ram"
+# size_mib = 4096  # persistent disk image size; only used when mode = "persistent"
+
+[kernel]
+version = "6.18.33"
+# sha256 = "…"
+
+# [toolchain]
+# Overrides the reproducible-build toolchain this CLI otherwise pins. All optional; see
+# docs/reproducible_builds.md. `apt_snapshot = "latest"` is rejected for sev-snp — pin an
+# explicit timestamp instead.
+# apt_snapshot = "20260701T000000Z"
+# rust_version = "1.97.0"
+# limine_version = "12.4.1"           # ISO bootloader release tag; iso is not the measured path
+# limine_sha256 = "…"
+# e2fsprogs_version = "1.47.4"        # mke2fs release (storage.mode = "persistent" only)
+# e2fsprogs_sha256 = "…"
+
+[hardening]
+level = "default"
+
+[hardening.kernel]
+disable_legacy_subsystems = true     # strips sound/USB/DRM/wireless/legacy net protocols/most fs drivers
+disable_debug_interfaces = true      # strips debugfs/SysRq/kprobes/ftrace/kernel debug-info
+kernel_self_protection = true        # KSPP baseline: ASLR, hardened allocator, Lockdown LSM, etc.
+exploit_mitigations = true           # SMEP/SMAP/UMIP, PTI, retpoline
+seccomp = true                       # enables seccomp-BPF (app still installs its own filter)
+# fips = true                        # CONFIG_CRYPTO_FIPS capability — off by default, opt in for compliance
+
+[hardening.runtime]
+network_spoofing_protection = true   # rp_filter + ICMP redirect defense
+icmp_hardening = true                # ignore broadcasts/bogus errors and all pings
+tcp_hardening = true                 # SYN cookies, backlog/keepalive tuning for DDoS resilience
+info_leak_restriction = true         # restricts kernel pointer/dmesg/perf-event exposure
+ptrace_and_bpf_restriction = true    # locks ptrace to YAMA scope 3, disables unprivileged BPF
+kexec_and_fs_protection = true       # disables kexec, protects symlinks/hardlinks from TOCTOU
+
+# extra_sysctls = { "/proc/sys/some/other/knob" = "1" }
+# extra_kernel_config = ["CONFIG_DEBUG_INFO=enable"]
+
+[sev_snp]
+# Must match what the image actually boots with — the measurement is only valid for this count.
+vcpus = 1
+# CPU model passed to `sev-snp-measure.py --vcpu-type` (e.g. "EPYC-Milan", "EPYC-Turin") — must
+# match the hypervisor's actual exposed CPU model.
+vcpu_type = "EPYC-Milan"
+# Baked into both the UKI's .cmdline section and the string sev-snp-measure.py hashes, so what's
+# measured and what boots can never drift apart. See docs/architecture.md's cmdline rationale.
+kernel_cmdline = "console=ttyS0 ip=dhcp quiet loglevel=3 panic=-1 random.trust_cpu=on random.trust_bootloader=off page_alloc.shuffle=1 lockdown=confidentiality transparent_hugepage=madvise"
+# Which boot inputs sev-snp-measure.py hashes. Defaults to auto-detecting from [output].formats:
+# "uki" if a UKI is built, "kernel-initrd" otherwise. Only set explicitly if your provider's
+# actual boot mode doesn't follow from your chosen output formats alone.
+measured_boot = "uki"
+
+[sev_snp.ovmf]
+# Exactly one of preset/path must be set — cloud providers ship different OVMF builds.
+# "builtin" (the only preset) uses the firmware baked into the cargo-unikernel binary.
+# preset = "builtin"
+path = "./firmware/OVMF.fd"
+
+[output]
+# ISO is available for sev-snp too but isn't the measured boot path — sev-snp-measure.py
+# always measures the cpio+bzImage (or UKI) pair.
+formats = ["uki"]
+dir = "dist/"
+
+[release]
+# Omit `assets` to attach every produced asset (the default). For sev-snp, keeping
+# "measurement" and "ovmf" lets a third party verify the launch measurement without rebuilding.
+# assets = ["cpio", "uki", "measurement", "ovmf"]
+
+# title = "My App Release"                # defaults to the tag name
+
+# notes = "See CHANGELOG.md for details." # mutually exclusive with notes_file
+# notes_file = "RELEASE_NOTES.md"         # path relative to this config file
+
+# draft = false
+# prerelease = false

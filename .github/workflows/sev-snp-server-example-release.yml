@@ -1,0 +1,64 @@
+name: sev-snp-server-example release
+
+# Same shape as the workflow `cargo unikernel github init` generates for any user's project
+# (see src/github.rs) — builds on every push to main (to keep the kernel-build cache warm,
+# since GitHub Actions cache scopes don't cross tags) but only *publishes* a release when a
+# `sev-snp-server-v*` tag lands. Building the kernel from scratch is the expensive part of
+# this pipeline, so this only ever runs it once per trigger — no duplicate builds for their
+# own sake. Tag prefix is namespaced (not a bare `v*`) so it can never collide with a future
+# release tag for the `cargo-unikernel` crate itself.
+#
+# Dogfoods this repo's own cargo-unikernel source (not the last crates.io release), so a
+# regression here is caught before it ships.
+#
+# Verifying a published release doesn't happen in this workflow — see
+# sev-snp-server-example/README.md for the two ways to check a release's measurement
+# yourself: rebuilding locally, or comparing against the live SEV-SNP host.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "sev-snp-server-v*"
+  workflow_dispatch:
+
+concurrency:
+  group: sev-snp-server-example-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo-unikernel's own build
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-sev-snp-server-example-cli
+
+      - name: cache cargo-unikernel build state (kernel source, ccache, cargo registry)
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/cargo-unikernel
+          key: ${{ runner.os }}-sev-snp-server-example-${{ hashFiles('sev-snp-server-example/cargo-unikernel.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-sev-snp-server-example-
+
+      - name: build cargo-unikernel
+        run: cargo build --release --locked --bin cargo-unikernel
+
+      - name: build sev-snp-server-example image
+        run: ./target/release/cargo-unikernel build --config sev-snp-server-example/cargo-unikernel.toml
+
+      # `--no-build`: the step above already built the image (needed on every trigger, to
+      # keep the cache warm) — rebuilding here would just redo the same work.
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./target/release/cargo-unikernel release --config sev-snp-server-example/cargo-unikernel.toml --tag "${{ github.ref_name }}" --no-build
