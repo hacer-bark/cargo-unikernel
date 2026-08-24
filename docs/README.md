@@ -10,6 +10,7 @@ These documents go deeper.
 | [`toolchains.md`](toolchains.md) | The three ways to get an app into the image, and the trust trade-off each makes |
 | [`threat_model.md`](threat_model.md) | Trust boundaries, attack/mitigation catalog, what's out of scope |
 | [`reproducible_builds.md`](reproducible_builds.md) | What's pinned, what nondeterminism is eliminated, how to verify a build |
+| [`building_an_iso.md`](building_an_iso.md) | Assembling a bootable ISO yourself from a `cpio`+`bzImage` or `uki` build — not produced by the tool itself |
 
 **New to the project?** Read `architecture.md`, then `toolchains.md`.
 **Evaluating security posture?** Read `threat_model.md`.

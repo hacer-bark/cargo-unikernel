@@ -115,7 +115,6 @@ pub fn run() -> Result<()> {
             let artifacts = pipeline::docker::BuildArtifacts {
                 bzimage,
                 cpio,
-                iso: None,
                 uki: None,
                 binary: None,
                 sev_measurement: Some(dist.join("sev_measurement.txt")),

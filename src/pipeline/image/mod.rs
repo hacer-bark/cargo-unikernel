@@ -1,7 +1,7 @@
 use crate::pipeline::docker::BuildArtifacts;
-use crate::schema::{Config, OutputFormat, ProfileKind};
+use crate::schema::OutputFormat;
 use anyhow::{Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Dispatches to the matching format's verification — confirms `format` landed in `dist/` and
 /// reports it.
@@ -13,12 +13,7 @@ use std::path::{Path, PathBuf};
 /// # Errors
 ///
 /// Returns an error if the build container didn't actually produce `format`.
-pub fn write(
-    format: OutputFormat,
-    config: &Config,
-    _project_dir: &Path,
-    artifacts: &BuildArtifacts,
-) -> Result<()> {
+pub fn write(format: OutputFormat, artifacts: &BuildArtifacts) -> Result<()> {
     match format {
         OutputFormat::Cpio => {
             if !artifacts.cpio.exists() || !artifacts.bzimage.exists() {
@@ -29,21 +24,6 @@ pub fn write(
                 artifacts.bzimage.display(),
                 artifacts.cpio.display()
             );
-        }
-        OutputFormat::Iso => {
-            let iso = require(
-                artifacts.iso.as_ref(),
-                "iso output was requested but not produced by build/scripts/make_iso.sh",
-            )?;
-            if config.profile.kind == ProfileKind::SevSnp {
-                println!(
-                    "iso ready: {} (note: for sev-snp, this is a convenience/testing image — the \
-                     measured boot path is cpio+bzImage or uki, matching what sev-snp-measure.py saw)",
-                    iso.display()
-                );
-            } else {
-                println!("iso ready: {}", iso.display());
-            }
         }
         OutputFormat::Uki => {
             let uki = require(

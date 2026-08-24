@@ -42,7 +42,7 @@ pub fn run() -> Result<()> {
     }
     println!(
         "\nDocker + git (+ gh, for `cargo unikernel release`) are all this host needs — \
-         cpio/xorriso/ukify/sev-snp-measure.py run inside the pinned build container."
+         cpio/ukify/sev-snp-measure.py run inside the pinned build container."
     );
     Ok(())
 }

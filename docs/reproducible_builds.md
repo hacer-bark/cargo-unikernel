@@ -18,8 +18,8 @@ source you think it was.
 | musl libc | Ubuntu's `musl-tools`, same pinned snapshot | Via `apt_snapshot` |
 | Rust dependencies | `Cargo.lock` | No |
 | `toolchain = "generic"` build command | Runs in the pinned container; its determinism is on the config author | N/A |
-| ISO tooling | `xorriso` (via `apt_snapshot`) + Limine, pinned release + checksum | `limine_version`/`limine_sha256` |
 | UKI tooling | `systemd-ukify`, pinned systemd package | Via `apt_snapshot` |
+| `mke2fs` (persistent storage only) | Statically built from a pinned e2fsprogs release + checksum, only when `[storage].mode = "persistent"` | `e2fsprogs_version`/`e2fsprogs_sha256` |
 | OVMF firmware (`preset`) | Baked into the binary (`assets/ovmf/`), no network fetch; a unit test checks embedded bytes against pinned hashes | Via `[sev_snp.ovmf].path` |
 
 The host's `$HOME/.cargo`/`target` are never mounted in — only explicit cache volumes
@@ -86,9 +86,6 @@ anywhere, any day.
 - **UKI** — deterministic given a pinned `ukify`/systemd and no "current time" defaults during
   PE assembly. Its embedded cmdline shares one source of truth with `sev-snp-measure.py`, so
   the two can't drift.
-- **ISO** — deterministic given pinned Limine and explicit `xorriso` flags. For sev-snp it's a
-  convenience/testing artifact, not what gets measured (always cpio+bzImage or UKI).
-
 ## Verifying a build yourself
 
 ```bash

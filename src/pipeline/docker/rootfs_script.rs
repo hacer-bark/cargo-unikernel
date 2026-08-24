@@ -70,14 +70,6 @@ pub(super) fn script_rootfs_and_images(config: &Config) -> String {
                     "cp \"$APP_BIN\" {dist_q}/{name_q}.bin && chmod 555 {dist_q}/{name_q}.bin"
                 );
             }
-            OutputFormat::Iso => {
-                let cmdline_q = shell_quote(&cmdline_for(config));
-                let _ = writeln!(
-                    s,
-                    "/assets/scripts/make_iso.sh /build-meta/{name_q}.bzImage \
-                     /build-meta/{name_q}.cpio {dist_q}/{name_q}.iso {cmdline_q}"
-                );
-            }
             OutputFormat::Uki => {
                 let cmdline_q = shell_quote(&cmdline_for(config));
                 let uname_q = shell_quote(&config.kernel.version);
@@ -119,16 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn iso_build_passes_the_actual_cmdline_not_the_script_default() {
-        let config = casual_config_with_formats(vec![OutputFormat::Cpio, OutputFormat::Iso]);
-        let script = script_rootfs_and_images(&config);
-        assert!(script.contains("make_iso.sh"));
-        assert!(script.contains("'/workspace/dist'/'test-app'.iso"));
-        assert!(script.contains(&shell_quote(&cmdline_for(&config))));
-    }
-
-    #[test]
-    fn uki_build_uses_same_cmdline_as_iso() {
+    fn uki_build_uses_configured_cmdline() {
         let config = casual_config_with_formats(vec![OutputFormat::Cpio, OutputFormat::Uki]);
         let script = script_rootfs_and_images(&config);
         assert!(script.contains(&format!("--cmdline={}", shell_quote(&cmdline_for(&config)))));

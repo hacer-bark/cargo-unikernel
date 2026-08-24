@@ -5,7 +5,7 @@
 # documented with its type/allowed values and default.
 
 [project]
-# Used for output filenames (dist/<name>.iso etc.). Required.
+# Used for output filenames (dist/<name>.cpio etc.). Required.
 name = "my-server"
 
 [profile]
@@ -93,8 +93,6 @@ version = "6.18.45"
 # CLI version's defaults.
 # apt_snapshot = "20260820T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
 # rust_version = "1.98.0"             # rustup --default-toolchain version
-# limine_version = "12.6.0"           # ISO bootloader release tag
-# limine_sha256 = "…"                 # recommended if limine_version is set
 # e2fsprogs_version = "1.47.4"        # mke2fs release (storage.mode = "persistent" only)
 # e2fsprogs_sha256 = "…"              # recommended if e2fsprogs_version is set
 
@@ -126,9 +124,10 @@ kexec_and_fs_protection = true       # disables kexec, protects symlinks/hardlin
 # extra_kernel_config = ["CONFIG_DEBUG_INFO=enable"]   # raw escape hatch, applied last
 
 [output]
-# Any subset of "cpio" (+bzImage), "iso" (hybrid BIOS+UEFI), "uki" (.efi), "binary" (raw app
-# binary). Default: cpio, iso, uki.
-formats = ["cpio", "iso", "uki"]
+# Any subset of "cpio" (+bzImage), "uki" (.efi), "binary" (raw app binary). Default: cpio, uki.
+# For a bootable ISO, build "cpio" or "uki" and assemble it yourself — see
+# docs/building_an_iso.md.
+formats = ["cpio", "uki"]
 # Output directory, relative to this config file.
 dir = "dist/"
 

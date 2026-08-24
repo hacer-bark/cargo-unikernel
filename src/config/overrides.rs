@@ -34,11 +34,10 @@ pub fn apply_overrides(mut config: Config, overrides: BuildOverrides) -> Result<
         for f in formats {
             parsed.push(match f.trim() {
                 "cpio" => OutputFormat::Cpio,
-                "iso" => OutputFormat::Iso,
                 "uki" => OutputFormat::Uki,
                 "binary" => OutputFormat::Binary,
                 other => {
-                    bail!("unknown --format value '{other}' (expected cpio, iso, uki, or binary)")
+                    bail!("unknown --format value '{other}' (expected cpio, uki, or binary)")
                 }
             });
         }
@@ -121,7 +120,6 @@ mod tests {
             BuildOverrides {
                 format: Some(vec![
                     "cpio".to_string(),
-                    "iso".to_string(),
                     "uki".to_string(),
                     "binary".to_string(),
                 ]),
@@ -131,12 +129,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.output.formats,
-            vec![
-                OutputFormat::Cpio,
-                OutputFormat::Iso,
-                OutputFormat::Uki,
-                OutputFormat::Binary
-            ]
+            vec![OutputFormat::Cpio, OutputFormat::Uki, OutputFormat::Binary]
         );
     }
 

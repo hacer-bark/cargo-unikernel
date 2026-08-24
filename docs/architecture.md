@@ -6,8 +6,10 @@
 drops into any project. The built image has **no traditional Linux distribution** — no
 systemd, no bash, no SSH, no package manager. Just a hardened kernel, a tiny init binary, and
 your app. Everything the build needs beyond your own project — Dockerfile, kernel build
-script + Kconfig, ISO/UKI tooling, the guest init's source — is embedded in the published
-binary, so the tool works from any directory after a plain `cargo install`.
+script + Kconfig, UKI tooling, the guest init's source — is embedded in the published
+binary, so the tool works from any directory after a plain `cargo install`. Need a bootable
+ISO? See [`docs/building_an_iso.md`](building_an_iso.md) for assembling one yourself from a
+`cpio`+`bzImage` or `uki` build.
 
 ```mermaid
 flowchart TB
@@ -23,7 +25,7 @@ flowchart TB
         APP["Your app: cargo build directly on /workspace (Mode A)<br/>or pre-verified binary (Mode B)"]
         INIT["cargo build --manifest-path /assets-guest/cargo-unikernel-init/Cargo.toml"]
         ROOTFS["/build/rootfs assembly:<br/>/init = cargo-unikernel-init, /payload/app = your app"]
-        IMG["cpio / ukify / xorriso+limine"]
+        IMG["cpio / ukify"]
         MEASURE["sev-snp-measure.py (sev-snp profile only)"]
         KERNEL --> ROOTFS
         APP --> ROOTFS
@@ -32,7 +34,7 @@ flowchart TB
         IMG --> MEASURE
     end
     BUILD -->|"mounts project dir as /workspace,<br/>materialized assets as /assets, /assets-guest"| DOCKER_INNER
-    DOCKER_INNER --> DIST["your-project/dist/: bzImage, cpio, iso, efi,<br/>sev_measurement.{txt,json}"]
+    DOCKER_INNER --> DIST["your-project/dist/: bzImage, cpio, efi,<br/>sev_measurement.{txt,json}"]
 ```
 
 ## Repo layout
@@ -41,8 +43,8 @@ flowchart TB
   app-source resolution, the Docker container, image formats, SEV-SNP measurement.
   `assets.rs`: embeds `assets/`+`guest/` via `include_dir!`, materializes to
   `~/.cache/cargo-unikernel/` on first use.
-- **`assets/`** — Dockerfile, kernel build script + Kconfig, ISO build script, the two pinned
-  OVMF firmware binaries. Mounted read-only as `/assets`.
+- **`assets/`** — Dockerfile, kernel build script + Kconfig, the two pinned OVMF firmware
+  binaries. Mounted read-only as `/assets`.
 - **`guest/`** — a separate, nested Cargo workspace: `cargo-unikernel-init` (guest PID 1) +
   `cargo-unikernel-common` (mount/hardening/entropy/seccomp). Not a Rust dependency of the
   CLI — only its source text is embedded and cross-compiled per build. Builds/tests standalone
@@ -180,13 +182,13 @@ router advertisements on a forwarding interface.
    linking regardless of mode, failing the build with missing-library names rather than
    shipping a crash-looping image — see [`toolchains.md`](toolchains.md). Then the rootfs/cpio
    assembles and every requested output format is produced.
-5. **`image::{cpio,iso,uki}`** — produced inside the container; this just confirms each
+5. **`image::{cpio,uki}`** — produced inside the container; this just confirms each
    landed in `dist/`.
 6. **`measurement`** (sev-snp only) — reads `dist/sev_measurement.txt`, writes a JSON sidecar
    recording every input (vcpus, cmdline, kernel/initrd identity, OVMF source).
 
-Shells out to pinned tools (`ukify`, `xorriso`+Limine, `sev-snp-measure.py`) rather than
-reimplementing PE/ISO assembly or kernel measurement.
+Shells out to pinned tools (`ukify`, `sev-snp-measure.py`) rather than reimplementing PE
+assembly or kernel measurement.
 
 ## GitHub integration
 
@@ -205,12 +207,11 @@ reimplementing PE/ISO assembly or kernel measurement.
 | Format | Tooling | Notes |
 |:---|:---|:---|
 | `.cpio` + `bzImage` | `cpio --reproducible`, zeroed timestamps, `LC_ALL=C sort` | The measured path for sev-snp; most direct for QEMU. |
-| `.iso` | `xorriso -as mkisofs` + Limine | Hybrid BIOS+UEFI; Limine over GRUB for a smaller trusted codebase. Convenience-only for sev-snp — not what's measured. |
 | UKI (`.efi`) | `systemd-ukify` | Single UEFI-bootable PE; cmdline shared with `sev-snp-measure.py`. |
 | `binary` (`.bin`) | plain `cp` of `$APP_BIN` | Raw app binary alongside any other requested formats. |
 
-`assets/scripts/make_iso.sh` takes the cmdline as an argument so every format from one build
-boots with exactly the same cmdline — one source of truth, no drift. See
+There is no built-in ISO output — see [`building_an_iso.md`](building_an_iso.md) for
+assembling a bootable ISO yourself from a `cpio`+`bzImage` or `uki` build. See
 [`reproducible_builds.md`](reproducible_builds.md) and [`threat_model.md`](threat_model.md)
 for the determinism and threat stories.
 
@@ -235,9 +236,3 @@ kernel's own default; `nosmt` costs 30-50% throughput for little gain single-ten
 `mitigations=off` (use `extra_kernel_config` if you really need it); `pti=on` (already
 default); `fips=1` (compliance opt-in, add yourself); `amd_iommu=*`/`iommu.*` (SEV-SNP's DMA
 protection is the hardware Reverse Map Table, not a vIOMMU that isn't there).
-
-**Ignorable warning:** every ISO build prints `xorriso ... WARNING: EFI boot equipment is
-provided but no directory /EFI/BOOT`. Expected — `make_iso.sh` embeds the EFI boot image via
-a real El Torito boot catalog entry (Limine's recipe) instead of a `/EFI/BOOT/BOOTX64.EFI`
-file; UEFI firmware still finds it as a proper ESP. A literal `/EFI/BOOT` tree would silence
-the warning but produce an ISO nothing can boot.

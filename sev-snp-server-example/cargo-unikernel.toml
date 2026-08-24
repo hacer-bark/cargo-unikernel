@@ -10,7 +10,7 @@
 
 [project]
 cargo_unikernel_version = "0.0.1"
-# Used for output filenames (dist/<name>.iso etc.). Required.
+# Used for output filenames (dist/<name>.cpio etc.). Required.
 name = "sev-snp-server"
 
 [profile]
@@ -89,8 +89,6 @@ version = "6.18.45"
 # CLI version's defaults.
 # apt_snapshot = "20260820T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
 # rust_version = "1.98.0"             # rustup --default-toolchain version
-# limine_version = "12.6.0"           # ISO bootloader release tag
-# limine_sha256 = "…"                 # recommended if limine_version is set
 # e2fsprogs_version = "1.47.4"        # mke2fs release (storage.mode = "persistent" only)
 # e2fsprogs_sha256 = "…"              # recommended if e2fsprogs_version is set
 
@@ -137,8 +135,6 @@ measured_boot = "uki"
 path = "./firmware/OVMF.fd"
 
 [output]
-# ISO is available for sev-snp too but isn't the measured boot path — sev-snp-measure.py
-# always measures the cpio+bzImage (or UKI) pair.
 formats = ["uki"]
 dir = "dist/"
 

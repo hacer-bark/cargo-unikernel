@@ -10,8 +10,7 @@ use include_dir::{Dir, include_dir};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Dockerfile, kernel build script + Kconfig fragments, ISO build script, and QEMU
-/// templates.
+/// Dockerfile, kernel build script + Kconfig fragments, and QEMU templates.
 static BUILD_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets");
 
 /// The guest-side source (`cargo-unikernel-init`), cross-compiled inside the container for
@@ -120,11 +119,9 @@ fn make_scripts_executable(build_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for rel in ["kernel/build_kernel.sh", "scripts/make_iso.sh"] {
-            let path = build_dir.join(rel);
-            if path.exists() {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-            }
+        let path = build_dir.join("kernel/build_kernel.sh");
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
     }
     Ok(())

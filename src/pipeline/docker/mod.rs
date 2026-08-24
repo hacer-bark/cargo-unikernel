@@ -54,8 +54,6 @@ pub struct BuildArtifacts {
     pub bzimage: PathBuf,
     /// Host path to the built initramfs.
     pub cpio: PathBuf,
-    /// Host path to the built ISO, if `OutputFormat::Iso` was requested.
-    pub iso: Option<PathBuf>,
     /// Host path to the built UKI `.efi`, if `OutputFormat::Uki` was requested.
     pub uki: Option<PathBuf>,
     /// Host path to the raw app binary, if `OutputFormat::Binary` was requested.
@@ -159,12 +157,17 @@ pub fn run_reproducible_build(
     collect_artifacts(config, &dist_dir, &last_build_dir)
 }
 
-/// `docker build`s the pinned reproducible-toolchain image, returning its tag.
+/// `docker buildx build`s the pinned reproducible-toolchain image, returning its tag.
+///
+/// Uses buildx (not plain `docker build`) so CI can export/import layers via the GitHub
+/// Actions cache backend (`type=gha`) — see `docker_buildx_cache_args`. `--load` puts the
+/// result in the local image store either way, since `docker run` below needs it there.
 fn build_toolchain_image(config: &Config, assets_dir: &Path) -> Result<&'static str> {
     let image_tag = "cargo-unikernel-builder";
     let mut build_cmd = Command::new("docker");
-    build_cmd.args(["build", "--network", "host"]);
-    for (name, value) in build_args_for(&config.toolchain)? {
+    build_cmd.args(["buildx", "build", "--network", "host", "--load"]);
+    build_cmd.args(docker_buildx_cache_args());
+    for (name, value) in build_args_for(&config.toolchain, config.storage.mode)? {
         build_cmd.arg("--build-arg").arg(format!("{name}={value}"));
     }
     let status = build_cmd
@@ -172,11 +175,29 @@ fn build_toolchain_image(config: &Config, assets_dir: &Path) -> Result<&'static 
         .arg(assets_dir.join("build/docker/Dockerfile.reproducible"))
         .arg(assets_dir.join("build"))
         .status()
-        .context("failed to run `docker build`")?;
+        .context("failed to run `docker buildx build`")?;
     if !status.success() {
-        bail!("docker build failed");
+        bail!("docker buildx build failed");
     }
     Ok(image_tag)
+}
+
+/// `--cache-from`/`--cache-to` flags for the GitHub Actions cache backend, only when actually
+/// running in Actions (`GITHUB_ACTIONS=true`) — the generated workflow's "Set up Docker
+/// Buildx" step (`docker/setup-buildx-action`) provisions the `ACTIONS_CACHE_URL`/
+/// `ACTIONS_RUNTIME_TOKEN` these need. A no-op locally, where buildx's default local cache
+/// already applies.
+fn docker_buildx_cache_args() -> Vec<&'static str> {
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        vec![
+            "--cache-from",
+            "type=gha",
+            "--cache-to",
+            "type=gha,mode=max",
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Generates the in-container build script (and, if configured, the extra-Kconfig fragment
@@ -313,7 +334,6 @@ fn collect_artifacts(
             last_build_dir.join(format!("{name}.cpio")),
         )
     };
-    let iso = dist_dir.join(format!("{name}.iso"));
     let uki = dist_dir.join(format!("{name}.efi"));
     let binary = dist_dir.join(format!("{name}.bin"));
     let measurement = dist_dir.join("sev_measurement.txt");
@@ -342,7 +362,6 @@ fn collect_artifacts(
     Ok(BuildArtifacts {
         bzimage,
         cpio,
-        iso: iso.exists().then_some(iso),
         uki: uki.exists().then_some(uki),
         binary: binary.exists().then_some(binary),
         sev_measurement: measurement.exists().then_some(measurement),

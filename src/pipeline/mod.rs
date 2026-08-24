@@ -38,7 +38,7 @@ pub fn build(config: &Config, project_dir: &Path) -> Result<()> {
     let artifacts = docker::run_reproducible_build(config, project_dir, &app_binary)?;
 
     for format in &config.output.formats {
-        image::write(*format, config, project_dir, &artifacts)?;
+        image::write(*format, &artifacts)?;
     }
 
     if config.profile.kind == ProfileKind::SevSnp {

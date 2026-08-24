@@ -1,14 +1,9 @@
 #!/bin/bash
-# Checks the pinned toolchain versions this project builds against (Ubuntu base image,
-# apt snapshot, Rust, Limine, e2fsprogs, and the guest kernel) against upstream, and
-# optionally rewrites the pins in place.
-#
-# Every version here is pinned for reproducibility (see docs/reproducible_builds.md), so
-# "bump" always means "pin to a new exact value plus its verified checksum" — never a loose
-# version range. `cryptography`'s pip install is deliberately unpinned instead (see the
-# comment above it in the Dockerfile) — it's never exercised by this project's own code path,
-# so it can't affect build reproducibility or the real measurement, and always installs
-# whatever's newest with no bump needed.
+# Checks the pinned toolchain versions this project builds against (Ubuntu base image, apt
+# snapshot, Rust, e2fsprogs, and the guest kernel) against upstream, and optionally rewrites
+# the pins in place. "bump" always means pin to a new exact value plus its verified checksum
+# — never a loose version range. (`cryptography`'s pip install is deliberately unpinned
+# instead — see the Dockerfile — so it's not tracked here.)
 #
 # Usage:
 #   bump_toolchain_versions.sh                    # report only
@@ -65,10 +60,8 @@ report_status() {
 }
 
 # ---- Ubuntu base image digest ----------------------------------------------------------
-# Tracks whatever release this Dockerfile is currently on (the `FROM ubuntu:<tag>@sha256:...`
-# line) — bumping to a new Ubuntu *release* (e.g. 26.04 -> 28.04) is a separate, deliberate
-# migration (new codename in the apt-snapshot suite lines, re-verify the default gcc package
-# name, etc.), not something this script does on its own.
+# Only re-resolves the digest for the release already pinned — bumping the Ubuntu release
+# itself (26.04 -> 28.04) is a separate, deliberate migration, not something this does.
 check_ubuntu() {
     local current latest token tag
     tag="$(grep -m1 '^FROM ubuntu:' "$DOCKERFILE" | sed -E 's/^FROM ubuntu:([0-9.]+)@sha256:.*/\1/')"
@@ -98,26 +91,6 @@ check_rust() {
     if report_status "rust" "$current" "$latest" && [ "$WRITE" -eq 1 ]; then
         sed -i "s/^ARG RUST_VERSION=$current/ARG RUST_VERSION=$latest/" "$DOCKERFILE"
         sync_example_docs "s/rust_version = \"$current\"/rust_version = \"$latest\"/"
-    fi
-}
-
-# ---- Limine (needs a real download — no published sha256sums file) --------------------
-check_limine() {
-    local current latest tag latest_sha tmp
-    current="$(grep -m1 '^ARG LIMINE_VERSION=' "$DOCKERFILE" | cut -d= -f2)"
-    tag="$(curl -fsS --max-time 10 https://api.github.com/repos/limine-bootloader/limine/releases/latest | jq -r .tag_name)"
-    latest="${tag#v}"
-    if report_status "limine" "$current" "$latest" && [ "$WRITE" -eq 1 ]; then
-        tmp="$(mktemp)"
-        trap 'rm -f "$tmp"' RETURN
-        curl -fLsS --max-time 60 -o "$tmp" \
-            "https://github.com/limine-bootloader/limine/releases/download/v${latest}/limine-${latest}.tar.gz"
-        latest_sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
-        local current_sha
-        current_sha="$(grep -m1 '^ARG LIMINE_SHA256=' "$DOCKERFILE" | cut -d= -f2)"
-        sed -i "s/^ARG LIMINE_VERSION=$current/ARG LIMINE_VERSION=$latest/" "$DOCKERFILE"
-        sed -i "s/^ARG LIMINE_SHA256=$current_sha/ARG LIMINE_SHA256=$latest_sha/" "$DOCKERFILE"
-        sync_example_docs "s/limine_version = \"$current\"/limine_version = \"$latest\"/"
     fi
 }
 
@@ -169,7 +142,6 @@ check_snapshot() {
 echo "Checking pinned toolchain versions..."
 check_ubuntu
 check_rust
-check_limine
 check_e2fsprogs
 check_kernel
 check_snapshot

@@ -9,25 +9,17 @@
 # removed upstream, has no prompt, or has an unmet dependency, so an unchecked config can claim
 # hardening the built kernel doesn't have.
 #
-# Caching (this is the expensive step in the whole pipeline — the kernel source tarball is
-# ~150MB and a from-scratch build takes minutes):
+# Caching (the expensive step in the pipeline — ~150MB source, minutes to build):
 #   - the downloaded source tarball is cached by version+sha256 under $CACHE_DIR/src/
-#   - ccache covers the actual compiler invocations across builds with the same toolchain
-#   - the *finished* bzImage is cached under $CACHE_DIR/bzimage/<fingerprint>/, where the
-#     fingerprint covers everything that can change the output bytes (kernel version+checksum,
-#     every kconfig fragment, this script, the toolchain versions). A cache hit skips download,
-#     configure, and compile entirely.
+#   - ccache covers compiler invocations across builds with the same toolchain
+#   - the finished bzImage is cached under $CACHE_DIR/bzimage/<fingerprint>/, fingerprinted
+#     on everything that can change the output bytes — a hit skips download/configure/compile.
 set -euo pipefail
 
-# CONFIG_GCC_PLUGIN_RANDSTRUCT reseeds its layout PRNG from the fixed seed generated below,
-# but the plugin's tie-breaking order for that PRNG is influenced by pointer-derived values
-# inside GCC's own process image — which vary run-to-run under ASLR even given an identical
-# fixed seed. Two from-scratch builds of the exact same source+config+toolchain can silently
-# produce a different struct layout (and therefore a different bzImage) purely because of
-# where the kernel randomized the compiler's own address space that run — confirmed: two
-# clean local builds on the same machine differed only in the kernel component, nothing
-# toolchain- or cache-related. Re-exec this whole script with ASLR disabled so every
-# `make`/gcc-plugin invocation below runs in a fixed, deterministic address space instead.
+# CONFIG_GCC_PLUGIN_RANDSTRUCT's tie-breaking order is influenced by GCC's own ASLR'd
+# process layout, so two from-scratch builds of identical source+config can silently produce
+# different struct layouts even with the fixed seed below. Re-exec with ASLR disabled so
+# every `make`/gcc-plugin invocation runs in a fixed address space.
 if [ -z "${CARGO_UNIKERNEL_ASLR_DISABLED:-}" ]; then
     export CARGO_UNIKERNEL_ASLR_DISABLED=1
     exec setarch "$(uname -m)" -R bash "$0" "$@"
@@ -40,9 +32,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE_DIR="${CARGO_UNIKERNEL_KERNEL_CACHE_DIR:-/build/cache}"
 EXTRA_KCONFIG_FILE="${CARGO_UNIKERNEL_EXTRA_KCONFIG_FILE:-}"
 
-# Building this artifact unverified is not a degraded mode worth having, so an absent checksum
-# is a hard failure, not a warning. The host CLI resolves `[kernel].sha256` (or its baked-in
-# default) before generating this script — this is the second line of that same rule.
+# An absent checksum is a hard failure, not a warning — the host CLI already resolves
+# `[kernel].sha256` (or its baked-in default) before generating this script.
 if [ -z "$KERNEL_SHA256" ]; then
     echo "CARGO_UNIKERNEL_KERNEL_SHA256 is not set — refusing to build an unverified kernel." >&2
     echo "Pin \`kernel.sha256\` for version $KERNEL_VER (see kernel.org's sha256sums.asc)." >&2
@@ -53,8 +44,7 @@ fi
 export PATH="/usr/lib/ccache:$PATH"
 export CCACHE_DIR="${CCACHE_DIR:-/root/.cache/ccache}"
 # Hash compiler contents, not mtime+size — the randstruct GCC plugin is rebuilt per source
-# tree and passed as `-fplugin=<path>`, and a path-only match could serve objects built against
-# a stale plugin, reintroducing the non-reproducibility the fixed-seed patch below removes.
+# tree, and a path-only match could serve objects built against a stale plugin.
 export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
 ccache -M 5G >/dev/null 2>&1 || true
 
@@ -80,12 +70,10 @@ CATEGORY_ORDER=(legacy-subsystems.config debug-interfaces.config self-protection
 
 FRAGMENTS=("$SCRIPT_DIR/kconfig/base.config" "$SCRIPT_DIR/kconfig/$PROFILE_FRAGMENT")
 
-# Networking: entirely driven by `[network].mode`, one fragment per protocol so a disabled
-# protocol has no NIC driver/IP stack compiled in at all — not category-gated like the
-# fragments below, since "neither selected" needs its own fragment (explicitly disabling
-# virtio-net) rather than just omitting the others. See kconfig/network/*.config. Both env
-# vars default to "0" (unlike every CATEGORY_ENV entry below, which defaults to enabled) —
-# the host CLI always sets them explicitly either way, this is just the safe fallback.
+# Networking: one fragment per protocol so a disabled protocol has no NIC driver/IP stack
+# compiled in at all. "Neither selected" gets its own fragment (explicitly disabling
+# virtio-net) rather than just omitting the others — see kconfig/network/*.config. Both env
+# vars default to "0" (the host CLI always sets them explicitly; this is just the fallback).
 NET_IPV4="${CARGO_UNIKERNEL_NET_IPV4:-0}"
 NET_IPV6="${CARGO_UNIKERNEL_NET_IPV6:-0}"
 if [ "$NET_IPV4" = "1" ]; then
@@ -105,8 +93,7 @@ for cat in "${CATEGORY_ORDER[@]}"; do
     fi
 done
 
-# FIPS defaults to *disabled* (opposite of every category above) — a compliance-specific
-# opt-in, not something every build should pay kernel size/attack surface for.
+# FIPS defaults to disabled (opposite of every category above) — a compliance opt-in.
 if [ "${CARGO_UNIKERNEL_KHARD_FIPS:-0}" = "1" ]; then
     FRAGMENTS+=("$SCRIPT_DIR/kconfig/categories/fips.config")
 fi
@@ -123,12 +110,8 @@ fi
 
 # --- Parse every fragment up front, into one "last write wins" directive map ---
 #
-# Parsed once rather than streamed straight into `scripts/config`: verify_config below checks
-# against the same resolved map, and a later fragment overriding an earlier one is normal.
-#
-# The loop condition's `|| [ -n "$line" ]` picks up a final line with no trailing newline
-# (`read -r` alone drops it at EOF). CR is stripped too (a CRLF file otherwise produces
-# `scripts/config --enable $'CONFIG_FOO\r'`), and surrounding whitespace is trimmed.
+# Parsed once (not streamed straight into `scripts/config`) so verify_config below can check
+# against the same resolved map; a later fragment overriding an earlier one is normal.
 declare -A DIRECTIVES=()
 DIRECTIVE_ORDER=()
 
@@ -165,9 +148,8 @@ done
 
 # --- Fingerprint ---
 #
-# Covers this script itself and the toolchain versions, not just the config — otherwise
-# editing the randstruct seed below, or bumping the compiler, would cache-hit a bzImage built
-# from the old recipe.
+# Covers this script and the toolchain versions too, not just the config — otherwise editing
+# the randstruct seed below, or bumping the compiler, would cache-hit a stale bzImage.
 fingerprint_input() {
     echo "$KERNEL_VER"
     echo "$KERNEL_SHA256"
@@ -212,25 +194,15 @@ mv "linux-${KERNEL_VER}" linux-kernel
 cd linux-kernel
 
 # CONFIG_GCC_PLUGIN_RANDSTRUCT (self-protection.config) otherwise draws a fresh seed from
-# /dev/urandom on every from-scratch build via this script, producing a genuinely different
-# bzImage each time — even from byte-identical source+config on the same machine. That
-# silently breaks every measurement comparison (local-vs-CI, or just rebuild-vs-rebuild).
-# Replace the seed generator with one that emits a fixed, public seed instead: this is the
-# same trade-off Debian's reproducible-builds project makes for this exact plugin. The
-# structure-layout hardening it buys is against generic/offset-reuse exploitation of a
-# stock kernel, not against an attacker who already has the source and build recipe — which
-# this project's whole measurement/verification model assumes anyway. Must land before the
-# first `make` invocation below (scripts/basic/randstruct.seed is generated lazily, the
-# first time anything triggers it, not necessarily during the final `make bzImage`).
+# /dev/urandom on every from-scratch build, breaking every measurement comparison. Replace
+# the seed generator with a fixed, public one instead (same trade-off Debian's
+# reproducible-builds project makes for this plugin). Must land before the first `make`
+# below — the seed file is generated lazily, not necessarily during the final bzImage build.
 cat > scripts/gen-randstruct-seed.sh <<'RANDSTRUCT_SEED_EOF'
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0
-# Fixed, public seed — see build_kernel.sh. Deterministic structure-layout randomization,
-# not a security secret; reproducible builds require this to be constant across runs.
-#
-# randomize_layout_plugin.c parses this with `sscanf(seed, "%016llx%016llx%016llx%016llx", ...)`
-# and rejects anything whose strlen() isn't exactly 64 (four 16-hex-digit u64 words, no
-# separators, no 0x prefix) — sha256 output is a convenient source of exactly that shape.
+# Fixed, public seed — not a secret, just needed constant for reproducible builds.
+# randomize_layout_plugin.c expects exactly 64 hex chars (sha256 output fits that shape).
 SEED=$(echo -n "unikarnel-fixed-randstruct-seed" | sha256sum | cut -d" " -f1)
 echo "$SEED" > "$1"
 HASH=$(echo -n "$SEED" | sha256sum | cut -d" " -f1)
@@ -257,10 +229,9 @@ make olddefconfig
 
 # --- Verify every directive actually took ---
 #
-# `make olddefconfig` discards anything it can't satisfy, silently. A dropped symbol is how a
-# rename (CONFIG_RETPOLINE -> CONFIG_MITIGATION_RETPOLINE), an upstream removal, or a missed
-# dependency shows up: as nothing at all. Failing the build beats warning — these are security
-# options.
+# `make olddefconfig` silently discards anything it can't satisfy — a renamed symbol, an
+# upstream removal, or a missed dependency all show up as nothing at all. Fail the build
+# rather than warn: these are security options.
 verify_config() {
     local key directive expected actual failures=0
     for key in "${DIRECTIVE_ORDER[@]}"; do
@@ -317,13 +288,9 @@ export KBUILD_BUILD_HOST="buildhost"
 export KBUILD_BUILD_VERSION="1"
 export SOURCE_DATE_EPOCH=0
 
-# CONFIG_GCC_PLUGIN_LATENT_ENTROPY (self-protection.config) seeds its injected build-time
-# entropy from GCC's own get_random_seed(true), which is a completely separate mechanism from
-# the randstruct plugin's seed file above: with no `-frandom-seed` on the command line it
-# returns 0, and the plugin's own fallback then reads /dev/urandom directly at compile time —
-# genuinely random on every single invocation, unrelated to ASLR/PID/the machine, so the
-# `setarch -R` re-exec above does nothing for it. `-frandom-seed` makes get_random_seed(true)
-# derive a fixed, deterministic non-zero value from this string instead.
+# CONFIG_GCC_PLUGIN_LATENT_ENTROPY reads /dev/urandom directly at compile time unless GCC
+# gets `-frandom-seed` — a separate mechanism from the randstruct seed file above, and the
+# ASLR re-exec doesn't help it either. This pins it to a fixed, deterministic value instead.
 export KCFLAGS="${KCFLAGS:-} -frandom-seed=unikarnel-fixed-latent-entropy-seed"
 make -j"$(nproc)" bzImage
 ccache -s || true

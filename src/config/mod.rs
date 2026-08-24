@@ -55,7 +55,6 @@ pub fn load(path: &Path) -> Result<Config> {
             path.display()
         )
     })?;
-    config.toolchain.warn_if_limine_unverified();
     config.toolchain.warn_if_e2fsprogs_unverified();
     config
         .validate()

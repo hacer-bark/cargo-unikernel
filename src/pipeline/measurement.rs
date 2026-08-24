@@ -146,7 +146,6 @@ mod tests {
         let artifacts = BuildArtifacts {
             bzimage: PathBuf::from("/build/bzImage"),
             cpio: PathBuf::from("/build/initrd.cpio"),
-            iso: None,
             uki: None,
             binary: None,
             sev_measurement: Some(measurement_path),
@@ -189,7 +188,6 @@ mod tests {
         let artifacts = BuildArtifacts {
             bzimage: PathBuf::from("/build/bzImage"),
             cpio: PathBuf::from("/build/initrd.cpio"),
-            iso: None,
             uki: None,
             binary: None,
             sev_measurement: Some(dir.join("dist/sev_measurement.txt")),
@@ -221,7 +219,6 @@ mod tests {
         let artifacts = BuildArtifacts {
             bzimage: PathBuf::from("/build/bzImage"),
             cpio: PathBuf::from("/build/initrd.cpio"),
-            iso: None,
             uki: None,
             binary: None,
             sev_measurement: None,

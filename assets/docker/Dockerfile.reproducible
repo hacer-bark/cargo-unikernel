@@ -1,39 +1,29 @@
+# syntax=docker/dockerfile:1
+#
+# Built via `docker buildx build`, cached layer-by-layer through the GitHub Actions cache
+# backend (`--cache-from/--cache-to type=gha`) in CI — see src/github.rs and
+# pipeline::docker::build_toolchain_image. Layers below are ordered least- to most-volatile
+# (apt/system setup first, version-pinned toolchain installs last) so a bump to
+# RUST_VERSION or E2FSPROGS_VERSION only invalidates the cache from that layer down.
 FROM ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
 
 # Avoid tzdata prompts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# Bootstrap ca-certificates using the base image's own default sources (plain HTTP —
-# archive.ubuntu.com/security.ubuntu.com, whatever the image ships) before switching apt
-# over to an HTTPS-only mirror below. Without this, apt has no CA trust store yet and
-# fails TLS verification against snapshot.ubuntu.com with "Certificate verification
-# failed: ... issuer is unknown" on a bare base image. ca-certificates' own version isn't
-# pinned by this step, but that only affects which root CAs are trusted, not the
-# toolchain packages that actually determine build output — those are pinned below.
+# Bootstrap ca-certificates from the base image's own default (HTTP) sources before
+# switching apt to the HTTPS-only snapshot mirror below — otherwise TLS verification
+# against snapshot.ubuntu.com fails with no CA trust store yet.
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Pin apt itself to a frozen point-in-time mirror (snapshot.ubuntu.com), not the live
-# archive. The base image above is pinned by digest, but `apt-get install` against the
-# live Ubuntu archive resolves to whatever package versions (gcc, binutils, musl-tools,
-# ...) happen to be current *the day the image is built* — which drifts over time and
-# between machines. Two builds from the exact same Dockerfile, weeks apart, can silently
-# link against a different libc/compiler and produce a different bzImage/binary, which
-# breaks reproducibility (and SEV-SNP measurement comparison) even though nothing in this
-# repo changed. Freezing all four suites (release/updates/security/backports) to the same
-# snapshot timestamp makes `apt-get install` resolve identically forever, on any machine,
-# regardless of when the image is actually built. `Check-Valid-Until=false` is required
-# because a historical snapshot's own Release file has a short-lived Valid-Until date that
-# has long since passed by the time anyone builds this image.
+# Pin apt to a frozen snapshot.ubuntu.com timestamp instead of the live archive, so two
+# builds of this Dockerfile weeks apart resolve gcc/binutils/musl-tools/etc. to the same
+# versions — otherwise reproducibility (and SEV-SNP measurement comparison) silently
+# breaks even with no repo changes. `Check-Valid-Until=false`: a historical snapshot's own
+# Release file always has a long-since-passed Valid-Until date.
 #
-# The dist-upgrade step right below forces every package already on the base image down
-# (or up) to match this timestamp, so SNAPSHOT_TS no longer has to stay >= whatever point
-# release the pinned base image digest was built from — any SNAPSHOT_TS/base-digest pair
-# works, including rebuilding against an old SNAPSHOT_TS years after the base digest above
-# was published.
-#
-# Overridable via `[toolchain].apt_snapshot` in cargo-unikernel.toml (`--build-arg
-# SNAPSHOT_TS=...`, see pipeline::docker::build_args_for) — see docs/reproducible_builds.md.
+# Overridable via `[toolchain].apt_snapshot` (`--build-arg SNAPSHOT_TS=...`, see
+# pipeline::docker::build_args_for) — see docs/reproducible_builds.md.
 ARG SNAPSHOT_TS=20260820T000000Z
 RUN rm -f /etc/apt/sources.list.d/ubuntu.sources && \
     printf 'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s resolute main restricted universe multiverse\n\
@@ -44,63 +34,39 @@ deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s resolute-backpo
     > /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
 
-# Force every package already on the base image (openssl, libc, ...) to the snapshot's
-# versions, not just the ones we explicitly install below. Without this, a package baked
-# into the base image can be *newer* than SNAPSHOT_TS — apt refuses to downgrade an
-# already-installed package to satisfy a dependency, so `apt-get install` later fails with
-# "unmet dependencies" (this happened with libssl3t64 vs. libssl-dev). --allow-downgrades
-# makes SNAPSHOT_TS the single source of truth for every package version regardless of
-# which base image digest or how much later this is rebuilt, so the exact same Dockerfile
-# keeps producing an identical package set even years from now, independent of whatever
-# `ubuntu:26.04` digest happens to be pinned above.
+# Force every already-installed package (openssl, libc, ...) down/up to the snapshot's
+# versions too, not just what's installed below — otherwise a package newer than
+# SNAPSHOT_TS on the base image causes "unmet dependencies" (seen with libssl3t64 vs.
+# libssl-dev), since apt won't downgrade to satisfy a dependency without the flag.
 RUN apt-get update && apt-get -y --allow-downgrades dist-upgrade
 
-# Install build dependencies exactly as we need them
+# --allow-downgrades again: this step pulls in *new* packages (systemd-boot-efi/
+# systemd-ukify) whose dependency graph can pin an exact-version sibling that conflicts
+# with a shared lib already resolved earlier in the same solve, even though every version
+# in play comes from the one pinned SNAPSHOT_TS.
 #
-# --allow-downgrades here too, not just on the dist-upgrade above: dist-upgrade only touches
-# packages already present on the base image, but this step pulls in *new* packages (e.g.
-# systemd-boot-efi/systemd-ukify, not on the base image at all) whose own dependency graph
-# can point at an exact-version sibling (e.g. `systemd (= X)`) that conflicts with a shared
-# lib (e.g. libsystemd0) already resolved to a different point release earlier in this same
-# solve — apt refuses that implicit downgrade without the flag and fails with "you have held
-# broken packages" even though every version in play still comes from the one pinned
-# SNAPSHOT_TS.
-#
-# gcc-15-plugin-dev (build-essential's default gcc on resolute is gcc-15): the guest kernel
-# config requests CONFIG_GCC_PLUGIN_LATENT_ENTROPY/CONFIG_RANDSTRUCT_FULL/CONFIG_KSTACK_ERASE,
-# all gated on CONFIG_GCC_PLUGINS in scripts/gcc-plugins/Kconfig, which itself probes for
-# `$(gcc -print-file-name=plugin)/include/plugin-version.h` at Kconfig time. Without this
-# package that header doesn't exist, GCC_PLUGINS silently resolves to n, and all three requested
-# options get dropped by `make olddefconfig` with no build error until build_kernel.sh's own
-# verify_config check catches it.
+# gcc-15-plugin-dev: the guest kernel's GCC-plugin hardening options (latent-entropy,
+# randstruct, kstack-erase) are gated on CONFIG_GCC_PLUGINS, which needs this package's
+# plugin headers — without it they silently drop during `make olddefconfig` with no error
+# until build_kernel.sh's own verify_config check catches it.
 RUN apt-get update && apt-get install -y --allow-downgrades \
-    build-essential gcc-15-plugin-dev flex bison libssl-dev libelf-dev wget cpio jq python3 python3-pip ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
-    xorriso systemd-ukify systemd-boot-efi nasm mtools
+    build-essential gcc-15-plugin-dev cpio jq python3 python3-pip ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
+    systemd-ukify systemd-boot-efi flex bison libssl-dev libelf-dev wget
 
-# musl-tools no longer symlinks the Linux kernel headers (linux-libc-dev provides these only
-# for glibc's include paths: /usr/include/linux, /usr/include/asm-generic, and the
-# x86_64-linux-gnu multiarch dir) into musl's own include tree
-# (/usr/include/x86_64-linux-musl). Without this, any crate whose C sources reach for kernel
-# UAPI headers under musl — e.g. aws-lc-fips-sys's urandom.c including <linux/random.h> for its
-# FIPS entropy source — fails with "fatal error: linux/random.h: No such file or directory"
-# when cross-compiling to x86_64-unknown-linux-musl.
+# musl-tools no longer symlinks the Linux kernel UAPI headers (linux-libc-dev only provides
+# them under glibc's include paths) into musl's own include tree. Without this, any crate
+# whose C sources include kernel headers directly (e.g. aws-lc-fips-sys's <linux/random.h>)
+# fails to cross-compile to x86_64-unknown-linux-musl.
 RUN ln -s /usr/include/linux /usr/include/x86_64-linux-musl/linux && \
     ln -s /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
     ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
 
-# `sev-snp-measure` (git-cloned at build-script runtime with no commit pin — see the comment
-# in pipeline::docker::script_sev_snp_measurement: it only *predicts* the launch measurement
-# for local convenience/verification and has no influence on the actual boot image bytes or
-# on the hardware-computed measurement AMD's Secure Processor produces at launch, so there is
-# nothing here for a pin to make "more reproducible") declares `cryptography>=39.0.1` as a
-# runtime dependency in its own setup.cfg, but nothing installs it — the specific invocation
-# this project makes (`--mode snp`) doesn't currently exercise the one module that imports it
-# (`id_block.py`, used only by the separate `snp-create-id-block` entry point), so this has
-# gone unnoticed. Install it so a future sev-snp-measure update that starts eagerly importing
-# it doesn't silently break the build. Unpinned and unverified deliberately: since this
-# package is never exercised by this project's own call path, it can't affect build
-# reproducibility or the real measurement either way, so there's nothing here worth the
-# version-pin/hash-verify ceremony the rest of this file uses for pins that do matter.
+# `sev-snp-measure` (cloned at build-script runtime — see script_sev_snp_measurement)
+# declares `cryptography` as a dependency but nothing installs it; the module that needs
+# it isn't exercised by this project's `--mode snp` invocation today, but a future
+# sev-snp-measure update could start importing it eagerly. Deliberately unpinned: since
+# it's never on this project's actual call path, it can't affect reproducibility or the
+# measurement either way.
 RUN pip3 install --break-system-packages --no-cache-dir --no-deps cryptography
 
 # Install a specific, fixed version of Rust. Overridable via `[toolchain].rust_version`.
@@ -109,57 +75,33 @@ RUN curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y --de
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup target add x86_64-unknown-linux-musl
 
-# Limine bootloader, pinned by release tag + checksum (used for ISO output — see
-# assets/scripts/make_iso.sh). Ubuntu doesn't package Limine, so it's fetched and built
-# from a pinned, checksum-verified source tarball rather than trusting a prebuilt binary.
-# Built with plain gcc/binutils (no clang/lld needed — confirmed against upstream's
-# configure, which only requires CC_FOR_TARGET/LD_FOR_TARGET etc. point at *something*
-# ELF-capable). Installed flat into /opt/limine to match what make_iso.sh expects
-# ($LIMINE_DIR/{limine-bios.sys,limine-bios-cd.bin,limine-uefi-cd.bin,limine}).
-# Overridable via `[toolchain].limine_version`/`limine_sha256`.
-ARG LIMINE_VERSION=12.6.0
-ARG LIMINE_SHA256=3177b8a64297667a379feb3af6405b13c536409ce46d712ea1233e9ed1f87b9a
-RUN curl -fL -o /tmp/limine.tar.gz \
-        "https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VERSION}/limine-${LIMINE_VERSION}.tar.gz" && \
-    echo "${LIMINE_SHA256}  /tmp/limine.tar.gz" | sha256sum -c - && \
-    mkdir -p /tmp/limine-src && tar -xzf /tmp/limine.tar.gz -C /tmp/limine-src --strip-components=1 && \
-    cd /tmp/limine-src && \
-    CC=gcc CC_FOR_TARGET=gcc LD_FOR_TARGET=ld OBJCOPY_FOR_TARGET=objcopy OBJDUMP_FOR_TARGET=objdump READELF_FOR_TARGET=readelf \
-        ./configure --prefix=/opt/limine-install \
-        --enable-bios --enable-bios-cd --enable-uefi-x86-64 --enable-uefi-cd && \
-    make -j"$(nproc)" && make install && \
-    mkdir -p /opt/limine && \
-    cp /opt/limine-install/share/limine/limine-bios.sys /opt/limine/ && \
-    cp /opt/limine-install/share/limine/limine-bios-cd.bin /opt/limine/ && \
-    cp /opt/limine-install/share/limine/limine-uefi-cd.bin /opt/limine/ && \
-    cp /opt/limine-install/bin/limine /opt/limine/ && \
-    rm -rf /tmp/limine.tar.gz /tmp/limine-src /opt/limine-install
-
-# Statically-linked `mke2fs`, bundled into `storage-persistent` images (see
-# pipeline::docker::rootfs_script) so the guest can format `/dev/vda` as ext4 — there is no
-# userspace at all in the guest's own initramfs to do this otherwise. `--enable-libuuid
-# --enable-libblkid` builds e2fsprogs' own private copies of those instead of linking the
-# host's shared libuuid/libblkid, which a static build can't use anyway. Everything not needed
-# to run `mke2fs -t ext4` (fsck, debugfs, e2image, resize2fs, fuse2fs, uuidd, mmp, tdb) is
-# trimmed. Depends on the musl kernel-header symlinks above (linux/unistd.h etc.) — this exact
-# configure/make recipe was verified to produce a working static binary before landing here.
-# Overridable via `[toolchain].e2fsprogs_version`/`e2fsprogs_sha256`.
+# Statically-linked `mke2fs`, bundled into `storage.mode = "persistent"` images (see
+# pipeline::docker::rootfs_script) so the guest can format `/dev/vda` as ext4 — there's no
+# userspace in the guest's own initramfs to do this otherwise. Everything not needed for
+# `mke2fs -t ext4` (fsck, debugfs, resize2fs, fuse2fs, uuidd, ...) is trimmed. Overridable
+# via `[toolchain].e2fsprogs_version`/`e2fsprogs_sha256`.
+#
+# BUILD_E2FSPROGS (derived from `[storage].mode` — see
+# pipeline::docker::helpers::build_args_for) skips this step entirely for RAM-mode.
+ARG BUILD_E2FSPROGS=0
 ARG E2FSPROGS_VERSION=1.47.4
 ARG E2FSPROGS_SHA256=da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96
-RUN curl -fL -o /tmp/e2fsprogs.tar.gz \
-        "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz" && \
-    echo "${E2FSPROGS_SHA256}  /tmp/e2fsprogs.tar.gz" | sha256sum -c - && \
-    mkdir -p /tmp/e2fsprogs-src && tar -xzf /tmp/e2fsprogs.tar.gz -C /tmp/e2fsprogs-src --strip-components=1 && \
-    cd /tmp/e2fsprogs-src && \
-    CC=musl-gcc ./configure \
-        --disable-nls --disable-uuidd --disable-tls --disable-defrag --disable-debugfs \
-        --disable-imager --disable-resizer --disable-backtrace --disable-fuse2fs \
-        --disable-mmp --disable-tdb --enable-libuuid --enable-libblkid --without-libarchive \
-        LDFLAGS=-static && \
-    make -j"$(nproc)" && \
-    mkdir -p /opt/e2fsprogs/sbin && \
-    cp misc/mke2fs /opt/e2fsprogs/sbin/mke2fs && \
-    strip /opt/e2fsprogs/sbin/mke2fs && \
-    rm -rf /tmp/e2fsprogs.tar.gz /tmp/e2fsprogs-src
+RUN if [ "$BUILD_E2FSPROGS" = "1" ]; then \
+        curl -fL -o /tmp/e2fsprogs.tar.gz \
+            "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz" && \
+        echo "${E2FSPROGS_SHA256}  /tmp/e2fsprogs.tar.gz" | sha256sum -c - && \
+        mkdir -p /tmp/e2fsprogs-src && tar -xzf /tmp/e2fsprogs.tar.gz -C /tmp/e2fsprogs-src --strip-components=1 && \
+        cd /tmp/e2fsprogs-src && \
+        CC=musl-gcc ./configure \
+            --disable-nls --disable-uuidd --disable-tls --disable-defrag --disable-debugfs \
+            --disable-imager --disable-resizer --disable-backtrace --disable-fuse2fs \
+            --disable-mmp --disable-tdb --enable-libuuid --enable-libblkid --without-libarchive \
+            LDFLAGS=-static && \
+        make -j"$(nproc)" && \
+        mkdir -p /opt/e2fsprogs/sbin && \
+        cp misc/mke2fs /opt/e2fsprogs/sbin/mke2fs && \
+        strip /opt/e2fsprogs/sbin/mke2fs && \
+        rm -rf /tmp/e2fsprogs.tar.gz /tmp/e2fsprogs-src ; \
+    fi
 
 WORKDIR /workspace

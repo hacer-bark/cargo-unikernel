@@ -10,7 +10,7 @@
 
 <br/>
 
-> **0.0.1, pre-release.** Config schema, CLI flags, and the generated GitHub Actions workflow
+> **0.0.x, pre-release.** Config schema, CLI flags, and the generated GitHub Actions workflow
 > can change between versions without warning. Pin an exact version
 > (`project.cargo_unikernel_version` in `Cargo-Unikernel.toml`) and re-verify on upgrade.
 
@@ -21,8 +21,9 @@ cargo unikernel build
 ```
 
 No config file needed — `cargo install` puts the binary on `PATH`, Cargo's external-subcommand
-convention picks it up, and it works from any project directory. Output is `.iso`, `.cpio`+kernel,
-UKI, or a raw binary, with an optional AMD SEV-SNP profile.
+convention picks it up, and it works from any project directory. Output is `.cpio`+kernel,
+UKI, or a raw binary, with an optional AMD SEV-SNP profile. (Need a bootable ISO? See
+[`docs/building_an_iso.md`](docs/building_an_iso.md) for assembling one yourself.)
 
 **Any language works.** Rust needs zero config. Bring a pre-built binary in anything, or point
 the tool at a build command (Go, Zig, C, ...) for the same reproducible build Rust gets. See
@@ -64,7 +65,7 @@ Inside: the kernel builds from pinned source with a curated hardening profile, t
 compiles (or, for a pre-built binary, is verified and staged) and is checked for static
 linking, the guest init cross-compiles alongside it, and everything assembles into a rootfs
 and packs into the requested formats. Every build dependency beyond your own project —
-Dockerfile, kernel Kconfig, ISO/UKI tooling, guest init source — is embedded in the
+Dockerfile, kernel Kconfig, UKI tooling, guest init source — is embedded in the
 `cargo-unikernel` binary itself.
 
 Full pipeline stage by stage: [`docs/architecture.md`](docs/architecture.md).
@@ -216,25 +217,23 @@ different OVMF builds — `[sev_snp.ovmf]` also accepts a local `path` (never a 
 `examples/Cargo-Unikernel.sev-snp.toml`.
 
 Build sev-snp via a tagged release workflow so the measurement corresponds to an immutable
-commit rather than uncommitted local state. ISO output works for sev-snp too as a
-convenience/testing artifact — the measured artifact is always cpio+bzImage or UKI. A benign
-`xorriso ... WARNING: EFI boot equipment is provided but no directory /EFI/BOOT` may appear
-during ISO builds — see [`docs/architecture.md`](docs/architecture.md) if that looks alarming.
+commit rather than uncommitted local state. The measured artifact is always cpio+bzImage or
+UKI; if you need a convenience/testing ISO too, see
+[`docs/building_an_iso.md`](docs/building_an_iso.md).
 
 ## Minimum supported Rust version
 
 **Rust 1.88+** — config-validation code relies on `if let` chains, stabilized in 1.88. This
 is what's needed to build `cargo-unikernel` itself; it has no bearing on your app's own
 toolchain, pinned independently inside the build container (see
-[`docs/reproducible_builds.md`](docs/reproducible_builds.md)). MSRV bumps are minor-version
-changes while the crate stays pre-1.0.
+[`docs/reproducible_builds.md`](docs/reproducible_builds.md)).
 
 ## Project layout
 
 ```
 Cargo.toml    the published CLI crate itself — `cargo install cargo-unikernel`
 src/          CLI, config schema, build pipeline
-assets/       Dockerfile, kernel build script + Kconfig, ISO script,
+assets/       Dockerfile, kernel build script + Kconfig,
               baked-in SEV-SNP OVMF firmware — embedded into the binary
 guest/        SEPARATE nested workspace: cargo-unikernel-init (the
               guest PID-1) + cargo-unikernel-common (shared mount/
@@ -262,6 +261,8 @@ Start at [`docs/README.md`](docs/README.md) for the full index. Direct links:
   each profile.
 - [`docs/reproducible_builds.md`](docs/reproducible_builds.md) — the determinism story, and
   how to verify a build independently.
+- [`docs/building_an_iso.md`](docs/building_an_iso.md) — assembling a bootable ISO yourself
+  from a `cpio`+`bzImage` or `uki` build.
 
 ## License
 

@@ -39,7 +39,7 @@ pub enum Command {
         /// Zero-config only: embed this pre-built binary instead of compiling the cwd.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// Comma-separated override of output.formats, e.g. cpio,iso,uki,binary
+        /// Comma-separated override of output.formats, e.g. cpio,uki,binary
         #[arg(long, value_delimiter = ',')]
         format: Option<Vec<String>>,
         /// Override `profile.kind`.

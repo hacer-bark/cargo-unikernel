@@ -1,4 +1,4 @@
-use crate::schema::{Config, ToolchainPins};
+use crate::schema::{Config, StorageMode, ToolchainPins};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -82,7 +82,14 @@ pub fn shell_quote(s: &str) -> String {
 /// `docker build --build-arg` pairs for any `[toolchain]` override — empty when nothing is
 /// set, so `Dockerfile.reproducible`'s own `ARG NAME=<default>` applies silently. See
 /// `docs/reproducible_builds.md`.
-pub(super) fn build_args_for(toolchain: &ToolchainPins) -> Result<Vec<(String, String)>> {
+///
+/// Always includes `BUILD_E2FSPROGS`, derived from `[storage].mode`: compiling the static
+/// `mke2fs` costs real build time, so the Dockerfile only does it for a project that actually
+/// requests persistent storage.
+pub(super) fn build_args_for(
+    toolchain: &ToolchainPins,
+    storage_mode: StorageMode,
+) -> Result<Vec<(String, String)>> {
     let mut args = Vec::new();
     if let Some(snapshot) = &toolchain.apt_snapshot {
         let resolved = if snapshot == "latest" {
@@ -94,8 +101,6 @@ pub(super) fn build_args_for(toolchain: &ToolchainPins) -> Result<Vec<(String, S
     }
     for (name, value) in [
         ("RUST_VERSION", &toolchain.rust_version),
-        ("LIMINE_VERSION", &toolchain.limine_version),
-        ("LIMINE_SHA256", &toolchain.limine_sha256),
         ("E2FSPROGS_VERSION", &toolchain.e2fsprogs_version),
         ("E2FSPROGS_SHA256", &toolchain.e2fsprogs_sha256),
     ] {
@@ -103,6 +108,12 @@ pub(super) fn build_args_for(toolchain: &ToolchainPins) -> Result<Vec<(String, S
             args.push((name.to_string(), v.clone()));
         }
     }
+    let build_e2fsprogs = if matches!(storage_mode, StorageMode::Persistent) {
+        "1"
+    } else {
+        "0"
+    };
+    args.push(("BUILD_E2FSPROGS".to_string(), build_e2fsprogs.to_string()));
     Ok(args)
 }
 
@@ -131,7 +142,6 @@ pub(super) fn print_toolchain_overrides(toolchain: &ToolchainPins) {
     let overrides: Vec<String> = [
         ("apt_snapshot", &toolchain.apt_snapshot),
         ("rust_version", &toolchain.rust_version),
-        ("limine_version", &toolchain.limine_version),
         ("e2fsprogs_version", &toolchain.e2fsprogs_version),
     ]
     .into_iter()
@@ -175,9 +185,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_args_for_is_empty_when_nothing_overridden() {
+    fn build_args_for_only_passes_build_e2fsprogs_when_nothing_overridden() {
         let toolchain = ToolchainPins::default();
-        assert!(build_args_for(&toolchain).unwrap().is_empty());
+        assert_eq!(
+            build_args_for(&toolchain, StorageMode::Ram).unwrap(),
+            vec![("BUILD_E2FSPROGS".to_string(), "0".to_string())]
+        );
     }
 
     #[test]
@@ -185,19 +198,25 @@ mod tests {
         let toolchain = ToolchainPins {
             apt_snapshot: Some("20250101T000000Z".to_string()),
             rust_version: Some("1.99.0".to_string()),
-            limine_version: None,
-            limine_sha256: None,
             e2fsprogs_version: None,
             e2fsprogs_sha256: None,
         };
-        let args = build_args_for(&toolchain).unwrap();
+        let args = build_args_for(&toolchain, StorageMode::Ram).unwrap();
         assert_eq!(
             args,
             vec![
                 ("SNAPSHOT_TS".to_string(), "20250101T000000Z".to_string()),
                 ("RUST_VERSION".to_string(), "1.99.0".to_string()),
+                ("BUILD_E2FSPROGS".to_string(), "0".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn build_args_for_enables_build_e2fsprogs_for_persistent_storage() {
+        let toolchain = ToolchainPins::default();
+        let args = build_args_for(&toolchain, StorageMode::Persistent).unwrap();
+        assert!(args.contains(&("BUILD_E2FSPROGS".to_string(), "1".to_string())));
     }
 
     #[test]
@@ -206,9 +225,11 @@ mod tests {
             apt_snapshot: Some("latest".to_string()),
             ..ToolchainPins::default()
         };
-        let args = build_args_for(&toolchain).unwrap();
-        assert_eq!(args.len(), 1);
-        let (name, value) = &args[0];
+        let args = build_args_for(&toolchain, StorageMode::Ram).unwrap();
+        let (name, value) = args
+            .iter()
+            .find(|(name, _)| name == "SNAPSHOT_TS")
+            .expect("SNAPSHOT_TS must be present");
         assert_eq!(name, "SNAPSHOT_TS");
         assert_ne!(value, "latest");
         assert_eq!(value.len(), 16, "expected YYYYMMDDTHHMMSSZ, got {value}");

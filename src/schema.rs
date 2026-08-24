@@ -467,24 +467,19 @@ impl Kernel {
 
 /// `[toolchain]` — overrides for the reproducible-build toolchain this CLI pins by default.
 ///
-/// Covers the apt package snapshot, Rust, Limine, and e2fsprogs pins — see
+/// Covers the apt package snapshot, Rust, and e2fsprogs pins — see
 /// `docs/reproducible_builds.md`. All optional; omit to use this CLI version's tested
 /// defaults. Overriding any of these makes the build reproducible given that exact pin, not
 /// comparable to a build using this CLI version's own defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolchainPins {
     /// `snapshot.ubuntu.com` timestamp (`YYYYMMDDTHHMMSSZ`) apt resolves gcc/binutils/
-    /// musl-tools/python3/xorriso/systemd-ukify/golang/cpio against. `"latest"` resolves to
+    /// musl-tools/python3/systemd-ukify/golang/cpio against. `"latest"` resolves to
     /// right now at build time — casual profile only, rejected for sev-snp.
     pub apt_snapshot: Option<String>,
     /// `rustup --default-toolchain` version used to build `cargo-unikernel-init` and Mode A
     /// Rust apps.
     pub rust_version: Option<String>,
-    /// Limine bootloader release tag (ISO output only).
-    pub limine_version: Option<String>,
-    /// sha256 of the Limine release tarball. Recommended whenever `limine_version` is set —
-    /// warns (not rejected) if omitted.
-    pub limine_sha256: Option<String>,
     /// `e2fsprogs` release used to build the static `mke2fs` bundled into `storage-persistent`
     /// images (`[storage].mode = "persistent"` only).
     pub e2fsprogs_version: Option<String>,
@@ -494,20 +489,8 @@ pub struct ToolchainPins {
 }
 
 impl ToolchainPins {
-    /// Warns (doesn't reject) if `limine_version` was overridden without a matching
-    /// `limine_sha256` — mirrors `Kernel::fill_default_sha256_or_warn`, but there's no
-    /// baked-in hash to fall back to once the version itself has changed.
-    pub fn warn_if_limine_unverified(&self) {
-        if self.limine_version.is_some() && self.limine_sha256.is_none() {
-            eprintln!(
-                "[WARN] toolchain.limine_version is set without toolchain.limine_sha256 — the \
-                 downloaded Limine release will NOT be integrity-checked. Pin \
-                 `toolchain.limine_sha256` (see the release's published checksum) to verify it."
-            );
-        }
-    }
-
-    /// Same as [`Self::warn_if_limine_unverified`], for `e2fsprogs_version`.
+    /// Warns (doesn't reject) if `e2fsprogs_version` was overridden without a matching
+    /// `e2fsprogs_sha256`.
     pub fn warn_if_e2fsprogs_unverified(&self) {
         if self.e2fsprogs_version.is_some() && self.e2fsprogs_sha256.is_none() {
             eprintln!(
@@ -684,8 +667,6 @@ pub enum MeasuredBoot {
 pub enum OutputFormat {
     /// `cpio` initramfs + `bzImage`, for `-initrd`/`-kernel` style boot.
     Cpio,
-    /// A bootable ISO (via Limine), for local testing.
-    Iso,
     /// A Unified Kernel Image — kernel + initrd + cmdline assembled into one `.efi`.
     Uki,
     /// The raw app binary (`$APP_BIN`), copied into `dist/` unmodified alongside whatever
@@ -746,8 +727,6 @@ pub enum ReleaseAsset {
     Bzimage,
     /// `dist/<name>.cpio`.
     Cpio,
-    /// `dist/<name>.iso`.
-    Iso,
     /// `dist/<name>.efi`.
     Uki,
     /// `dist/<name>.bin` (the raw app binary, `OutputFormat::Binary`).

@@ -41,17 +41,6 @@ jobs:
         with:
           prefix-key: v1-sev-snp-server-example-cli
 
-      # `~/.cache/cargo-unikernel` holds ccache's object cache alongside the downloaded
-      # kernel source and cargo registry — the key must include everything that determines
-      # the embedded toolchain (assets/**, guest/**: exactly what src/assets.rs's own
-      # content_fingerprint() hashes into the built binary), not just this example's config.
-      # Keying on the config alone let a toolchain change (e.g. a Dockerfile/kernel-version
-      # bump) fall through the restore-keys fallback to a ccache directory built under the
-      # *previous* toolchain — ccache is supposed to reject a cross-toolchain hit on its own,
-      # but relying on that instead of just keying the cache correctly can produce a build
-      # that silently differs from a clean one. Restore-keys still falls back across just
-      # this example's config changes within the same toolchain, since that reuse is
-      # genuinely safe.
       - name: cache cargo-unikernel build state (kernel source, ccache, cargo registry)
         uses: actions/cache@v6
         with:

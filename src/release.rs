@@ -22,7 +22,6 @@ fn candidate_assets(config: &Config, dist_dir: &Path) -> Vec<(ReleaseAsset, Path
             dist_dir.join(format!("{name}.bzImage")),
         ),
         (ReleaseAsset::Cpio, dist_dir.join(format!("{name}.cpio"))),
-        (ReleaseAsset::Iso, dist_dir.join(format!("{name}.iso"))),
         (ReleaseAsset::Uki, dist_dir.join(format!("{name}.efi"))),
         (ReleaseAsset::Binary, dist_dir.join(format!("{name}.bin"))),
         (
