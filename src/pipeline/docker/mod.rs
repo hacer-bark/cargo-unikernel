@@ -245,6 +245,21 @@ fn run_build_container(
 
     let mut cmd = Command::new("docker");
     cmd.args(["run", "--rm", "--network", "host"]);
+    // Docker's own default seccomp profile (vendored at assets/docker/seccomp-personality.json,
+    // Apache-2.0, from github.com/moby/profiles) blocks `personality(ADDR_NO_RANDOMIZE)` —
+    // it only allow-lists a handful of benign personality values, none of which disable ASLR.
+    // build_kernel.sh needs that syscall to make CONFIG_GCC_PLUGIN_RANDSTRUCT's struct-layout
+    // randomization reproducible across builds (its internal tie-breaking is influenced by
+    // GCC's own ASLR'd process layout, even with a fixed seed). This is Docker's default
+    // profile plus exactly that one additional rule — everything else stays as locked down as
+    // a stock `docker run` — rather than `--security-opt seccomp=unconfined`, which would drop
+    // syscall filtering entirely for this container.
+    cmd.arg("--security-opt").arg(format!(
+        "seccomp={}",
+        assets_dir
+            .join("build/docker/seccomp-personality.json")
+            .display()
+    ));
     // The container builds as root, so files it writes into the bind-mounted host cache
     // dirs come out root-owned — harmless locally, but breaks GitHub Actions' `actions/cache`
     // save step, which runs as the unprivileged runner user. Pass the host uid/gid in so the

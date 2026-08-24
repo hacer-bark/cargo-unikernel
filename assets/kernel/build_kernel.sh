@@ -19,6 +19,20 @@
 #     configure, and compile entirely.
 set -euo pipefail
 
+# CONFIG_GCC_PLUGIN_RANDSTRUCT reseeds its layout PRNG from the fixed seed generated below,
+# but the plugin's tie-breaking order for that PRNG is influenced by pointer-derived values
+# inside GCC's own process image — which vary run-to-run under ASLR even given an identical
+# fixed seed. Two from-scratch builds of the exact same source+config+toolchain can silently
+# produce a different struct layout (and therefore a different bzImage) purely because of
+# where the kernel randomized the compiler's own address space that run — confirmed: two
+# clean local builds on the same machine differed only in the kernel component, nothing
+# toolchain- or cache-related. Re-exec this whole script with ASLR disabled so every
+# `make`/gcc-plugin invocation below runs in a fixed, deterministic address space instead.
+if [ -z "${CARGO_UNIKERNEL_ASLR_DISABLED:-}" ]; then
+    export CARGO_UNIKERNEL_ASLR_DISABLED=1
+    exec setarch "$(uname -m)" -R bash "$0" "$@"
+fi
+
 KERNEL_VER="${CARGO_UNIKERNEL_KERNEL_VERSION:-6.18.33}"
 KERNEL_SHA256="${CARGO_UNIKERNEL_KERNEL_SHA256:-}"
 CARGO_UNIKERNEL_PROFILE="${CARGO_UNIKERNEL_PROFILE:-casual}"
