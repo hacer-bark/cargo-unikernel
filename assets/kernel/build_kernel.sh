@@ -316,6 +316,15 @@ export KBUILD_BUILD_USER="builder"
 export KBUILD_BUILD_HOST="buildhost"
 export KBUILD_BUILD_VERSION="1"
 export SOURCE_DATE_EPOCH=0
+
+# CONFIG_GCC_PLUGIN_LATENT_ENTROPY (self-protection.config) seeds its injected build-time
+# entropy from GCC's own get_random_seed(true), which is a completely separate mechanism from
+# the randstruct plugin's seed file above: with no `-frandom-seed` on the command line it
+# returns 0, and the plugin's own fallback then reads /dev/urandom directly at compile time —
+# genuinely random on every single invocation, unrelated to ASLR/PID/the machine, so the
+# `setarch -R` re-exec above does nothing for it. `-frandom-seed` makes get_random_seed(true)
+# derive a fixed, deterministic non-zero value from this string instead.
+export KCFLAGS="${KCFLAGS:-} -frandom-seed=unikarnel-fixed-latent-entropy-seed"
 make -j"$(nproc)" bzImage
 ccache -s || true
 

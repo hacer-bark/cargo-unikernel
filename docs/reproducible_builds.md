@@ -55,7 +55,13 @@ anywhere, any day.
   make section/symbol order nondeterministic on identical source. The kernel (C/Kbuild) is
   unaffected.
 - **Kernel struct-layout randomization seed** — a fixed public seed replaces
-  `CONFIG_GCC_PLUGIN_RANDSTRUCT`'s fresh-per-build default (`gen-randstruct-seed.sh`).
+  `CONFIG_GCC_PLUGIN_RANDSTRUCT`'s fresh-per-build default (`gen-randstruct-seed.sh`), and the
+  whole kernel build re-execs under `setarch -R` (ASLR off) because the plugin's tie-breaking
+  order is otherwise influenced by GCC's own randomized address space.
+- **Latent-entropy plugin seed** — `CONFIG_GCC_PLUGIN_LATENT_ENTROPY` reads `/dev/urandom`
+  directly at compile time unless GCC is given `-frandom-seed`; `build_kernel.sh` passes a
+  fixed one via `KCFLAGS`. This is a separate plugin/seed path from `RANDSTRUCT` above — pinning
+  one does nothing for the other.
 - **Python hash randomization** — `PYTHONHASHSEED=0` for `ukify`, since unseeded hashing
   randomizes dict/set iteration order in its section-assembly code.
 
