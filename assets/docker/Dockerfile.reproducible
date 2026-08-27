@@ -38,7 +38,22 @@ deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/%s resolute-backpo
 # versions too, not just what's installed below — otherwise a package newer than
 # SNAPSHOT_TS on the base image causes "unmet dependencies" (seen with libssl3t64 vs.
 # libssl-dev), since apt won't downgrade to satisfy a dependency without the flag.
-RUN apt-get update && apt-get -y --allow-downgrades dist-upgrade
+#
+# `dist-upgrade --allow-downgrades` alone does NOT catch this: apt's own candidate
+# selection excludes downgrades at priority 500 (apt_preferences(5) — a 500-pinned
+# version is only a candidate "unless the installed version is more recent"), so a
+# package already newer than the snapshot (e.g. libssl3t64 baked into the base image
+# ahead of SNAPSHOT_TS) never becomes dist-upgrade's target and is silently left in
+# place. We instead resolve each installed package's exact version as it exists in the
+# pinned snapshot repos (via `apt-cache madison`, which lists real archive versions
+# rather than apt's downgrade-averse "Candidate") and force-install that exact
+# pkg=version, which does honor --allow-downgrades.
+RUN apt-get update && \
+    PKGS=$(dpkg-query -W -f='${Package}=${Version}\n' | while IFS== read -r pkg ver; do \
+        snapver=$(apt-cache madison "$pkg" 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}' | sort -rV | head -1); \
+        if [ -n "$snapver" ] && [ "$snapver" != "$ver" ]; then echo "$pkg=$snapver"; fi; \
+    done) && \
+    apt-get -y --allow-downgrades install $PKGS
 
 # --allow-downgrades again: this step pulls in *new* packages (systemd-boot-efi/
 # systemd-ukify) whose dependency graph can pin an exact-version sibling that conflicts

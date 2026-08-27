@@ -503,7 +503,10 @@ mod tests {
             ("TRUNCATE", FS_TRUNCATE),
             ("IOCTL_DEV", FS_IOCTL_DEV),
         ] {
-            assert!(handled & right != 0, "{name} is ungoverned, so always allowed");
+            assert!(
+                handled & right != 0,
+                "{name} is ungoverned, so always allowed"
+            );
         }
     }
 

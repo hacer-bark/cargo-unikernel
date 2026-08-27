@@ -148,7 +148,13 @@ fn app_env_exports(config: &Config, s: &mut String) {
                 encode_path_list(&config.app.runtime.landlock.extra_read_paths),
             );
         }
-        if !config.app.runtime.landlock.extra_read_write_paths.is_empty() {
+        if !config
+            .app
+            .runtime
+            .landlock
+            .extra_read_write_paths
+            .is_empty()
+        {
             write_export(
                 s,
                 "CARGO_UNIKERNEL_LANDLOCK_RW",
