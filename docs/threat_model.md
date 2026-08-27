@@ -74,9 +74,11 @@ what gets measured.
 | `ptrace` / debug another process | Seccomp blocks `ptrace`, `process_vm_read`/`write` |
 | Remount writable+exec, load a module, kexec | Seccomp blocks both mount APIs, `*_module`, `kexec_*`, `personality` |
 | Drop and run a new binary | Every writable mount is `noexec`; `memfd_create`/`memfd_secret` also denied so a file can't dodge the mount flags via `execveat`. Both lift with `[app.runtime.danger].allow_write_execute` |
-| Shellcode from `PROT_WRITE\|PROT_EXEC` memory | **Not mitigated** — `mmap`/`mprotect` flags aren't filtered (would break JITs/allocators). This blocks a new *program image*, not W^X within the app's own memory |
+| Shellcode from `PROT_WRITE\|PROT_EXEC` memory | `PR_SET_MDWE` (`PR_MDWE_REFUSE_EXEC_GAIN`) refuses any `mmap`/`mprotect` that turns a writable mapping executable — closes the anonymous-memory gap the mount-flag/seccomp row above leaves open. Lifts with the same `[app.runtime.danger].allow_write_execute`, since both gate "no writable+executable memory" as one guarantee. Does not affect `execve` itself (the ELF loader maps a new image's text `PROT_EXEC` directly, never via a writable transition) |
+| Read files/devices outside the app's own footprint | Landlock (`[app.runtime.landlock]`, on by default): an allowlist over the payload dir, the scratch mounts, `/proc`, the CPU-topology slice of `/sys`, and the basic character devices — everything else, including most of `/sys` and `/dev/vda`, is unreachable regardless of uid or mount flags |
+| `ioctl` a device the app has no business touching (sev-snp: `/dev/sev-guest`) | Landlock ABI 5's `IOCTL_DEV` right is granted only on `/dev/sev-guest`, which the driver exposes as `ioctl`-only (no `.read`/`.write`) — no other device node in the ruleset can `ioctl` at all |
 | Bypass seccomp via x32 ABI | Filter checks `AUDIT_ARCH_X86_64` and rejects `__X32_SYSCALL_BIT`; `CONFIG_X86_X32_ABI` is off by default too |
-| Read PID 1's `/proc` (cmdline = host's kernel cmdline) | `/proc` mounted `hidepid=2`; PID 1 is `PR_SET_DUMPABLE 0` |
+| Read PID 1's `/proc` (cmdline = host's kernel cmdline) | `/proc` mounted `hidepid=2`, optionally `subset=pid` (`[hardening.runtime].proc_subset_pid`); PID 1 is `PR_SET_DUMPABLE 0` |
 | Exhaust RAM via writable tmpfs | `/tmp`, `/var/tmp`, `/dev/shm` capped at 64 MB, `/run` at 16 MB (not the tmpfs default of half of RAM) |
 | Weak keys from an unseeded CRNG | Boot waits up to 30s for seeding, then **powers off** rather than starting unseeded |
 | Escape into a new namespace | `CONFIG_NAMESPACES=n` — every `CLONE_NEW*` fails. Seccomp also denies `unshare`/`setns` |
@@ -141,3 +143,8 @@ untrusted, host-visible scratch space; keep secrets in RAM.
 - **Whatever you pin** — the tool verifies running code matches the ref/hash you gave it, not
   that the ref/hash itself is trustworthy. It moves the trust question to you; it doesn't
   answer it for you.
+- **The console, unless you opt in** — `[app.runtime].console` (app stdio) and `[logging].enabled`
+  (this init's own boot/warning output) both default to *off* and are compile-time toggles
+  (`app-console`/`logging` features), not runtime flags. On sev-snp the serial console is read
+  by the hypervisor, outside the trust boundary — enabling either means accepting that
+  whatever it prints reaches an untrusted party.

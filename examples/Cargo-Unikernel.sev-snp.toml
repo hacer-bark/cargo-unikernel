@@ -56,6 +56,23 @@ gid = 65534
 # max_memory_mb = 0          # RLIMIT_AS in MiB; 0 = no cap
 # max_locked_memory_mb = 64  # RLIMIT_MEMLOCK in MiB — how much the app may mlock
 
+# console = false
+# Leaves the app's stdin/stdout/stderr on the serial console instead of /dev/null. Off by
+# default: on sev-snp the console is read by the hypervisor, outside the trust boundary, so
+# the app's own output must not reach it unless this is a deliberate choice. Compiled in or
+# out (the `app-console` feature) — there is no runtime flag for this.
+
+[app.runtime.landlock]
+# Landlock filesystem sandbox on the app process. On by default — an allowlist over the
+# payload dir, the scratch mounts (/tmp, /var, /var/tmp, /dev/shm), /proc, the CPU-topology
+# slice of /sys, the basic character devices, and (sev-snp) an ioctl-only grant on
+# /dev/sev-guest. Everything else is unreachable regardless of uid or mount flags. Compiled in
+# or out (the `landlock` feature); the escape hatch is a kernel too old for
+# CONFIG_SECURITY_LANDLOCK, or an app whose filesystem footprint this can't predict.
+enabled = true
+# extra_read_paths = ["/some/extra/config/dir"]
+# extra_read_write_paths = ["/some/extra/writable/dir"]
+
 [network]
 # "ipv4", "ipv6", "dual", or "none" — compile-time choice; unselected protocols aren't built in.
 # IPv4 addresses come from DHCP (kernel `ip=dhcp`); IPv6 comes from SLAAC, which means one
@@ -72,11 +89,27 @@ mode = "ipv4"
 # gateway = "fe80::1"           # only if the provider sends no router advertisements
 # interface = "eth0"            # only on a multi-NIC guest
 
+# DNS resolvers for /etc/resolv.conf, in order. Empty (the default) means "use whatever the
+# kernel's ip=dhcp autoconfig learned" — which is nothing on an IPv6-only or mode = "none"
+# guest, since this image ships no DHCPv6 client. Configured resolvers replace any
+# DHCP-supplied ones outright, not append to them.
+# nameservers = ["9.9.9.9", "149.112.112.112"]
+# search = "corp.example"
+
 [storage]
 # "ram" (default): /var is wiped every reboot. "persistent": /var lives on a virtio-blk disk;
 # an untrusted/foreign device is wiped and reformatted rather than trusted.
 mode = "ram"
 # size_mib = 4096  # persistent disk image size; only used when mode = "persistent"
+
+# [storage.tmpfs]
+# Sizes (MiB) of the RAM-backed scratch mounts — capped rather than tmpfs's default of half of
+# guest RAM, since an uncapped mount is one an app could grow until the guest OOMs. Raise only
+# for an app with a genuinely larger scratch need.
+# tmp_mb = 64
+# run_mb = 16
+# shm_mb = 64
+# var_tmp_mb = 64
 
 [kernel]
 version = "6.18.45"
@@ -109,6 +142,11 @@ tcp_hardening = true                 # SYN cookies, backlog/keepalive tuning for
 info_leak_restriction = true         # restricts kernel pointer/dmesg/perf-event exposure
 ptrace_and_bpf_restriction = true    # locks ptrace to YAMA scope 3, disables unprivileged BPF
 kexec_and_fs_protection = true       # disables kexec, protects symlinks/hardlinks from TOCTOU
+# proc_subset_pid = false
+# Remounts /proc with subset=pid at lockdown, hiding every non-process entry (/proc/cpuinfo,
+# /proc/meminfo, /proc/net/*, ...) from the app. Unlike every category above, off by default:
+# several allocators/runtimes read those at startup, and enabling this for one that does
+# breaks it rather than just narrowing its view. Compiled in or out (`proc-subset-pid`).
 
 # extra_sysctls = { "/proc/sys/some/other/knob" = "1" }
 # extra_kernel_config = ["CONFIG_DEBUG_INFO=enable"]
@@ -137,6 +175,15 @@ measured_boot = "uki"
 # "builtin" (the only preset) uses the firmware baked into the cargo-unikernel binary.
 preset = "builtin"
 # path = "./firmware/OVMF.fd"   # a local firmware file the provider gave you — never a URL
+
+[logging]
+# The guest init's own boot-progress and [WARN]/FATAL console output — separate from the app's
+# own stdio ([app.runtime].console above). Off by default: on sev-snp the serial console is
+# read by the hypervisor, outside the trust boundary, so a boot log documenting exactly what
+# this image is and does is not something to hand it for free. Compiled in or out (the
+# `logging` feature) — off means no println!/eprintln! call exists in the binary at all, not
+# a runtime flag that decides not to print.
+# enabled = false
 
 [output]
 formats = ["cpio", "uki"]

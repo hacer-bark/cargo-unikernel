@@ -8,7 +8,6 @@ authors = ["Hacer-Bark <hacer.bark@proton.me>"]
 license = "0BSD"
 description = "Turn a Rust project (or any static binary) into a minimal, hardened bootable unikernel — with an optional AMD SEV-SNP profile."
 repository = "https://github.com/hacer-bark/cargo-unikernel"
-homepage = "https://github.com/hacer-bark/cargo-unikernel"
 documentation = "https://docs.rs/cargo-unikernel"
 keywords = ["unikernel", "sev-snp", "os", "kernel", "hardening"]
 categories = ["command-line-utilities", "virtualization"]

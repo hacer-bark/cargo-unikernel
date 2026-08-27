@@ -13,6 +13,13 @@
 use rustix::mount::MountFlags;
 use std::ffi::CString;
 
+/// tmpfs sizes in MiB, baked in by `build.rs` from `[storage.tmpfs]`. Plain per-deployment
+/// data, not a toggle — see `Cargo.toml`'s feature list for the actual on/off switches.
+const TMPFS_TMP_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_TMP_MB");
+const TMPFS_RUN_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_RUN_MB");
+const TMPFS_SHM_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_SHM_MB");
+const TMPFS_VAR_TMP_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_VAR_TMP_MB");
+
 /// `data` as a `CString`, for the one argument `rustix::mount::mount` still takes as an
 /// `Option<&CStr>` rather than a generic `path::Arg` — every other argument here is a fixed
 /// string literal chosen by this crate, so only this one ever needs the conversion.
@@ -100,6 +107,10 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     log("Mounting essential filesystems...");
     log_write_execute_danger(&log, "/tmp");
 
+    let tmp_data = format!("size={TMPFS_TMP_MB}m,mode=1777");
+    let run_data = format!("size={TMPFS_RUN_MB}m,mode=0755");
+    let shm_data = format!("size={TMPFS_SHM_MB}m,mode=1777");
+
     // Ordered: each entry's target must already exist, which for /dev/pts, /dev/shm and
     // /var/tmp means the filesystem carrying it is mounted by an earlier entry.
     let base: &[(&str, &str, &str, MountFlags, Option<&str>)] = &[
@@ -131,24 +142,25 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
             "/tmp",
             "tmpfs",
             writable_exec_mount_flags(),
-            Some("size=64m,mode=1777"),
+            Some(tmp_data.as_str()),
         ),
         (
             "tmpfs",
             "/run",
             "tmpfs",
             NOSUID_NODEV_NOEXEC,
-            Some("size=16m,mode=0755"),
+            Some(run_data.as_str()),
         ),
-        // `size=64m` to match /tmp rather than taking tmpfs's default, which is *half of guest
-        // RAM* — without it this is the one writable mount an app can grow until the guest OOMs,
-        // and the one the shutdown scrub then has to zero against its deadline.
+        // Sized separately from `/tmp` (see `CARGO_UNIKERNEL_TMPFS_SHM_MB`), rather than
+        // taking tmpfs's default, which is *half of guest RAM* — without a cap this is one
+        // more writable mount an app can grow until the guest OOMs, and one more the shutdown
+        // scrub has to zero against its deadline.
         (
             "tmpfs",
             "/dev/shm",
             "tmpfs",
             NOSUID_NODEV_NOEXEC,
-            Some("size=64m,mode=1777"),
+            Some(shm_data.as_str()),
         ),
     ];
     for &(source, target, fstype, flags, data) in base {
@@ -184,12 +196,13 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     .unwrap_or_else(|e| fatal(&format!("Failed to mount /var: {e}")));
 
     let _ = std::fs::create_dir_all("/var/tmp");
+    let var_tmp_data = format!("size={TMPFS_VAR_TMP_MB}m,mode=1777");
     mount(
         "tmpfs",
         "/var/tmp",
         "tmpfs",
         NOSUID_NODEV_NOEXEC,
-        Some("size=64m,mode=1777"),
+        Some(&var_tmp_data),
     )
     .unwrap_or_else(|e| fatal(&format!("Failed to mount /var/tmp: {e}")));
 
@@ -243,13 +256,37 @@ fn log_lockdown_complete(log: &impl Fn(&str)) {
     }
 }
 
-/// Remounts `payload_dir` read-only and (unless `danger-allow-write-execute` is compiled in)
-/// `/tmp` noexec, sealing off all writable+executable paths.
+/// `/proc`'s remount data for [`lockdown_filesystem`] — plain `hidepid=2` (same as the initial
+/// mount) by default, or `hidepid=2,subset=pid` when the `proc-subset-pid` feature is compiled
+/// in, hiding every non-process entry (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/net/*`, ...)
+/// from the app. Two functions selected by `#[cfg]`, matching [`writable_exec_mount_flags`]'s
+/// pattern, rather than a baked bool an `if` reads: an app that couldn't reach `subset=pid`'s
+/// restriction through a bypassed check can't reach it through absent code either.
+#[cfg(feature = "proc-subset-pid")]
+const fn proc_remount_data() -> &'static str {
+    "hidepid=2,subset=pid"
+}
+#[cfg(not(feature = "proc-subset-pid"))]
+const fn proc_remount_data() -> &'static str {
+    "hidepid=2"
+}
+
+/// Remounts `/proc` (see [`proc_remount_data`]), `payload_dir` read-only, and (unless
+/// `danger-allow-write-execute` is compiled in) `/tmp` noexec, sealing off all
+/// writable+executable paths.
+///
+/// The `/proc` remount runs last among the three, after every sysctl write this crate performs
+/// (`hardening::apply`, called by the caller before this function) — `subset=pid` would hide
+/// `/proc/sys` from a plain path lookup the same way it hides everything else non-process, and
+/// this init still needs to write there itself up to this point in boot.
 ///
 /// `/run` is remounted noexec unconditionally. Calls `fatal(msg)` (never returns) on any
 /// remount failure.
 pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: fn(&str) -> !) {
     log("Locking down filesystem...");
+
+    remount("/proc", NOSUID_NODEV_NOEXEC, proc_remount_data())
+        .unwrap_or_else(|e| fatal(&format!("Failed to remount /proc: {e}")));
 
     // payload_dir is a bind mount — remounting it read-only requires MS_BIND alongside
     // MS_REMOUNT, or the kernel ignores the flag change.
@@ -267,15 +304,17 @@ pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: 
         ))
     });
 
-    remount("/tmp", tmp_remount_flags(), "size=64m,mode=1777")
+    let tmp_data = format!("size={TMPFS_TMP_MB}m,mode=1777");
+    remount("/tmp", tmp_remount_flags(), &tmp_data)
         .unwrap_or_else(|e| fatal(&format!("Failed to remount /tmp: {e}")));
 
+    let run_data = format!("size={TMPFS_RUN_MB}m,mode=0755");
     remount(
         "/run",
         MountFlags::NOSUID
             .union(MountFlags::NODEV)
             .union(MountFlags::NOEXEC),
-        "size=16m,mode=0755",
+        &run_data,
     )
     .unwrap_or_else(|e| fatal(&format!("Failed to remount /run noexec: {e}")));
 

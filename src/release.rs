@@ -203,6 +203,7 @@ mod tests {
                 dir: "dist/".to_string(),
             },
             release: Release::default(),
+            logging: crate::schema::Logging::default(),
         }
     }
 

@@ -393,6 +393,7 @@ pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
     // caller's entire session. Refusing outright is the only safe response to being called
     // from the wrong place.
     if std::process::id() != 1 {
+        #[cfg(feature = "logging")]
         eprintln!(
             "[SHUTDOWN] wipe_and_power_off() called from PID {} — only PID 1 may run it.",
             std::process::id()
@@ -407,11 +408,13 @@ pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
     if std::thread::Builder::new()
         .spawn(|| {
             std::thread::sleep(EMERGENCY_WIPE_DEADLINE);
+            #[cfg(feature = "logging")]
             eprintln!("[SHUTDOWN] Wipe exceeded its deadline — powering off now.");
             force_power_off();
         })
         .is_err()
     {
+        #[cfg(feature = "logging")]
         eprintln!("[SHUTDOWN] Could not arm the wipe deadline — powering off without wiping.");
         force_power_off();
     }

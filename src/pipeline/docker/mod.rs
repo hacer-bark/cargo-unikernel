@@ -460,8 +460,8 @@ pub mod test_fixtures {
     #[must_use]
     pub fn casual_config_with_formats(formats: Vec<OutputFormat>) -> Config {
         use crate::schema::{
-            App, AppMode, AppRuntime, Hardening, Kernel, Network, Output, Profile, Project,
-            Release, Storage,
+            App, AppMode, AppRuntime, Hardening, Kernel, Logging, Network, Output, Profile,
+            Project, Release, Storage,
         };
         Config {
             project: Project {
@@ -488,6 +488,7 @@ pub mod test_fixtures {
                 dir: "dist/".to_string(),
             },
             release: Release::default(),
+            logging: Logging::default(),
         }
     }
 

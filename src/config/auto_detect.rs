@@ -102,6 +102,7 @@ fn build_config(name: String, app: App) -> Config {
             dir: "dist/".to_string(),
         },
         release: Release::default(),
+        logging: crate::schema::Logging::default(),
     }
 }
 

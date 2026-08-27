@@ -14,7 +14,10 @@
 #![allow(clippy::redundant_pub_crate)]
 
 mod entropy;
+mod etcfiles;
 mod hardening;
+#[cfg(feature = "landlock")]
+mod landlock;
 mod mounts;
 #[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 mod network;
@@ -24,6 +27,7 @@ mod shutdown;
 mod storage;
 
 use std::fs::Permissions;
+#[cfg(feature = "logging")]
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -72,6 +76,21 @@ const LIMIT_NPROC: &str = env!("CARGO_UNIKERNEL_LIMIT_NPROC");
 const LIMIT_AS_MB: &str = env!("CARGO_UNIKERNEL_LIMIT_AS_MB");
 const LIMIT_MEMLOCK_MB: &str = env!("CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB");
 
+#[cfg(feature = "landlock")]
+const LANDLOCK_RO: &str = env!("CARGO_UNIKERNEL_LANDLOCK_RO");
+#[cfg(feature = "landlock")]
+const LANDLOCK_RW: &str = env!("CARGO_UNIKERNEL_LANDLOCK_RW");
+
+const NAMESERVERS: &str = env!("CARGO_UNIKERNEL_NAMESERVERS");
+const DNS_SEARCH: &str = env!("CARGO_UNIKERNEL_DNS_SEARCH");
+
+/// Splits a `';'`-joined path list (see `build.rs`) into its parts — the `landlock` feature's
+/// `extra_read`/`extra_read_write`, which unlike [`parse_pairs`] carry no `=value` half.
+#[cfg(feature = "landlock")]
+fn parse_path_list(raw: &str) -> Vec<&str> {
+    raw.split(';').filter(|s| !s.is_empty()).collect()
+}
+
 /// Splits a `';'`-joined list of `key=value` pairs (see `build.rs`) into its parts.
 ///
 /// A pair with no `=` runs the wipe protocol rather than being silently dropped — these
@@ -107,9 +126,16 @@ fn app_ids() -> (u32, u32) {
     )
 }
 
+/// Boot-progress and `[WARN]` output. Compiled to a true no-op — no `println!`, no write
+/// syscall — when the `logging` feature is off, which is the default: on sev-snp the serial
+/// console is read by the hypervisor, outside the trust boundary, so "off" has to mean no
+/// bytes ever reach it, not merely a flag this function chooses not to check.
+#[cfg(feature = "logging")]
 fn log(msg: &str) {
     println!("[INIT] {msg}");
 }
+#[cfg(not(feature = "logging"))]
+const fn log(_msg: &str) {}
 
 /// `/var` is mounted root:root mode 0755 (tmpfs default, or `mke2fs`'s ext4 default) — the app
 /// runs as an unprivileged, non-root uid/gid, so without this it could never write into `/var`
@@ -131,12 +157,17 @@ fn is_pid1() -> bool {
 /// that got here anyway can't power off (it is not PID 1, so it has neither `CAP_SYS_BOOT` nor
 /// the standing to `kill(-1)`), and exiting is the only safe thing left.
 fn non_pid1_fatal_exit(message: &str) -> ! {
-    eprintln!("\n======================================================================");
-    eprintln!("FATAL (PID {}): {message}", std::process::id());
-    eprintln!("Exiting — only PID 1 may run the guest's shutdown protocol.");
-    eprintln!("======================================================================\n");
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
+    #[cfg(feature = "logging")]
+    {
+        eprintln!("\n======================================================================");
+        eprintln!("FATAL (PID {}): {message}", std::process::id());
+        eprintln!("Exiting — only PID 1 may run the guest's shutdown protocol.");
+        eprintln!("======================================================================\n");
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+    #[cfg(not(feature = "logging"))]
+    let _ = message;
     std::process::exit(1);
 }
 
@@ -163,12 +194,17 @@ fn fatal_shutdown(message: &str) -> ! {
         non_pid1_fatal_exit(message);
     }
 
-    eprintln!("\n======================================================================");
-    eprintln!("FATAL: {message}");
-    eprintln!("SHUTDOWN: wiping writable state, then powering off.");
-    eprintln!("======================================================================\n");
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
+    #[cfg(feature = "logging")]
+    {
+        eprintln!("\n======================================================================");
+        eprintln!("FATAL: {message}");
+        eprintln!("SHUTDOWN: wiping writable state, then powering off.");
+        eprintln!("======================================================================\n");
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+    #[cfg(not(feature = "logging"))]
+    let _ = message;
 
     crate::shutdown::wipe_and_power_off(log);
 }
@@ -225,6 +261,47 @@ fn drop_privileges(uid: u32, gid: u32) -> impl Fn() -> std::io::Result<()> {
         }
         Ok(())
     }
+}
+
+/// Refuses to let the app turn a writable mapping executable, or `mmap` a fresh
+/// `PROT_WRITE|PROT_EXEC` one — `PR_SET_MDWE` (Linux 6.3+, the kernel this image pins is far
+/// newer). This is what closes the one gap `mounts.rs`'s `noexec` flags admit to leaving open:
+/// they seal file-backed routes to new code, not anonymous `mmap`/`mprotect`. `execve` itself
+/// is untouched — the ELF loader maps a fresh image's text as `PROT_EXEC` directly, never via a
+/// writable-then-executable transition, so this does not affect spawning subprocesses at all,
+/// only turning memory the app already holds writable into memory it then runs.
+///
+/// The one real cost: it also blocks any JIT the app embeds, which needs exactly this
+/// transition to emit and run generated code. `danger-allow-write-execute` already exists for
+/// that population (today via `/tmp`'s mount flags and the `memfd_create`/`memfd_secret`
+/// seccomp entries) — this ties into the same feature rather than adding a second toggle, so
+/// enabling one opt-out coherently lifts every "no writable+executable memory" guarantee at
+/// once instead of half of them.
+///
+/// Two functions selected by `#[cfg]`, matching every other opt-out in this crate: a build
+/// without the escape hatch doesn't carry a runtime check that could be bypassed, it carries
+/// no call to `PR_SET_MDWE` at all is the *danger* build, and the default build carries no
+/// branch that skips it.
+#[cfg(not(feature = "danger-allow-write-execute"))]
+fn set_mdwe() -> std::io::Result<()> {
+    // PR_SET_MDWE = 65, PR_MDWE_REFUSE_EXEC_GAIN = 1 (linux/prctl.h) — hardcoded rather than
+    // trusting `libc` to export names this recent for every target this crate might build on.
+    const PR_SET_MDWE: libc::c_int = 65;
+    const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
+    // SAFETY: plain integer arguments; the return value is checked.
+    unsafe {
+        if libc::prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+// `Result` here is never an `Err` — but this must share `set_mdwe`'s other-cfg signature,
+// since both are passed to `Command::pre_exec` as plain `fn` values from the same call site.
+#[cfg(feature = "danger-allow-write-execute")]
+#[allow(clippy::unnecessary_wraps)]
+const fn set_mdwe() -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Caps the child's open-file, process/thread, locked-memory and (optionally) address-space
@@ -303,19 +380,46 @@ fn spawn_app() -> u32 {
 
     // Built here, before the fork below, and moved into the `pre_exec` closure that installs
     // it: `seccomp::build_baseline_denylist` allocates, which is unsound to do between `fork()`
-    // and `execve()` — see its own doc comment.
+    // and `execve()` — see its own doc comment. `landlock::build` carries the same constraint
+    // (it opens files and allocates a `Vec`), for the same reason.
     let seccomp_program = crate::seccomp::build_baseline_denylist(fatal_shutdown);
+    #[cfg(feature = "landlock")]
+    let landlock_ruleset = crate::landlock::build(
+        PAYLOAD_DIR,
+        &parse_path_list(LANDLOCK_RO),
+        &parse_path_list(LANDLOCK_RW),
+        log,
+        fatal_shutdown,
+    );
 
     // SAFETY: `pre_exec` closures run in the forked child between `fork()` and `execve()`,
     // where only async-signal-safe operations are sound; each closure here calls only a fixed,
-    // small number of setrlimit/setgroups/setgid/setuid/seccomp syscalls.
+    // small number of setrlimit/setgroups/setgid/setuid/prctl/landlock/seccomp syscalls.
     let (uid, gid) = app_ids();
+    let mut command = Command::new(APP_PATH);
+    command
+        .env_clear()
+        .envs(parse_pairs(APP_ENV, "[app.runtime].env"));
+    // Without the `app-console` feature (the default): the app's stdio goes to /dev/null
+    // rather than PID 1's inherited serial console. On sev-snp that console is read by the
+    // hypervisor — outside the trust boundary — so the app's own output must not reach it
+    // unless this feature was deliberately compiled in. `app-console`'s build simply doesn't
+    // call `.stdin`/`.stdout`/`.stderr` here, so `Command`'s default (inherit) applies.
+    #[cfg(not(feature = "app-console"))]
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(feature = "landlock")]
+    let ruleset_fd = landlock_ruleset.raw_fd();
     let child = unsafe {
-        Command::new(APP_PATH)
-            .env_clear()
-            .envs(parse_pairs(APP_ENV, "[app.runtime].env"))
+        command
             .pre_exec(apply_resource_limits)
             .pre_exec(drop_privileges(uid, gid))
+            .pre_exec(set_mdwe);
+        #[cfg(feature = "landlock")]
+        command.pre_exec(move || crate::landlock::restrict_self(ruleset_fd));
+        command
             .pre_exec(move || install_seccomp_baseline(&seccomp_program))
             .spawn()
             .unwrap_or_else(|e| fatal_shutdown(&format!("Failed to spawn app: {e}")))
@@ -403,7 +507,7 @@ fn main() {
         non_pid1_fatal_exit("This binary is the guest's init and only runs as PID 1");
     }
 
-    println!("[INIT] cargo-unikernel guest init starting (PID 1)...");
+    log("cargo-unikernel guest init starting (PID 1)...");
     set_self_non_dumpable(|w| log(&format!("[WARN] {w}")));
 
     crate::mounts::prepare_system_env(PAYLOAD_DIR, log, fatal_shutdown);
@@ -415,6 +519,12 @@ fn main() {
     let shutdown_triggers = crate::shutdown::arm_shutdown_triggers();
     let (uid, gid) = app_ids();
     chown_var_for_app(uid, gid, fatal_shutdown);
+
+    // After /proc is mounted (for /proc/net/pnp) but otherwise placement-insensitive — nothing
+    // else reads /etc before the app starts, and nothing after lockdown can write to it anyway.
+    crate::etcfiles::write_etc(uid, gid, NAMESERVERS, DNS_SEARCH, &|w: &str| {
+        log(&format!("[WARN] {w}"));
+    });
 
     let extra_sysctls = parse_pairs(EXTRA_SYSCTLS, "[hardening].extra_sysctls");
     crate::hardening::apply(&extra_sysctls, |w| {

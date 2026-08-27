@@ -39,6 +39,24 @@ pub struct Config {
     /// `[release]` — which `dist/` assets a GitHub Release includes.
     #[serde(default)]
     pub release: Release,
+    /// `[logging]` — the guest init's own boot-progress and `[WARN]`/`FATAL` console output.
+    #[serde(default)]
+    pub logging: Logging,
+}
+
+/// `[logging]` — `cargo-unikernel-init`'s own console diagnostics, separate from anything the
+/// app itself prints (the app's stdio is a separate `[app.runtime].console` toggle).
+///
+/// Off by default: on `sev-snp` the serial console is read by the hypervisor, outside the
+/// trust boundary, so a boot log documenting exactly what this image is and does is not
+/// something to hand it for free. `enabled` compiles `cargo-unikernel-init`'s `logging`
+/// feature in or out — off means no `println!`/`eprintln!` call in the binary at all, not a
+/// runtime flag that decides not to print.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Logging {
+    /// Compile in boot-progress and warning/fatal console output. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `[project]` — identifies the project and, optionally, pins it to an exact CLI version.
@@ -187,6 +205,16 @@ pub struct AppRuntime {
     /// `[app.runtime.limits]` — `setrlimit` ceilings.
     #[serde(default)]
     pub limits: AppLimits,
+    /// `[app.runtime.landlock]` — the Landlock filesystem sandbox.
+    #[serde(default)]
+    pub landlock: LandlockConfig,
+    /// Leaves the app's stdin/stdout/stderr on the serial console PID 1 inherited, instead of
+    /// `/dev/null`. Off by default: on `sev-snp` the console is read by the hypervisor, which
+    /// is outside the trust boundary, so the app's own output must not reach it unless this is
+    /// a deliberate choice. A compile-time toggle (`app-console` on `cargo-unikernel-init`),
+    /// not a runtime flag — see that crate's `spawn_app`.
+    #[serde(default)]
+    pub console: bool,
 }
 
 const fn default_uid() -> u32 {
@@ -204,6 +232,45 @@ impl Default for AppRuntime {
             gid: default_gid(),
             danger: DangerRuntime::default(),
             limits: AppLimits::default(),
+            landlock: LandlockConfig::default(),
+            console: false,
+        }
+    }
+}
+
+/// `[app.runtime.landlock]` — the Landlock filesystem sandbox on the app process.
+///
+/// `enabled` compiles `cargo-unikernel-init`'s `landlock` feature in or out — there is no
+/// runtime "disabled" state inside the guest, only a build that carries the three `landlock_*`
+/// syscalls and the ruleset-construction code, or one that doesn't. See that crate's
+/// `landlock.rs` for the ruleset itself (payload dir, scratch mounts, and — on `sev-snp` — an
+/// `ioctl`-only grant on `/dev/sev-guest` and nothing else).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LandlockConfig {
+    /// Enforce the ruleset. On by default; the escape hatch for an app whose filesystem
+    /// footprint this tool can't predict, or a kernel too old for `CONFIG_SECURITY_LANDLOCK`.
+    #[serde(default = "default_landlock_enabled")]
+    pub enabled: bool,
+    /// Extra paths granted read-only, beyond the built-in ruleset (the payload directory, the
+    /// scratch mounts, `/proc`, `/dev/{null,zero,full,random,urandom}`, and on `sev-snp`
+    /// `/dev/sev-guest`).
+    #[serde(default)]
+    pub extra_read_paths: Vec<String>,
+    /// Extra paths granted read-write, beyond the built-in scratch mounts.
+    #[serde(default)]
+    pub extra_read_write_paths: Vec<String>,
+}
+
+const fn default_landlock_enabled() -> bool {
+    true
+}
+
+impl Default for LandlockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_landlock_enabled(),
+            extra_read_paths: Vec::new(),
+            extra_read_write_paths: Vec::new(),
         }
     }
 }
@@ -317,6 +384,16 @@ pub struct Network {
     /// `[network.ipv6_static]` — a fixed IPv6 address instead of relying on SLAAC. Omitted by
     /// default; see [`Ipv6Static`].
     pub ipv6_static: Option<Ipv6Static>,
+    /// DNS resolvers to write into the guest's `/etc/resolv.conf`, in order. Empty (the
+    /// default) means "use whatever the kernel's `ip=dhcp` autoconfig learned" — which is
+    /// nothing at all on an IPv6-only or `mode = "none"` guest, since this image ships no
+    /// `DHCPv6` client. Configured resolvers replace any DHCP-supplied ones outright rather
+    /// than being appended, on the assumption that naming them explicitly means not trusting
+    /// the network's.
+    #[serde(default)]
+    pub nameservers: Vec<String>,
+    /// `search`/`domain` line for `/etc/resolv.conf`. Omitted by default.
+    pub search: Option<String>,
 }
 
 const fn default_network_mode() -> NetworkMode {
@@ -328,6 +405,8 @@ impl Default for Network {
         Self {
             mode: default_network_mode(),
             ipv6_static: None,
+            nameservers: Vec::new(),
+            search: None,
         }
     }
 }
@@ -389,6 +468,9 @@ pub struct Storage {
     /// Size of the persistent disk image, in MiB. Only meaningful for `mode = "persistent"`.
     #[serde(default = "default_storage_size_mib")]
     pub size_mib: u32,
+    /// `[storage.tmpfs]` — sizes of the guest's RAM-backed scratch mounts.
+    #[serde(default)]
+    pub tmpfs: TmpfsSizes,
 }
 
 const fn default_storage_mode() -> StorageMode {
@@ -404,6 +486,54 @@ impl Default for Storage {
         Self {
             mode: default_storage_mode(),
             size_mib: default_storage_size_mib(),
+            tmpfs: TmpfsSizes::default(),
+        }
+    }
+}
+
+/// `[storage.tmpfs]` — sizes, in MiB, of `/tmp`, `/run`, `/dev/shm`, and `/var/tmp`.
+///
+/// Each is capped rather than left at tmpfs's kernel default (half of guest RAM): an
+/// uncapped writable mount is the one an app could otherwise grow until the guest OOMs, and
+/// the one the shutdown scrub then has to zero against its own deadline. Plain per-deployment
+/// sizing, not a mechanism toggle — an app with a larger scratch need raises these instead of
+/// forking `cargo-unikernel-init`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TmpfsSizes {
+    /// `/tmp`, in MiB.
+    #[serde(default = "default_tmpfs_tmp_mb")]
+    pub tmp_mb: u64,
+    /// `/run`, in MiB.
+    #[serde(default = "default_tmpfs_run_mb")]
+    pub run_mb: u64,
+    /// `/dev/shm`, in MiB.
+    #[serde(default = "default_tmpfs_shm_mb")]
+    pub shm_mb: u64,
+    /// `/var/tmp`, in MiB.
+    #[serde(default = "default_tmpfs_var_tmp_mb")]
+    pub var_tmp_mb: u64,
+}
+
+const fn default_tmpfs_tmp_mb() -> u64 {
+    64
+}
+const fn default_tmpfs_run_mb() -> u64 {
+    16
+}
+const fn default_tmpfs_shm_mb() -> u64 {
+    64
+}
+const fn default_tmpfs_var_tmp_mb() -> u64 {
+    64
+}
+
+impl Default for TmpfsSizes {
+    fn default() -> Self {
+        Self {
+            tmp_mb: default_tmpfs_tmp_mb(),
+            run_mb: default_tmpfs_run_mb(),
+            shm_mb: default_tmpfs_shm_mb(),
+            var_tmp_mb: default_tmpfs_var_tmp_mb(),
         }
     }
 }
@@ -568,6 +698,16 @@ pub struct RuntimeHardening {
     pub ptrace_and_bpf_restriction: Option<bool>,
     /// Disable kexec loading; protect VFS symlinks/hardlinks/fifos/regular files.
     pub kexec_and_fs_protection: Option<bool>,
+    /// Remounts `/proc` with `subset=pid` at lockdown, hiding every non-process entry
+    /// (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/net/*`, ...) from the app.
+    ///
+    /// Unlike every category above, this defaults to **off**: several allocators and language
+    /// runtimes read `/proc/meminfo` or `/proc/sys/vm/*` at startup, and turning this on for an
+    /// app that does would break it, not just narrow its view. A compile-time toggle (a
+    /// `proc-subset-pid` Cargo feature on `cargo-unikernel-init`), same as every other
+    /// `[hardening.runtime]` category — see that crate's `mounts` module.
+    #[serde(default)]
+    pub proc_subset_pid: bool,
 }
 
 /// `[hardening]` — build-time and runtime hardening toggles.
@@ -902,6 +1042,19 @@ pub enum ValidationError {
          pointing elsewhere writes to that path instead of tuning a sysctl"
     )]
     ExtraSysctlNotUnderProcSys(String),
+    /// A list entry (a Landlock extra path, or a nameserver) contained a `';'`, the wire
+    /// format's separator.
+    #[error(
+        "`{table}` entry {entry:?} contains a `;` — these reach the guest as one `;`-joined \
+         string, so such an entry cannot be encoded without the guest reading it back as more \
+         than one item"
+    )]
+    UnrepresentableListEntry {
+        /// The config table the offending entry came from.
+        table: &'static str,
+        /// The offending entry.
+        entry: String,
+    },
 }
 
 impl Config {
@@ -919,6 +1072,7 @@ impl Config {
         self.validate_kernel()?;
         self.validate_kv_encoding()?;
         self.validate_extra_sysctl_paths()?;
+        self.validate_list_encoding()?;
         self.validate_ipv6_static()?;
         self.validate_app()?;
         self.validate_profile()?;
@@ -944,6 +1098,35 @@ impl Config {
                     return Err(ValidationError::UnrepresentableKvPair {
                         table,
                         key: key.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `[app.runtime.landlock]`'s extra paths and `[network].nameservers` all reach the guest
+    /// as one `';'`-joined string (see `pipeline::docker::guest_init_script`) — the same
+    /// encoding hazard [`Self::validate_kv_encoding`] checks for `key=value` pairs, applied to
+    /// plain list entries instead.
+    fn validate_list_encoding(&self) -> Result<(), ValidationError> {
+        let checks: [(&'static str, &[String]); 3] = [
+            (
+                "app.runtime.landlock.extra_read_paths",
+                &self.app.runtime.landlock.extra_read_paths,
+            ),
+            (
+                "app.runtime.landlock.extra_read_write_paths",
+                &self.app.runtime.landlock.extra_read_write_paths,
+            ),
+            ("network.nameservers", &self.network.nameservers),
+        ];
+        for (table, entries) in checks {
+            for entry in entries {
+                if entry.contains(';') {
+                    return Err(ValidationError::UnrepresentableListEntry {
+                        table,
+                        entry: entry.clone(),
                     });
                 }
             }
@@ -1416,6 +1599,34 @@ mod tests {
         // A value containing '=' is fine: the guest splits on the *first* '=' only.
         let mut config = base_config();
         config.app.runtime.env = BTreeMap::from([("OPTS".to_string(), "a=b".to_string())]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn list_entry_that_the_wire_format_cannot_round_trip_is_rejected() {
+        let mut config = base_config();
+        config.app.runtime.landlock.extra_read_paths = vec!["/a;/b".to_string()];
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::UnrepresentableListEntry { .. })
+        ));
+
+        let mut config = base_config();
+        config.app.runtime.landlock.extra_read_write_paths = vec!["/a;/b".to_string()];
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::UnrepresentableListEntry { .. })
+        ));
+
+        let mut config = base_config();
+        config.network.nameservers = vec!["9.9.9.9;1.1.1.1".to_string()];
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::UnrepresentableListEntry { .. })
+        ));
+
+        let mut config = base_config();
+        config.network.nameservers = vec!["9.9.9.9".to_string()];
         assert!(config.validate().is_ok());
     }
 

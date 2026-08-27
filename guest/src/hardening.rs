@@ -168,6 +168,14 @@ fn apply_ptrace_and_bpf_restriction(warn: &impl Fn(&str)) {
     // Constant-blinds the classic-BPF JIT's output against spray-style attacks. "2" (harden
     // always, not just for unprivileged callers) since nothing here needs unhardened JIT output.
     write_sysctl("/proc/sys/net/core/bpf_jit_harden", b"2", warn);
+    // A no-op write today (CONFIG_MODULES=disable already means the path doesn't exist), but
+    // survives someone re-enabling modules via `extra_kernel_config` the same way the
+    // `io_uring` seccomp entries survive `CONFIG_IO_URING` being re-enabled.
+    write_sysctl("/proc/sys/kernel/modules_disabled", b"1", warn);
+    // "2": refuse io_uring even for CAP_SYS_ADMIN, not just unprivileged callers — closes the
+    // same door as the seccomp io_uring entries and CONFIG_IO_URING=disable, again for a
+    // build that re-enables the kernel option without touching this file.
+    write_sysctl("/proc/sys/kernel/io_uring_disabled", b"2", warn);
 }
 
 /// Disable kexec loading and protect VFS symlinks/hardlinks/fifos/regular files.
@@ -178,6 +186,10 @@ fn apply_kexec_and_fs_protection(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/fs/protected_hardlinks", b"1", warn);
     write_sysctl("/proc/sys/fs/protected_fifos", b"2", warn);
     write_sysctl("/proc/sys/fs/protected_regular", b"2", warn);
+    // CONFIG_COREDUMP=disable already means no core is ever written, but a build that
+    // re-enables it via `extra_kernel_config` should not also inherit "a setuid binary's core
+    // is world-writable" for free.
+    write_sysctl("/proc/sys/fs/suid_dumpable", b"0", warn);
 }
 
 /// Not a hardening category and not feature-gated: raises the mmap-count ceiling well above the
@@ -186,6 +198,10 @@ fn apply_kexec_and_fs_protection(warn: &impl Fn(&str)) {
 /// stays applied even if every `hardening.runtime` category is turned off.
 fn apply_baseline_tuning(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/vm/max_map_count", b"1048576", warn);
+    // Pinned rather than inherited from CONFIG_RANDOMIZE_BASE/RANDOMIZE_MEMORY's own default
+    // (already "2" today) — a build that lowers those Kconfig options shouldn't silently take
+    // this with it.
+    write_sysctl("/proc/sys/kernel/randomize_va_space", b"2", warn);
 }
 
 /// Applies every compiled-in hardening category, then any `extra` (path, value) pairs from

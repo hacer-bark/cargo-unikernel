@@ -71,6 +71,19 @@ fn init_features(config: &Config) -> Vec<&'static str> {
         features.push("danger-allow-write-execute");
     }
 
+    if rh.proc_subset_pid {
+        features.push("proc-subset-pid");
+    }
+    if config.app.runtime.landlock.enabled {
+        features.push("landlock");
+    }
+    if config.app.runtime.console {
+        features.push("app-console");
+    }
+    if config.logging.enabled {
+        features.push("logging");
+    }
+
     features
 }
 
@@ -120,6 +133,47 @@ fn app_env_exports(config: &Config, s: &mut String) {
             encode_kv_pairs(&config.hardening.extra_sysctls),
         );
     }
+
+    let tmpfs = &config.storage.tmpfs;
+    write_export(s, "CARGO_UNIKERNEL_TMPFS_TMP_MB", tmpfs.tmp_mb);
+    write_export(s, "CARGO_UNIKERNEL_TMPFS_RUN_MB", tmpfs.run_mb);
+    write_export(s, "CARGO_UNIKERNEL_TMPFS_SHM_MB", tmpfs.shm_mb);
+    write_export(s, "CARGO_UNIKERNEL_TMPFS_VAR_TMP_MB", tmpfs.var_tmp_mb);
+
+    if config.app.runtime.landlock.enabled {
+        if !config.app.runtime.landlock.extra_read_paths.is_empty() {
+            write_export(
+                s,
+                "CARGO_UNIKERNEL_LANDLOCK_RO",
+                encode_path_list(&config.app.runtime.landlock.extra_read_paths),
+            );
+        }
+        if !config.app.runtime.landlock.extra_read_write_paths.is_empty() {
+            write_export(
+                s,
+                "CARGO_UNIKERNEL_LANDLOCK_RW",
+                encode_path_list(&config.app.runtime.landlock.extra_read_write_paths),
+            );
+        }
+    }
+
+    if !config.network.nameservers.is_empty() {
+        write_export(
+            s,
+            "CARGO_UNIKERNEL_NAMESERVERS",
+            encode_path_list(&config.network.nameservers),
+        );
+    }
+    if let Some(search) = &config.network.search {
+        write_export(s, "CARGO_UNIKERNEL_DNS_SEARCH", search);
+    }
+}
+
+/// Encodes a list of strings as ';'-joined entries — the shared wire format for env vars that
+/// pass a whole list through a single shell-exported string, mirroring [`encode_kv_pairs`] for
+/// plain entries with no `=value` half.
+fn encode_path_list(entries: &[String]) -> String {
+    entries.join(";")
 }
 
 /// Encodes a `key=value` map as ';'-joined pairs — the shared wire format for env vars that
@@ -266,5 +320,73 @@ mod tests {
         let features = init_features(&config);
         assert!(!features.contains(&"hardening-icmp"));
         assert!(features.contains(&"hardening-tcp"));
+    }
+
+    #[test]
+    fn landlock_is_enabled_by_default() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        assert!(init_features(&config).contains(&"landlock"));
+    }
+
+    #[test]
+    fn disabling_landlock_omits_the_feature() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.app.runtime.landlock.enabled = false;
+        assert!(!init_features(&config).contains(&"landlock"));
+    }
+
+    #[test]
+    fn proc_subset_pid_is_off_by_default() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        assert!(!init_features(&config).contains(&"proc-subset-pid"));
+    }
+
+    #[test]
+    fn app_console_is_off_by_default() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        assert!(!init_features(&config).contains(&"app-console"));
+    }
+
+    #[test]
+    fn logging_is_off_by_default() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        assert!(!init_features(&config).contains(&"logging"));
+    }
+
+    #[test]
+    fn logging_enabled_adds_the_feature() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.logging.enabled = true;
+        assert!(init_features(&config).contains(&"logging"));
+    }
+
+    #[test]
+    fn landlock_extra_paths_are_exported_only_when_the_feature_is_on() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.app.runtime.landlock.extra_read_paths = vec!["/some/path".to_string()];
+        let script = script_guest_init_build(&config);
+        assert!(script.contains(r#"CARGO_UNIKERNEL_LANDLOCK_RO="/some/path""#));
+
+        config.app.runtime.landlock.enabled = false;
+        let script = script_guest_init_build(&config);
+        assert!(!script.contains("CARGO_UNIKERNEL_LANDLOCK_RO"));
+    }
+
+    #[test]
+    fn nameservers_and_search_are_exported_as_configured() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.network.nameservers = vec!["9.9.9.9".to_string(), "149.112.112.112".to_string()];
+        config.network.search = Some("corp.example".to_string());
+        let script = script_guest_init_build(&config);
+        assert!(script.contains(r#"CARGO_UNIKERNEL_NAMESERVERS="9.9.9.9;149.112.112.112""#));
+        assert!(script.contains(r#"CARGO_UNIKERNEL_DNS_SEARCH="corp.example""#));
+    }
+
+    #[test]
+    fn tmpfs_sizes_are_always_exported() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        let script = script_guest_init_build(&config);
+        assert!(script.contains(r#"CARGO_UNIKERNEL_TMPFS_TMP_MB="64""#));
+        assert!(script.contains(r#"CARGO_UNIKERNEL_TMPFS_RUN_MB="16""#));
     }
 }

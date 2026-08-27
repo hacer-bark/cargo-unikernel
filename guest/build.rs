@@ -39,4 +39,28 @@ fn main() {
     passthrough("CARGO_UNIKERNEL_LIMIT_AS_MB", "0");
     // RLIMIT_MEMLOCK in MiB — finite on purpose, see schema::AppLimits::max_locked_memory_mb.
     passthrough("CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB", "64");
+
+    // Everything below is plain per-deployment DATA, never a mechanism on/off switch — see
+    // Cargo.toml's feature list for why on/off switches are `--features` flags instead
+    // (`hardening-*`, `landlock`, `proc-subset-pid`, `app-console`, `logging`), never a baked
+    // bool read at runtime.
+
+    // tmpfs sizes in MiB, from [storage.tmpfs]. Previously hardcoded in mounts.rs, which left
+    // an app with a larger scratch need no way out short of a fork.
+    passthrough("CARGO_UNIKERNEL_TMPFS_TMP_MB", "64");
+    passthrough("CARGO_UNIKERNEL_TMPFS_RUN_MB", "16");
+    passthrough("CARGO_UNIKERNEL_TMPFS_SHM_MB", "64");
+    passthrough("CARGO_UNIKERNEL_TMPFS_VAR_TMP_MB", "64");
+
+    // ';'-joined extra paths for the `landlock` feature's ruleset, from
+    // `[app.runtime.landlock]`. Read only by code compiled under that feature — inert data
+    // when the feature is off, same as every other passthrough here.
+    passthrough("CARGO_UNIKERNEL_LANDLOCK_RO", "");
+    passthrough("CARGO_UNIKERNEL_LANDLOCK_RW", "");
+
+    // ';'-joined resolver addresses for /etc/resolv.conf, from [network].nameservers. Empty
+    // means "use whatever the kernel's DHCP client left in /proc/net/pnp".
+    passthrough("CARGO_UNIKERNEL_NAMESERVERS", "");
+    // Optional `search`/`domain` line for /etc/resolv.conf.
+    passthrough("CARGO_UNIKERNEL_DNS_SEARCH", "");
 }
