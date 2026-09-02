@@ -55,6 +55,11 @@ fn main() {
     // ';'-joined extra paths for the `landlock` feature's ruleset, from
     // `[app.runtime.landlock]`. Read only by code compiled under that feature — inert data
     // when the feature is off, same as every other passthrough here.
+    // ';'-joined "proto:ports" entries for the `firewall` feature's ruleset, from
+    // [network.firewall].inbound — e.g. "tcp:80;tcp:443;udp:443". Empty means a guest that
+    // answers nothing at all, which is a valid (and deliberately silent) configuration.
+    passthrough("CARGO_UNIKERNEL_FIREWALL_RULES", "");
+
     passthrough("CARGO_UNIKERNEL_LANDLOCK_RO", "");
     passthrough("CARGO_UNIKERNEL_LANDLOCK_RW", "");
 

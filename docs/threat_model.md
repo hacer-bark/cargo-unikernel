@@ -66,6 +66,22 @@ what gets measured.
 | Malicious/wrong OVMF firmware | `preset = "builtin"` is baked in, never fetched; a provider-supplied `path` is local but not verifiable by the tool |
 | `cargo unikernel release`'s `gh` call | Standard CI-secret hygiene; generated workflow scopes `contents: write` only |
 
+### Unsolicited network traffic (pre-RCE, both profiles)
+
+| Attack | Mitigation |
+|:---|:---|
+| Port-scan the guest to find what it runs | `[network.firewall]` (on by default): an nftables `input` chain with `policy drop`, so an unlisted port produces no `RST` and no ICMP unreachable — a scanner sees `filtered`, the same answer a dark address gives. Only the ports in `inbound` reach the stack at all |
+| Ping/ICMP-probe for liveness | Echo request is not in the admitted ICMP set, so nothing replies. `icmp_echo_ignore_all=1` (`[hardening.runtime].icmp_hardening`) is the second answer to the same question |
+| Reach a port the app opened that the config never mentioned | The filter is an allowlist over ports, not over the app's behaviour: a listener the config doesn't name is unreachable from off-box regardless of what bound it |
+| Change the port policy from the host | On sev-snp the policy is baked into the guest image and covered by the launch measurement, so a peer verifying an attestation report verifies the port policy with it — unlike a host-side security group, which the host can edit |
+| Reconfigure the filter after an RCE | The app is an unprivileged uid with an empty capability bounding set — no `CAP_NET_ADMIN`, so nf_tables refuses it. With `[network.firewall].enabled = false` the kernel has no netfilter compiled in at all, which is the same answer by removal |
+
+Not covered, and deliberately: the guest still answers ARP and IPv6 neighbour solicitation, because
+an address that answers neither is unreachable at L2 — an attacker on the same segment can always
+see the guest exists. Outbound traffic is unrestricted by design, so egress destinations and timing
+are visible to the network. The kernel's own `ip=dhcp` autoconfiguration runs before PID 1 exists,
+so that one exchange predates the filter; nothing is listening yet, but it is not zero.
+
 ### Runtime exploitation (post-RCE, both profiles)
 
 | Attack | Mitigation |

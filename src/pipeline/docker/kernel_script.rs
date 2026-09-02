@@ -30,6 +30,7 @@ pub(super) fn script_kernel_build(config: &Config) -> String {
         .chain([
             kernel::fips_env_var(&config.hardening.kernel),
             kernel::storage_env_var(config.storage.mode),
+            kernel::firewall_env_var(&config.network),
         ])
     {
         write_export(&mut s, name, value);

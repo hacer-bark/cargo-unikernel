@@ -104,6 +104,12 @@ else
     FRAGMENTS+=("$SCRIPT_DIR/kconfig/storage/ram.config")
 fi
 
+# After the category fragments, which disable CONFIG_NETFILTER wholesale: the in-guest firewall
+# is the one thing that needs it back, and "last write wins" is what lets it say so.
+if [ "${CARGO_UNIKERNEL_FIREWALL:-0}" = "1" ]; then
+    FRAGMENTS+=("$SCRIPT_DIR/kconfig/network/firewall.config")
+fi
+
 if [ -n "$EXTRA_KCONFIG_FILE" ] && [ -f "$EXTRA_KCONFIG_FILE" ]; then
     FRAGMENTS+=("$EXTRA_KCONFIG_FILE")
 fi

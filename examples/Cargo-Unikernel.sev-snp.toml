@@ -96,6 +96,29 @@ mode = "ipv4"
 # nameservers = ["9.9.9.9", "149.112.112.112"]
 # search = "corp.example"
 
+# Inbound packet filter. The guest answers nothing it was not told to answer: an unlisted port
+# gets no RST, UDP gets no ICMP unreachable, and ping gets no reply — to a scanner the address
+# looks like one with nothing behind it. Outbound traffic is unrestricted, and replies to
+# connections the guest itself opens come back on connection state, without opening any port.
+#
+# The default below is plain web traffic. Every port the app listens on must be listed here or
+# it is unreachable; an empty `inbound = []` is legal and means a guest that answers nothing at
+# all, which is right for a worker that only makes outbound connections.
+#
+# On this profile the policy is part of the launch measurement: a peer verifying an attestation
+# report is also verifying which ports this guest can answer on. A host-side security group is a
+# policy the host can change; this one it cannot.
+[network.firewall]
+# enabled = false removes the filter entirely — and with it the netfilter/conntrack code from
+# the kernel build, so there is nothing compiled in for a compromised app to reconfigure.
+enabled = true
+inbound = [
+    { proto = "tcp", ports = "80" },    # HTTP
+    { proto = "tcp", ports = "443" },   # HTTPS
+    { proto = "udp", ports = "443" },   # HTTP/3 (QUIC) — same port, different protocol
+    # { proto = "tcp", ports = "8000-8100" },   # inclusive range, low end first
+]
+
 [storage]
 # "ram" (default): /var is wiped every reboot. "persistent": /var lives on a virtio-blk disk;
 # an untrusted/foreign device is wiped and reformatted rather than trusted.
@@ -112,17 +135,19 @@ mode = "ram"
 # var_tmp_mb = 64
 
 [kernel]
-version = "6.18.45"
+# Linux kernel version to build. Tarball and compiled bzImage are cached by version+config.
+version = "6.18.49"
+# Optional: pin the expected sha256 of the kernel.org tarball. Build fails on mismatch.
 # sha256 = "…"
 
 # [toolchain]
 # Overrides the reproducible-build toolchain this CLI otherwise pins. All optional; see
 # docs/reproducible_builds.md — overriding one means reproducible given that pin, not this
 # CLI version's defaults.
-# apt_snapshot = "20260820T000000Z"   # snapshot.ubuntu.com timestamp; "latest" (casual only)
-# rust_version = "1.98.0"             # rustup --default-toolchain version
-# e2fsprogs_version = "1.47.4"        # mke2fs release (storage.mode = "persistent" only)
-# e2fsprogs_sha256 = "…"              # recommended if e2fsprogs_version is set
+# apt_snapshot = "20260820T000000Z" # snapshot.ubuntu.com timestamp; "latest" (casual only)
+# rust_version = "1.98.0"           # rustup --default-toolchain version
+# e2fsprogs_version = "1.47.4"      # mke2fs release (storage.mode = "persistent" only)
+# e2fsprogs_sha256 = "…"            # recommended if e2fsprogs_version is set
 
 [hardening]
 level = "default"
@@ -159,11 +184,6 @@ vcpus = 2
 vcpu_type = "EPYC-Milan"
 # Baked into both the UKI's .cmdline section and the string sev-snp-measure.py hashes, so what's
 # measured and what boots can never drift apart. See docs/architecture.md's cmdline rationale.
-#
-# random.trust_cpu=on is deliberate here, unlike the casual profile: this profile's threat model
-# doesn't trust the hypervisor, so host-fed virtio-rng entropy is adversarial in this context,
-# while RDRAND/RDSEED execute on real silicon inside the encrypted guest, outside the
-# hypervisor's reach.
 kernel_cmdline = "console=ttyS0 ip=dhcp quiet loglevel=3 panic=-1 random.trust_cpu=on random.trust_bootloader=off page_alloc.shuffle=1 lockdown=confidentiality transparent_hugepage=madvise"
 # Which boot inputs sev-snp-measure.py hashes. Defaults to auto-detecting from [output].formats:
 # "uki" if a UKI is built, "kernel-initrd" otherwise. Only set explicitly if your provider's

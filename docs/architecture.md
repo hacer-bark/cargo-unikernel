@@ -55,7 +55,13 @@ flowchart TB
 The app is already embedded at build time, so the sequence is short:
 
 1. `mlockall` — lock all pages, no swap.
-2. Mount `/proc` (`hidepid=2`), `/sys`, `/dev`, `/tmp`+`/var` (noexec unless
+2. Install the inbound packet filter (`[network.firewall]`, on by default) — an nftables
+   `inet` table with a default-drop `input` policy, before any interface comes up, so no packet
+   ever meets an unfiltered stack. Conntrack admits replies to the guest's own outbound
+   connections; loopback, NDP/SLAAC and PMTUD are admitted explicitly; the configured ports are
+   the only unsolicited traffic that gets a response of any kind. Fatal if it cannot be
+   installed — an image whose config names three open ports must not boot answering on 65535.
+3. Mount `/proc` (`hidepid=2`), `/sys`, `/dev`, `/tmp`+`/var` (noexec unless
    `[app.runtime.danger].allow_write_execute`), `/run`, `/dev/shm`, `/payload`, each writable
    tmpfs with an explicit `size=`. `/var` is tmpfs unless `[storage].mode = "persistent"`, in
    which case it's the virtio-blk device — formatted ext4 on first use, wiped instead of
@@ -63,16 +69,16 @@ The app is already embedded at build time, so the sequence is short:
    the kernel's ext4 driver ever sees it). `/var` and `/run` are then `chown`'d to the app's
    uid/gid — both are mode 0755, so without that the app (an unprivileged uid) could not write
    to either; the `1777` scratch mounts need no equivalent.
-3. Bring up loopback + interfaces, apply enabled sysctl hardening. Only `lo`'s IPv4 address is
+4. Bring up loopback + interfaces, apply enabled sysctl hardening. Only `lo`'s IPv4 address is
    set here; the rest comes from DHCP/SLAAC — see [Network addressing](#network-addressing).
-4. Wait (≤30s) for the kernel CRNG to seed — **fatal if it doesn't**, since starting the app
+5. Wait (≤30s) for the kernel CRNG to seed — **fatal if it doesn't**, since starting the app
    anyway risks keys generated from an unseeded pool. Then poll (≤30s) for a default route,
    skipped when `[network].mode = "none"`.
-5. Remount `/payload` read-only, `/sys` read-only, `/` read-only (best-effort — see
+6. Remount `/payload` read-only, `/sys` read-only, `/` read-only (best-effort — see
    `mounts::seal_rootfs`), and `/tmp`/`/run` back to noexec (unless `allow_write_execute`);
    `/var` is never remounted. This happens before the app exists, so it never sees a writable
    payload mount.
-6. `exec` the app, unprivileged. Before `execve`, in order: apply `[app.runtime.limits]`
+7. `exec` the app, unprivileged. Before `execve`, in order: apply `[app.runtime.limits]`
    `setrlimit` ceilings (needs `CAP_SYS_RESOURCE`, so before the capability drop); drop the
    capability bounding set (`PR_CAPBSET_DROP`, needs `CAP_SETPCAP`, so still root); clear
    supplementary groups and `setgid`/`setuid` to the configured uid/gid; install a mandatory
@@ -83,10 +89,10 @@ The app is already embedded at build time, so the sequence is short:
    syscall number carrying `__X32_SYSCALL_BIT`, since x32 reports the same arch and would
    otherwise slip past every check below it. Ordinary `clone`/`fork`/`execve` is untouched;
    namespace creation is blocked by `CONFIG_NAMESPACES=n` instead.
-7. On sev-snp builds, `/dev/sev-guest` (if present) opens to the app — it fetches and binds
+8. On sev-snp builds, `/dev/sev-guest` (if present) opens to the app — it fetches and binds
    its own SEV-SNP reports, since the image runs no attestation service. See
    [`threat_model.md`](threat_model.md#remote-attestation-is-the-apps-job).
-8. PID 1 watchdog: the app's death, or any earlier failure, triggers immediate power-off —
+9. PID 1 watchdog: the app's death, or any earlier failure, triggers immediate power-off —
    never a lingering degraded state.
 
 ## Network addressing

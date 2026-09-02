@@ -5,7 +5,7 @@
 //! this module just knows how `Cargo-Unikernel.toml` maps onto the env vars that script
 //! reads.
 
-use crate::schema::{KernelHardening, NetworkMode, ProfileKind, StorageMode};
+use crate::schema::{KernelHardening, Network, NetworkMode, ProfileKind, StorageMode};
 
 /// The `PROFILE` env var value `assets/kernel/build_kernel.sh` expects for `kind`.
 #[must_use]
@@ -68,6 +68,23 @@ pub const fn fips_env_var(kh: &KernelHardening) -> (&'static str, &'static str) 
     (
         "CARGO_UNIKERNEL_KHARD_FIPS",
         if kh.fips { "1" } else { "0" },
+    )
+}
+
+/// Env var gating `assets/kernel/kconfig/network/firewall.config`.
+///
+/// See `build_kernel.sh`. Defaults to *disabled* if unset; this function always sets it
+/// explicitly from `[network.firewall]`. A guest with no NIC has nothing to filter, so the
+/// fragment is deselected there too rather than compiling netfilter in for no reason.
+#[must_use]
+pub const fn firewall_env_var(network: &Network) -> (&'static str, &'static str) {
+    (
+        "CARGO_UNIKERNEL_FIREWALL",
+        if network.firewall.enabled && network.mode.has_any() {
+            "1"
+        } else {
+            "0"
+        },
     )
 }
 

@@ -394,6 +394,11 @@ pub struct Network {
     pub nameservers: Vec<String>,
     /// `search`/`domain` line for `/etc/resolv.conf`. Omitted by default.
     pub search: Option<String>,
+    /// `[network.firewall]` — which inbound ports answer at all. Defaults to web traffic
+    /// (`80/tcp`, `443/tcp`, `443/udp`) and a default-deny policy for everything else; see
+    /// [`Firewall`].
+    #[serde(default)]
+    pub firewall: Firewall,
 }
 
 const fn default_network_mode() -> NetworkMode {
@@ -407,6 +412,86 @@ impl Default for Network {
             ipv6_static: None,
             nameservers: Vec::new(),
             search: None,
+            firewall: Firewall::default(),
+        }
+    }
+}
+
+/// `[network.firewall]` — the guest's inbound packet filter.
+///
+/// The guest answers nothing it was not configured to answer: an unlisted port gets no `RST`,
+/// UDP gets no ICMP port-unreachable, and `ping` gets no reply. To a scanner the address is
+/// indistinguishable from one with nothing behind it. Outbound traffic is unrestricted, and the
+/// replies to connections the guest itself opens are admitted by connection state rather than by
+/// opening any port to the network.
+///
+/// This is a filter *inside* the guest, which is the point: on a sev-snp image the port policy
+/// is part of the launch measurement, so a remote peer verifying an attestation report is also
+/// verifying which ports that guest can answer on. A host-side security group is a policy the
+/// host could change; this one it cannot.
+///
+/// Implemented by `guest/src/firewall.rs` as an `nftables` ruleset installed before any
+/// interface comes up. Enabling it also selects the netfilter/conntrack Kconfig fragment — a
+/// kernel built with `enabled = false` has no packet filter compiled into it at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Firewall {
+    /// Whether to install the filter. `true` by default.
+    ///
+    /// `false` removes it entirely — the guest replies to pings and answers every port its app
+    /// binds, as it did before this section existed. That is a real choice for a guest already
+    /// behind a filtering fabric it trusts, and a bad one otherwise.
+    #[serde(default = "default_firewall_enabled")]
+    pub enabled: bool,
+    /// The inbound ports that answer, as `{ proto, ports }` entries — `proto` is `"tcp"` or
+    /// `"udp"`, `ports` is `"443"` or an inclusive `"8000-8100"` range.
+    ///
+    /// Defaults to plain web traffic: `80/tcp`, `443/tcp`, and `443/udp` for HTTP/3. An
+    /// explicitly empty list is legal and means a guest that answers nothing at all — the right
+    /// configuration for a worker that only makes outbound connections.
+    #[serde(default = "default_firewall_inbound")]
+    pub inbound: Vec<InboundPorts>,
+}
+
+/// One `[[network.firewall.inbound]]` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboundPorts {
+    /// `"tcp"` or `"udp"`.
+    pub proto: String,
+    /// A single port (`"443"`) or an inclusive range (`"8000-8100"`).
+    pub ports: String,
+}
+
+impl InboundPorts {
+    fn new(proto: &str, ports: &str) -> Self {
+        Self {
+            proto: proto.to_string(),
+            ports: ports.to_string(),
+        }
+    }
+}
+
+const fn default_firewall_enabled() -> bool {
+    true
+}
+
+/// Web traffic and nothing else: HTTP, HTTPS, and HTTP/3 (QUIC, which is UDP on the same port).
+///
+/// A default rather than a required field because the overwhelmingly common case for this tool
+/// is a web server, and an image whose config says nothing about ports should still be one that
+/// works — while still being silent on all the ports it was never asked to serve.
+fn default_firewall_inbound() -> Vec<InboundPorts> {
+    vec![
+        InboundPorts::new("tcp", "80"),
+        InboundPorts::new("tcp", "443"),
+        InboundPorts::new("udp", "443"),
+    ]
+}
+
+impl Default for Firewall {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            inbound: default_firewall_inbound(),
         }
     }
 }
@@ -553,7 +638,7 @@ pub struct Kernel {
 }
 
 fn default_kernel_version() -> String {
-    "6.18.45".to_string()
+    "6.18.49".to_string()
 }
 
 /// sha256 of the `linux-<version>.tar.xz` for [`default_kernel_version`], verified against
@@ -562,7 +647,7 @@ fn default_kernel_version() -> String {
 /// without requiring a config file just to pin a hash for the version this tool already
 /// defaults to.
 const DEFAULT_KERNEL_SHA256: &str =
-    "30fa4a56579ca614ac125a12614f7f6466f87ab1278aef7b951dd74156deab33";
+    "ae826f33111fea6f1d279dde7299d7463c8dfd204aeb75a8fb5432bc60a28191";
 
 impl Default for Kernel {
     fn default() -> Self {
@@ -989,6 +1074,25 @@ pub enum ValidationError {
         /// The version the config asks for, which has no baked-in checksum.
         version: String,
     },
+    /// A `[network.firewall].inbound` entry's `proto` was neither `"tcp"` nor `"udp"`.
+    #[error(
+        "`[network.firewall].inbound` entry {0:?} has an unknown `proto` — expected \"tcp\" or \
+         \"udp\""
+    )]
+    FirewallProtoUnknown(String),
+    /// A `[network.firewall].inbound` entry's `ports` was not a port or an ordered range.
+    #[error(
+        "`[network.firewall].inbound` entry has an unusable `ports` value {0:?} — expected a \
+         single port (\"443\") or an inclusive range with the low end first (\"8000-8100\"), \
+         within 1-65535"
+    )]
+    FirewallPortsUnusable(String),
+    /// `[network.firewall]` left on for a guest with no network stack at all.
+    #[error(
+        "`[network.firewall]` requires `network.mode` other than \"none\" — a guest with no NIC \
+         has no inbound traffic to filter. Remove the section or set `enabled = false`"
+    )]
+    FirewallRequiresNetwork,
     /// `[network.ipv6_static]` set while `network.mode` has no IPv6.
     #[error(
         "`[network.ipv6_static]` requires `network.mode` to include IPv6 (\"ipv6\" or \"dual\") \
@@ -1076,6 +1180,7 @@ impl Config {
         self.validate_extra_sysctl_paths()?;
         self.validate_list_encoding()?;
         self.validate_ipv6_static()?;
+        self.validate_firewall()?;
         self.validate_app()?;
         self.validate_profile()?;
         self.validate_output_and_release()?;
@@ -1232,6 +1337,40 @@ impl Config {
             return Err(ValidationError::Ipv6StaticGatewayUnparseable(
                 gateway.clone(),
             ));
+        }
+        Ok(())
+    }
+
+    /// `[network.firewall]` invariants: a network stack to filter, a known protocol, and a
+    /// port or ordered port range within 1-65535.
+    ///
+    /// Worth validating strictly rather than letting the guest sort it out: the guest treats a
+    /// malformed entry as a build/runtime disagreement and refuses to boot, and every failure
+    /// mode of this section — a typo'd port, a reversed range — produces an image that builds,
+    /// boots, and is quietly unreachable on the port it was supposed to serve.
+    fn validate_firewall(&self) -> Result<(), ValidationError> {
+        let firewall = &self.network.firewall;
+        if !firewall.enabled {
+            return Ok(());
+        }
+        if !self.network.mode.has_any() {
+            return Err(ValidationError::FirewallRequiresNetwork);
+        }
+
+        for entry in &firewall.inbound {
+            if entry.proto != "tcp" && entry.proto != "udp" {
+                return Err(ValidationError::FirewallProtoUnknown(entry.proto.clone()));
+            }
+            let (first, last) = entry
+                .ports
+                .split_once('-')
+                .unwrap_or((&entry.ports, &entry.ports));
+            let (Ok(first), Ok(last)) = (first.parse::<u16>(), last.parse::<u16>()) else {
+                return Err(ValidationError::FirewallPortsUnusable(entry.ports.clone()));
+            };
+            if first == 0 || last < first {
+                return Err(ValidationError::FirewallPortsUnusable(entry.ports.clone()));
+            }
         }
         Ok(())
     }
@@ -1551,6 +1690,62 @@ mod tests {
             config.validate(),
             Err(ValidationError::Ipv6StaticGatewayUnparseable(_))
         ));
+    }
+
+    /// Every failure mode of this section produces an image that builds, boots, and is quietly
+    /// unreachable on the port it was meant to serve — so each one is a config error instead.
+    #[test]
+    fn firewall_rejects_entries_that_would_silently_not_serve() {
+        let with = |proto: &str, ports: &str| {
+            let mut config = base_config();
+            config.network.firewall.inbound = vec![InboundPorts::new(proto, ports)];
+            config.validate()
+        };
+
+        assert!(with("tcp", "443").is_ok());
+        assert!(with("udp", "8000-8100").is_ok());
+        assert!(matches!(
+            with("sctp", "443"),
+            Err(ValidationError::FirewallProtoUnknown(_))
+        ));
+        for bad in ["0", "70000", "443-80", "https", "", "80-"] {
+            assert!(
+                matches!(
+                    with("tcp", bad),
+                    Err(ValidationError::FirewallPortsUnusable(_))
+                ),
+                "ports {bad:?} must be rejected"
+            );
+        }
+
+        // A guest with no NIC has no inbound traffic to filter, and compiling netfilter into it
+        // would be attack surface with nothing behind it.
+        let mut config = base_config();
+        config.network.mode = NetworkMode::None;
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::FirewallRequiresNetwork)
+        ));
+        config.network.firewall.enabled = false;
+        assert!(config.validate().is_ok());
+    }
+
+    /// The default is a working web server that is silent everywhere else — the shape almost
+    /// every image built with this tool has.
+    #[test]
+    fn the_default_policy_serves_web_traffic_and_nothing_else() {
+        let firewall = Firewall::default();
+        assert!(firewall.enabled);
+        let entries: Vec<(&str, &str)> = firewall
+            .inbound
+            .iter()
+            .map(|e| (e.proto.as_str(), e.ports.as_str()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("tcp", "80"), ("tcp", "443"), ("udp", "443")],
+            "HTTP, HTTPS and HTTP/3 — the last is why 443 appears twice"
+        );
     }
 
     /// The guest compiles no IPv6 stack at all in these modes, so the address would be baked

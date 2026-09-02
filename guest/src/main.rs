@@ -15,6 +15,8 @@
 
 mod entropy;
 mod etcfiles;
+#[cfg(feature = "firewall")]
+mod firewall;
 mod hardening;
 #[cfg(feature = "landlock")]
 mod landlock;
@@ -80,6 +82,9 @@ const LIMIT_MEMLOCK_MB: &str = env!("CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB");
 const LANDLOCK_RO: &str = env!("CARGO_UNIKERNEL_LANDLOCK_RO");
 #[cfg(feature = "landlock")]
 const LANDLOCK_RW: &str = env!("CARGO_UNIKERNEL_LANDLOCK_RW");
+
+#[cfg(feature = "firewall")]
+const FIREWALL_RULES: &str = env!("CARGO_UNIKERNEL_FIREWALL_RULES");
 
 const NAMESERVERS: &str = env!("CARGO_UNIKERNEL_NAMESERVERS");
 const DNS_SEARCH: &str = env!("CARGO_UNIKERNEL_DNS_SEARCH");
@@ -548,6 +553,15 @@ fn main() {
 
     log("cargo-unikernel guest init starting (PID 1)...");
     set_self_non_dumpable(|w| log(&format!("[WARN] {w}")));
+
+    // Ahead of `prepare_system_env`, which is what brings the interfaces up: the filter has to
+    // be in place before the guest can receive a packet, not shortly afterwards.
+    #[cfg(feature = "firewall")]
+    crate::firewall::install(
+        &crate::firewall::parse_rules(FIREWALL_RULES, fatal_shutdown),
+        log,
+        fatal_shutdown,
+    );
 
     crate::mounts::prepare_system_env(PAYLOAD_DIR, log, fatal_shutdown);
 

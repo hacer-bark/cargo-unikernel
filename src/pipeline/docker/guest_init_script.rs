@@ -77,6 +77,9 @@ fn init_features(config: &Config) -> Vec<&'static str> {
     if config.app.runtime.landlock.enabled {
         features.push("landlock");
     }
+    if config.network.firewall.enabled && config.network.mode.has_any() {
+        features.push("firewall");
+    }
     if config.app.runtime.console {
         features.push("app-console");
     }
@@ -161,6 +164,24 @@ fn app_env_exports(config: &Config, s: &mut String) {
                 encode_path_list(&config.app.runtime.landlock.extra_read_write_paths),
             );
         }
+    }
+
+    if config.network.firewall.enabled && config.network.mode.has_any() {
+        // ';'-joined "proto:ports" entries, e.g. "tcp:80;tcp:443;udp:443". Exported even when
+        // empty is impossible here (an empty list encodes as an empty string, which build.rs's
+        // own default already is), so the guest reads "answer nothing" either way.
+        write_export(
+            s,
+            "CARGO_UNIKERNEL_FIREWALL_RULES",
+            config
+                .network
+                .firewall
+                .inbound
+                .iter()
+                .map(|entry| format!("{}:{}", entry.proto, entry.ports))
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
     }
 
     if !config.network.nameservers.is_empty() {
@@ -326,6 +347,36 @@ mod tests {
         let features = init_features(&config);
         assert!(!features.contains(&"hardening-icmp"));
         assert!(features.contains(&"hardening-tcp"));
+    }
+
+    /// The whole point of the default: an image nobody configured still answers on the three
+    /// web ports and is silent everywhere else — and the guest gets the ports as data, not as a
+    /// promise the host tool made in a comment somewhere.
+    #[test]
+    fn the_firewall_is_on_by_default_and_exports_the_web_ports() {
+        let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        assert!(init_features(&config).contains(&"firewall"));
+        let script = script_guest_init_build(&config);
+        assert!(script.contains(r#"CARGO_UNIKERNEL_FIREWALL_RULES="tcp:80;tcp:443;udp:443""#));
+    }
+
+    /// Turning it off must remove the feature *and* the rules: a build that carried the ports
+    /// but not the code that enforces them would read as configured-and-filtered while being
+    /// neither.
+    #[test]
+    fn disabling_the_firewall_omits_both_the_feature_and_the_rules() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.network.firewall.enabled = false;
+        assert!(!init_features(&config).contains(&"firewall"));
+        assert!(!script_guest_init_build(&config).contains("CARGO_UNIKERNEL_FIREWALL_RULES"));
+    }
+
+    /// A guest with no NIC has nothing to filter, whatever the section says.
+    #[test]
+    fn a_guest_with_no_network_gets_no_firewall() {
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.network.mode = NetworkMode::None;
+        assert!(!init_features(&config).contains(&"firewall"));
     }
 
     #[test]
