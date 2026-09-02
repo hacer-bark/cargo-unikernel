@@ -486,24 +486,33 @@ fn log_interface_addresses(log: &impl Fn(&str)) {
     }
 }
 
+/// `RTF_UP`, from `linux/route.h`. A route the kernel is still holding down reads exactly like
+/// a settled one without this bit, which is precisely the state the settle poll is waiting to
+/// see the end of — so both parsers below check it rather than trusting the destination alone.
+#[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
+const RTF_UP: u32 = 0x1;
+
 /// `/proc/net/route` fields: `Iface Destination Gateway Flags …` — a default route has an
-/// all-zero destination, and `RTF_UP` (0x1) set in the hex flags. Checking the flags too, since
-/// a route the kernel is still holding down reads exactly like a settled one without them.
+/// all-zero destination and `RTF_UP` set in the hex flags.
 #[cfg(feature = "net-ipv4")]
 fn has_default_route_v4() -> bool {
-    const RTF_UP: u32 = 0x1;
-    let Ok(routes) = std::fs::read_to_string("/proc/net/route") else {
-        return false;
-    };
+    std::fs::read_to_string("/proc/net/route").is_ok_and(|routes| route_v4_has_default(&routes))
+}
+
+/// The pure half of [`has_default_route_v4`], split out so the field offsets are testable
+/// without a `/proc`.
+#[cfg(feature = "net-ipv4")]
+fn route_v4_has_default(routes: &str) -> bool {
     routes.lines().skip(1).any(|line| {
         let mut fields = line.split_whitespace();
+        // Iface, then the destination.
         fields.next();
         if fields.next() != Some("00000000") {
             return false;
         }
-        fields.next();
+        // Skip the gateway — the flags follow.
         fields
-            .next()
+            .nth(1)
             .and_then(|flags| u32::from_str_radix(flags, 16).ok())
             .is_some_and(|flags| flags & RTF_UP != 0)
     })
@@ -512,16 +521,29 @@ fn has_default_route_v4() -> bool {
 /// `/proc/net/ipv6_route` fields: `dest_addr dest_prefixlen src_addr src_prefixlen next_hop
 /// metric refcnt use flags devname` — a default route has an all-zero destination and a
 /// zero prefix length.
+///
 #[cfg(feature = "net-ipv6")]
 fn has_default_route_v6() -> bool {
-    let Ok(routes) = std::fs::read_to_string("/proc/net/ipv6_route") else {
-        return false;
-    };
+    std::fs::read_to_string("/proc/net/ipv6_route")
+        .is_ok_and(|routes| route_v6_has_default(&routes))
+}
+
+/// The pure half of [`has_default_route_v6`], split out so the field offsets are testable
+/// without a `/proc`. Unlike `/proc/net/route`, this file carries no header line.
+#[cfg(feature = "net-ipv6")]
+fn route_v6_has_default(routes: &str) -> bool {
     routes.lines().any(|line| {
         let mut fields = line.split_whitespace();
         let dest = fields.next();
         let prefix_len = fields.next();
-        dest == Some("00000000000000000000000000000000") && prefix_len == Some("00")
+        if dest != Some("00000000000000000000000000000000") || prefix_len != Some("00") {
+            return false;
+        }
+        // Skip src_addr, src_prefixlen, next_hop, metric, refcnt and use — the flags follow.
+        fields
+            .nth(6)
+            .and_then(|flags| u32::from_str_radix(flags, 16).ok())
+            .is_some_and(|flags| flags & RTF_UP != 0)
     })
 }
 
@@ -559,6 +581,63 @@ pub(crate) fn wait_for_network_settle(
     }
     log("[WARN] No default route after the settle timeout — continuing anyway.");
     log_interface_addresses(&log);
+}
+
+/// The settle poll's whole job is deciding when the network is usable, and both parsers reach
+/// their flags field by counting columns — one miscounted column silently turns "is this route
+/// up?" into "is this route's refcount odd?". Real lines from a booted guest, so the offsets are
+/// checked against the format the kernel actually prints rather than a restatement of it.
+#[cfg(all(test, any(feature = "net-ipv4", feature = "net-ipv6")))]
+// Tests panicking (via unwrap/expect/assert) on failure is the point, not a code
+// smell — this is the standard justified exception to these lints.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod route_tests {
+    #[cfg(feature = "net-ipv4")]
+    use super::route_v4_has_default;
+    #[cfg(feature = "net-ipv6")]
+    use super::route_v6_has_default;
+
+    #[cfg(feature = "net-ipv4")]
+    #[test]
+    fn an_ipv4_default_route_counts_only_once_it_is_up() {
+        const HEADER: &str = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n";
+        let up = format!("{HEADER}eth0\t00000000\t0102030A\t0003\t0\t0\t0\t00000000\n");
+        let down = format!("{HEADER}eth0\t00000000\t0102030A\t0000\t0\t0\t0\t00000000\n");
+        let on_link = format!("{HEADER}eth0\t000010AC\t00000000\t0001\t0\t0\t0\t00FFFFFF\n");
+
+        assert!(route_v4_has_default(&up));
+        assert!(
+            !route_v4_has_default(&down),
+            "a route being held down is not a settled one"
+        );
+        assert!(
+            !route_v4_has_default(&on_link),
+            "an on-link route is not a default route"
+        );
+        assert!(!route_v4_has_default(HEADER));
+    }
+
+    #[cfg(feature = "net-ipv6")]
+    #[test]
+    fn an_ipv6_default_route_counts_only_once_it_is_up() {
+        const ZERO: &str = "00000000000000000000000000000000";
+        let line = |dst_len: &str, flags: &str| {
+            format!(
+                "{ZERO} {dst_len} {ZERO} 00 fe800000000000000000000000000001 00000400 00000000 00000000 {flags} eth0\n"
+            )
+        };
+
+        assert!(route_v6_has_default(&line("00", "00000003")));
+        assert!(
+            !route_v6_has_default(&line("00", "00000002")),
+            "RTF_GATEWAY without RTF_UP is a route the kernel is still holding down"
+        );
+        assert!(
+            !route_v6_has_default(&line("40", "00000003")),
+            "a /64 prefix route is not a default route"
+        );
+        assert!(!route_v6_has_default(""));
+    }
 }
 
 #[cfg(all(test, feature = "net-ipv6"))]

@@ -12,16 +12,33 @@
 //! [`apply_baseline_tuning`] is the one exception: it's not a hardening category, isn't
 //! feature-gated, and always runs — see its doc comment.
 
+/// Tally of what [`write_sysctl`] actually did, reported once by [`apply`].
+///
+/// An absent knob is skipped silently and for good reason (see [`write_sysctl`]), but "silently"
+/// applied to a whole category is how a hardening pass turns into a no-op nobody notices — a
+/// renamed knob upstream, or a category running before the subsystem it tunes exists. Two
+/// counters and one summary line make the difference between "24 applied" and "0 applied, 24
+/// absent" visible without weakening the per-write behaviour. Plain statics rather than a
+/// counter threaded through every category function: PID 1 applies these once, from one thread,
+/// and the alternative is an extra parameter on ten call sites.
+static APPLIED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ABSENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn bump(counter: &std::sync::atomic::AtomicU32) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn write_sysctl(path: &str, val: &[u8], warn: &impl Fn(&str)) {
-    if let Err(e) = std::fs::write(path, val) {
+    match std::fs::write(path, val) {
+        Ok(()) => bump(&APPLIED),
         // Missing means the kernel feature it would tune is already compiled out (e.g.
         // CONFIG_KEXEC, CONFIG_BPF_SYSCALL, or CONFIG_IPV6 when net-ipv6 isn't selected) —
         // nothing to restrict, not a failure.
-        if e.kind() == std::io::ErrorKind::NotFound {
-            return;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bump(&ABSENT),
+        Err(e) => {
+            let val = String::from_utf8_lossy(val);
+            warn(&format!("Failed to set sysctl {path} to {val:?}: {e}"));
         }
-        let val = String::from_utf8_lossy(val);
-        warn(&format!("Failed to set sysctl {path} to {val:?}: {e}"));
     }
 }
 
@@ -106,7 +123,13 @@ fn apply_source_routing_protection(warn: &impl Fn(&str)) {
 #[cfg(feature = "hardening-net-spoofing")]
 fn apply_arp_hardening(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/net/ipv4/conf/all/arp_filter", b"1", warn);
-    write_sysctl("/proc/sys/net/ipv4/conf/all/arp_ignore", b"2", warn);
+    // "1" (answer only for an address local to the receiving interface), not "2" (also require
+    // the sender to be in the same subnet as the target). On the single-NIC guest this runs in,
+    // the two are equivalent right up until the provider puts the gateway *outside* the guest's
+    // subnet — a point-to-point /32 layout several large hosts use — where "2" makes the guest
+    // refuse to answer its own gateway's ARP and silently fall off the network. "1" is the whole
+    // of the protection that actually applies here; "2" only adds a way to be unreachable.
+    write_sysctl("/proc/sys/net/ipv4/conf/all/arp_ignore", b"1", warn);
     write_sysctl(
         "/proc/sys/net/ipv4/conf/all/drop_gratuitous_arp",
         b"1",
@@ -157,6 +180,20 @@ fn apply_info_leak_restriction(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/kernel/kptr_restrict", b"2", warn);
     write_sysctl("/proc/sys/kernel/dmesg_restrict", b"1", warn);
     write_sysctl("/proc/sys/kernel/perf_event_paranoid", b"3", warn);
+    // SysRq is reached over the serial console, which on sev-snp is the *hypervisor* — outside
+    // the trust boundary — and answers with task lists, register dumps and memory state.
+    // `CONFIG_MAGIC_SYSRQ=disable` (debug-interfaces.config) already removes it, but that whole
+    // fragment is opt-out, exactly like the kexec/module knobs pinned elsewhere in this file.
+    write_sysctl("/proc/sys/kernel/sysrq", b"0", warn);
+    // An oops prints a full register and stack trace to that same console and then leaves the
+    // kernel running in a state it just declared inconsistent. Stopping at the first one is both
+    // the smaller leak and the honest response to a guest whose integrity is already in question.
+    write_sysctl("/proc/sys/kernel/panic_on_oops", b"1", warn);
+    // TCP timestamps carry a monotonic counter derived from the guest's uptime, which is a
+    // fingerprint and a boot-time oracle for any peer that can reach the listener. Costs PAWS
+    // and finer RTT estimation, which matters on long fat networks — the trade this category
+    // exists to let a deployment make.
+    write_sysctl("/proc/sys/net/ipv4/tcp_timestamps", b"0", warn);
 }
 
 /// Disable unprivileged BPF and userfaultfd, and lock down ptrace (YAMA scope 3).
@@ -204,11 +241,20 @@ fn apply_baseline_tuning(warn: &impl Fn(&str)) {
     write_sysctl("/proc/sys/kernel/randomize_va_space", b"2", warn);
 }
 
+/// What one [`apply`] pass did, for the caller to log as boot progress rather than as a warning.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Summary {
+    /// Knobs written successfully.
+    pub(crate) applied: u32,
+    /// Knobs this kernel doesn't have, skipped (see [`write_sysctl`]).
+    pub(crate) absent: u32,
+}
+
 /// Applies every compiled-in hardening category, then any `extra` (path, value) pairs from
 /// `Cargo-Unikernel.toml`'s `hardening.extra_sysctls`.
 ///
 /// Logs (but does not fail the boot on) any write error.
-pub(crate) fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
+pub(crate) fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) -> Summary {
     apply_baseline_tuning(&warn);
     #[cfg(feature = "hardening-net-spoofing")]
     apply_network_spoofing_protection(&warn);
@@ -223,6 +269,17 @@ pub(crate) fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
     #[cfg(feature = "hardening-kexec-fs")]
     apply_kexec_and_fs_protection(&warn);
 
+    apply_extra(extra, &warn);
+
+    Summary {
+        applied: APPLIED.load(std::sync::atomic::Ordering::Relaxed),
+        absent: ABSENT.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The `hardening.extra_sysctls` half of [`apply`], split out so that function reads as the list
+/// of categories it is.
+fn apply_extra(extra: &[(&str, &str)], warn: &impl Fn(&str)) {
     for (path, val) in extra {
         if !is_sysctl_path(path) {
             warn(&format!(
@@ -231,7 +288,7 @@ pub(crate) fn apply(extra: &[(&str, &str)], warn: impl Fn(&str)) {
             ));
             continue;
         }
-        write_sysctl(path, val.as_bytes(), &warn);
+        write_sysctl(path, val.as_bytes(), warn);
     }
 }
 

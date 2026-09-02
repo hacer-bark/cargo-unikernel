@@ -20,6 +20,17 @@ const TMPFS_RUN_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_RUN_MB");
 const TMPFS_SHM_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_SHM_MB");
 const TMPFS_VAR_TMP_MB: &str = env!("CARGO_UNIKERNEL_TMPFS_VAR_TMP_MB");
 
+/// `size={mb}m,{rest}`, with `mb` parsed as a number first.
+///
+/// Every other baked-in constant goes through `crate::baked` before it is used; without this
+/// these four would be the only ones spliced into a `mount(2)` option string as raw text, where
+/// a value that wasn't a number would silently become extra mount options rather than a boot
+/// failure. `what` names the constant if the parse fails.
+fn tmpfs_data(mb: &str, what: &str, rest: &str) -> String {
+    let mb: u64 = crate::baked(mb, what);
+    format!("size={mb}m,{rest}")
+}
+
 /// `data` as a `CString`, for the one argument `rustix::mount::mount` still takes as an
 /// `Option<&CStr>` rather than a generic `path::Arg` — every other argument here is a fixed
 /// string literal chosen by this crate, so only this one ever needs the conversion.
@@ -107,9 +118,9 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     log("Mounting essential filesystems...");
     log_write_execute_danger(&log, "/tmp");
 
-    let tmp_data = format!("size={TMPFS_TMP_MB}m,mode=1777");
-    let run_data = format!("size={TMPFS_RUN_MB}m,mode=0755");
-    let shm_data = format!("size={TMPFS_SHM_MB}m,mode=1777");
+    let tmp_data = tmpfs_data(TMPFS_TMP_MB, "CARGO_UNIKERNEL_TMPFS_TMP_MB", "mode=1777");
+    let run_data = tmpfs_data(TMPFS_RUN_MB, "CARGO_UNIKERNEL_TMPFS_RUN_MB", "mode=0755");
+    let shm_data = tmpfs_data(TMPFS_SHM_MB, "CARGO_UNIKERNEL_TMPFS_SHM_MB", "mode=1777");
 
     // Ordered: each entry's target must already exist, which for /dev/pts, /dev/shm and
     // /var/tmp means the filesystem carrying it is mounted by an earlier entry.
@@ -196,7 +207,11 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     .unwrap_or_else(|e| fatal(&format!("Failed to mount /var: {e}")));
 
     let _ = std::fs::create_dir_all("/var/tmp");
-    let var_tmp_data = format!("size={TMPFS_VAR_TMP_MB}m,mode=1777");
+    let var_tmp_data = tmpfs_data(
+        TMPFS_VAR_TMP_MB,
+        "CARGO_UNIKERNEL_TMPFS_VAR_TMP_MB",
+        "mode=1777",
+    );
     mount(
         "tmpfs",
         "/var/tmp",
@@ -281,9 +296,18 @@ const fn proc_remount_data() -> &'static str {
 /// this init still needs to write there itself up to this point in boot.
 ///
 /// `/run` is remounted noexec unconditionally. Calls `fatal(msg)` (never returns) on any
-/// remount failure.
+/// remount failure, except the root filesystem's — see [`seal_rootfs`].
 pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: fn(&str) -> !) {
     log("Locking down filesystem...");
+
+    // Nothing writes to `/sys` after boot — this init never did, and no app in a single-purpose
+    // guest has business steering the kernel through it. Read-only is what makes that a property
+    // of the mount rather than of every file's owner and mode, and it holds whether or not the
+    // `landlock` feature (which narrows `/sys` much further, to the CPU topology) is compiled in.
+    remount("/sys", NOSUID_NODEV_NOEXEC.union(MountFlags::RDONLY), "")
+        .unwrap_or_else(|e| fatal(&format!("Failed to remount /sys read-only: {e}")));
+
+    seal_rootfs(&log);
 
     remount("/proc", NOSUID_NODEV_NOEXEC, proc_remount_data())
         .unwrap_or_else(|e| fatal(&format!("Failed to remount /proc: {e}")));
@@ -304,11 +328,11 @@ pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: 
         ))
     });
 
-    let tmp_data = format!("size={TMPFS_TMP_MB}m,mode=1777");
+    let tmp_data = tmpfs_data(TMPFS_TMP_MB, "CARGO_UNIKERNEL_TMPFS_TMP_MB", "mode=1777");
     remount("/tmp", tmp_remount_flags(), &tmp_data)
         .unwrap_or_else(|e| fatal(&format!("Failed to remount /tmp: {e}")));
 
-    let run_data = format!("size={TMPFS_RUN_MB}m,mode=0755");
+    let run_data = tmpfs_data(TMPFS_RUN_MB, "CARGO_UNIKERNEL_TMPFS_RUN_MB", "mode=0755");
     remount(
         "/run",
         MountFlags::NOSUID
@@ -319,4 +343,23 @@ pub(crate) fn lockdown_filesystem(payload_dir: &str, log: impl Fn(&str), fatal: 
     .unwrap_or_else(|e| fatal(&format!("Failed to remount /run noexec: {e}")));
 
     log_lockdown_complete(&log);
+}
+
+/// Remounts `/` read-only, so `/etc` and every other path on the image's own root filesystem is
+/// fixed for the rest of the boot rather than merely owned by a uid the app doesn't have.
+///
+/// A warning rather than `fatal`, alone among the remounts here: every other one is on a mount
+/// *this* file created moments earlier with known flags, while `/` is whatever the kernel handed
+/// this init — an initramfs on some builds, a read-only image on others — and the failure mode
+/// (`EBUSY` from a descriptor this process doesn't control) would turn a defense-in-depth
+/// tightening into a guest that refuses to boot. The app is an unprivileged uid and every
+/// root-owned directory on `/` is mode 0755, so this closes a window rather than a hole.
+fn seal_rootfs(log: &impl Fn(&str)) {
+    match remount("/", MountFlags::RDONLY, "") {
+        Ok(()) => log("Root filesystem remounted read-only."),
+        Err(e) => log(&format!(
+            "[WARN] Failed to remount / read-only: {e}. Paths on the root filesystem (/etc among \
+             them) stay writable to root for the rest of this boot."
+        )),
+    }
 }

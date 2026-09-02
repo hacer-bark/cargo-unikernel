@@ -11,9 +11,11 @@
 //! app's own uid failing is a surprising way for a program to break, and `/etc/hosts` without
 //! `localhost` is a worse one.
 //!
-//! Everything here is written by PID 1 onto a tmpfs before the app exists, and the mount is
-//! remounted read-only by `mounts::lockdown_filesystem` — so this is not writable state the
-//! app can turn into a persistence mechanism, and the shutdown scrub has nothing to do here.
+//! Everything here is written by PID 1 before the app exists, onto the image's own root
+//! filesystem — which `mounts::lockdown_filesystem` then remounts read-only (best-effort; see
+//! `mounts::seal_rootfs`) and which the app, an unprivileged uid facing root-owned 0755
+//! directories, cannot write to either way. So this is not writable state the app can turn into
+//! a persistence mechanism, and the shutdown scrub has nothing to do here.
 
 /// Where the kernel's IP autoconfiguration publishes what DHCP told it, in `resolv.conf`
 /// syntax already. Only exists on an `ip=dhcp` boot.

@@ -271,6 +271,25 @@ const BASELINE_SYSCALLS: &[i64] = &[
     libc::SYS_clock_settime,
     libc::SYS_clock_adjtime,
     libc::SYS_adjtimex,
+    // Reads the kernel ring buffer, which carries raw kernel addresses and driver state.
+    // `dmesg_restrict=1` closes it too, but only in a build that compiled in
+    // `hardening-info-leak` — and a denial that depends on an opt-out toggle is exactly the
+    // arrangement the `io_uring` entries above exist to avoid.
+    libc::SYS_syslog,
+    // Legacy x86 segment/loader interfaces with a long CVE history (`modify_ldt` in particular)
+    // and no use whatsoever in a modern static binary.
+    libc::SYS_modify_ldt,
+    libc::SYS_uselib,
+    // Filesystem quota administration — meaningless in this guest, and a root-only interface an
+    // app should never be probing.
+    libc::SYS_quotactl,
+    // Reaches into another process: `pidfd_getfd` steals an open descriptor outright,
+    // `process_madvise` operates on its address space. Both are same-uid-only, which in this
+    // guest means the app and its own children — but that is precisely the boundary a compromised
+    // worker crossing into its parent would want, and it pairs with the `process_vm_*` denials
+    // already above.
+    libc::SYS_pidfd_getfd,
+    libc::SYS_process_madvise,
 ];
 
 /// Builds the compiled BPF program for the baseline denylist. Must be called *before* `fork()`

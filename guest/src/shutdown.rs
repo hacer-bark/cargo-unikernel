@@ -9,9 +9,10 @@
 //! alive, best-effort zeroes writable tmpfs state, and powers off.
 //!
 //! [`wipe_and_power_off`] is the other way in: the same wipe, reached from a fatal error rather
-//! than a shutdown request. It skips the `SIGTERM` grace period (nothing is owed a clean exit
-//! at that point) and is bounded by a hard deadline, but it scrubs the same paths — an
-//! integrity failure should not leave more behind than an orderly stop does.
+//! than a shutdown request. It skips the `SIGTERM` grace period (nothing is owed a clean exit at
+//! that point), but it scrubs the same paths — an integrity failure should not leave more behind
+//! than an orderly stop does. Both paths meet in [`kill_wipe_and_power_off`], which is where the
+//! single-entry interlock and the hard deadline on the wipe live, so neither can hang the guest.
 
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
@@ -35,23 +36,26 @@ static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 const SIGTERM_GRACE: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Hard ceiling on the whole of [`wipe_and_power_off`], enforced by a watchdog thread that
-/// powers off regardless of what the wipe is doing.
+/// Hard ceiling on the kill-wipe-power-off tail shared by both shutdown paths, enforced by a
+/// watchdog thread that powers off regardless of what the wipe is doing.
 ///
-/// The wipe runs on a path that was reached *because* something is already wrong, so it must
-/// not be able to keep a compromised guest alive by being slow — a `read_dir` on a corrupted
-/// mount, a `write_all` to a full tmpfs, or an `unmount` that blocks would otherwise leave the
-/// VM up indefinitely. Generous enough for a full 64 MB `/tmp` plus an ext4 unmount, short
-/// enough that a wedged wipe is bounded.
-const EMERGENCY_WIPE_DEADLINE: Duration = Duration::from_secs(20);
+/// Nothing about the wipe is more trustworthy on the graceful path than on the fatal one: a
+/// `read_dir` on a corrupted mount, a `write_all` to a full tmpfs, or an `unmount` that blocks
+/// leaves the VM up indefinitely either way — and on the graceful path that means a hypervisor's
+/// stop request never completing. So the deadline is armed by [`kill_wipe_and_power_off`], where
+/// both entrances pass, rather than by the fatal one alone. Generous enough for a full 64 MB
+/// `/tmp` plus an ext4 unmount, short enough that a wedged wipe is bounded.
+const WIPE_DEADLINE: Duration = Duration::from_secs(20);
 
-/// How long [`wipe_and_power_off`] waits for `SIGKILL`ed processes to actually leave the
+/// How long [`kill_wipe_and_power_off`] waits for `SIGKILL`ed processes to actually leave the
 /// process table before scrubbing, so nothing is still writing into what's being scrubbed.
 const KILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Guards against re-entering the wipe. A second entry means the wipe itself is what failed
-/// (it called `fatal` again), so the only remaining safe move is to stop trying and power off.
-static EMERGENCY_WIPE_STARTED: AtomicBool = AtomicBool::new(false);
+/// Guards against a second entry into the wipe, from either path. A second entry means either
+/// the wipe itself failed (it called `fatal` again) or a fatal error landed on another thread
+/// while the graceful wipe was already running — in both cases the only safe move is to stop
+/// trying and power off, rather than have two threads `kill(-1)` and scrub concurrently.
+static WIPE_STARTED: AtomicBool = AtomicBool::new(false);
 
 const EV_KEY: u16 = 0x01;
 const KEY_POWER: u16 = 116;
@@ -316,9 +320,21 @@ fn run_graceful_shutdown(app_pid: u32, log: &impl Fn(&str)) {
 /// remaining process, waits for them to actually leave the process table, scrubs writable
 /// state, logs `final_message`, then powers off. Never returns.
 ///
+/// Both guarantees that this cannot hang a guest live here, so that both callers get them: the
+/// single-entry interlock ([`WIPE_STARTED`]) and the watchdog thread that powers off after
+/// [`WIPE_DEADLINE`] whatever the wipe is doing. If that thread can't even be spawned, the wipe
+/// is skipped entirely — losing the scrub is acceptable, losing the power-off is not.
+///
 /// `kill_process_group(Pid::INIT, ...)` is `kill(-1, ...)`: every process this one may signal,
 /// which the kernel defines as excluding PID 1 itself.
 fn kill_wipe_and_power_off(log: &impl Fn(&str), final_message: &str) -> ! {
+    if WIPE_STARTED.swap(true, Ordering::SeqCst) {
+        force_power_off();
+    }
+    if !arm_wipe_deadline() {
+        force_power_off();
+    }
+
     let _ = rustix::process::kill_process_group(
         rustix::process::Pid::INIT,
         rustix::process::Signal::KILL,
@@ -328,6 +344,25 @@ fn kill_wipe_and_power_off(log: &impl Fn(&str), final_message: &str) -> ! {
     wipe_writable_state(log);
     log(final_message);
     force_power_off()
+}
+
+/// Spawns the thread that powers the guest off once [`WIPE_DEADLINE`] elapses, whatever the
+/// wipe is doing by then. Returns whether it was armed — a caller that gets `false` must power
+/// off immediately rather than start a wipe nothing would bound.
+fn arm_wipe_deadline() -> bool {
+    let armed = std::thread::Builder::new()
+        .spawn(|| {
+            std::thread::sleep(WIPE_DEADLINE);
+            #[cfg(feature = "logging")]
+            eprintln!("[SHUTDOWN] Wipe exceeded its deadline — powering off now.");
+            force_power_off();
+        })
+        .is_ok();
+    #[cfg(feature = "logging")]
+    if !armed {
+        eprintln!("[SHUTDOWN] Could not arm the wipe deadline — powering off without wiping.");
+    }
+    armed
 }
 
 /// Zeroes every writable path the guest owns, then commits it.
@@ -380,11 +415,10 @@ pub(crate) fn force_power_off() -> ! {
 /// anonymous memory and any unlinked-but-open files are released before the scrub, letting
 /// `CONFIG_INIT_ON_FREE_DEFAULT_ON` zero them.
 ///
-/// Two independent guarantees that this cannot hang a compromised guest: a watchdog thread
-/// powers off unconditionally after [`EMERGENCY_WIPE_DEADLINE`], and re-entry (the wipe itself
-/// hitting a fatal error) powers off immediately rather than recursing. If the watchdog thread
-/// can't even be spawned, the wipe is skipped entirely — losing the scrub is acceptable, losing
-/// the power-off is not.
+/// The two guarantees that this cannot hang a compromised guest — a watchdog thread that powers
+/// off unconditionally after [`WIPE_DEADLINE`], and a single-entry interlock so a re-entry (the
+/// wipe itself hitting a fatal error) powers off immediately rather than recursing — live in
+/// [`kill_wipe_and_power_off`], which every path into the wipe goes through.
 ///
 /// Call only from PID 1; a child has neither `CAP_SYS_BOOT` nor permission to signal others.
 pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
@@ -399,24 +433,6 @@ pub(crate) fn wipe_and_power_off(log: impl Fn(&str)) -> ! {
             std::process::id()
         );
         std::process::exit(1);
-    }
-
-    if EMERGENCY_WIPE_STARTED.swap(true, Ordering::SeqCst) {
-        force_power_off();
-    }
-
-    if std::thread::Builder::new()
-        .spawn(|| {
-            std::thread::sleep(EMERGENCY_WIPE_DEADLINE);
-            #[cfg(feature = "logging")]
-            eprintln!("[SHUTDOWN] Wipe exceeded its deadline — powering off now.");
-            force_power_off();
-        })
-        .is_err()
-    {
-        #[cfg(feature = "logging")]
-        eprintln!("[SHUTDOWN] Could not arm the wipe deadline — powering off without wiping.");
-        force_power_off();
     }
 
     // Stops the watchdog loop in `main.rs` from treating the kills below as a fresh compromise

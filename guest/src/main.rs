@@ -137,12 +137,21 @@ fn log(msg: &str) {
 #[cfg(not(feature = "logging"))]
 const fn log(_msg: &str) {}
 
-/// `/var` is mounted root:root mode 0755 (tmpfs default, or `mke2fs`'s ext4 default) — the app
-/// runs as an unprivileged, non-root uid/gid, so without this it could never write into `/var`
-/// at all, in either storage mode.
-fn chown_var_for_app(uid: u32, gid: u32, fatal: fn(&str) -> !) {
-    if let Err(e) = std::os::unix::fs::chown("/var", Some(uid), Some(gid)) {
-        fatal(&format!("Failed to chown /var to the app's uid/gid: {e}"));
+/// The writable mounts that belong to the app but are not world-writable.
+///
+/// `/var` is mounted root:root mode 0755 (tmpfs default, or `mke2fs`'s ext4 default) and `/run`
+/// root:root mode 0755 — the app runs as an unprivileged, non-root uid/gid, so without this it
+/// could never write into either at all. `/tmp`, `/var/tmp` and `/dev/shm` need no equivalent:
+/// they are mounted `1777`, where the sticky bit is what keeps "writable by the app" from also
+/// meaning "any process may unlink another's files". `/run` is not given that treatment because
+/// nothing else in this guest has any business in it; a single owner is the tighter expression.
+const APP_OWNED_DIRS: [&str; 2] = ["/var", "/run"];
+
+fn chown_dirs_for_app(uid: u32, gid: u32, fatal: fn(&str) -> !) {
+    for dir in APP_OWNED_DIRS {
+        if let Err(e) = std::os::unix::fs::chown(dir, Some(uid), Some(gid)) {
+            fatal(&format!("Failed to chown {dir} to the app's uid/gid: {e}"));
+        }
     }
 }
 
@@ -304,6 +313,34 @@ const fn set_mdwe() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The child's `setrlimit` ceilings, parsed from their baked-in strings.
+///
+/// A plain struct of numbers so [`apply_resource_limits`] can be handed values rather than
+/// parsing in the forked child: `baked`'s failure path formats a message and runs the wipe
+/// protocol, both of which allocate, and a `pre_exec` closure must not — see [`spawn_app`].
+#[derive(Debug, Clone, Copy)]
+struct ResourceLimits {
+    nofile: u64,
+    nproc: u64,
+    memlock_bytes: u64,
+    /// `0` means no `RLIMIT_AS` cap.
+    address_space_bytes: u64,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Parses every limit constant. Called in the parent, before the fork.
+fn resource_limits() -> ResourceLimits {
+    ResourceLimits {
+        nofile: baked(LIMIT_NOFILE, "CARGO_UNIKERNEL_LIMIT_NOFILE"),
+        nproc: baked(LIMIT_NPROC, "CARGO_UNIKERNEL_LIMIT_NPROC"),
+        memlock_bytes: baked::<u64>(LIMIT_MEMLOCK_MB, "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB")
+            .saturating_mul(MIB),
+        address_space_bytes: baked::<u64>(LIMIT_AS_MB, "CARGO_UNIKERNEL_LIMIT_AS_MB")
+            .saturating_mul(MIB),
+    }
+}
+
 /// Caps the child's open-file, process/thread, locked-memory and (optionally) address-space
 /// limits before exec.
 ///
@@ -314,27 +351,20 @@ const fn set_mdwe() -> std::io::Result<()> {
 /// material out of swap) but stays bounded — unlimited would let a compromised app pin all of
 /// guest RAM.
 ///
-fn apply_resource_limits() -> std::io::Result<()> {
+/// Takes already-parsed values (see [`ResourceLimits`]) so the closure this returns performs
+/// nothing but `setrlimit` syscalls in the forked child.
+fn apply_resource_limits(limits: ResourceLimits) -> impl Fn() -> std::io::Result<()> {
     use rustix::process::Resource;
 
-    set_rlimit(
-        Resource::Nofile,
-        baked(LIMIT_NOFILE, "CARGO_UNIKERNEL_LIMIT_NOFILE"),
-    )?;
-    set_rlimit(
-        Resource::Nproc,
-        baked(LIMIT_NPROC, "CARGO_UNIKERNEL_LIMIT_NPROC"),
-    )?;
-    set_rlimit(
-        Resource::Memlock,
-        baked::<u64>(LIMIT_MEMLOCK_MB, "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB")
-            .saturating_mul(1024 * 1024),
-    )?;
-    let as_mb: u64 = baked(LIMIT_AS_MB, "CARGO_UNIKERNEL_LIMIT_AS_MB");
-    if as_mb > 0 {
-        set_rlimit(Resource::As, as_mb.saturating_mul(1024 * 1024))?;
+    move || {
+        set_rlimit(Resource::Nofile, limits.nofile)?;
+        set_rlimit(Resource::Nproc, limits.nproc)?;
+        set_rlimit(Resource::Memlock, limits.memlock_bytes)?;
+        if limits.address_space_bytes > 0 {
+            set_rlimit(Resource::As, limits.address_space_bytes)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn set_rlimit(resource: rustix::process::Resource, value: u64) -> std::io::Result<()> {
@@ -378,11 +408,13 @@ fn prepare_app_binary() {
 fn spawn_app() -> u32 {
     log("Spawning embedded app as child process...");
 
-    // Built here, before the fork below, and moved into the `pre_exec` closure that installs
-    // it: `seccomp::build_baseline_denylist` allocates, which is unsound to do between `fork()`
-    // and `execve()` — see its own doc comment. `landlock::build` carries the same constraint
-    // (it opens files and allocates a `Vec`), for the same reason.
+    // Built here, before the fork below, and moved into the `pre_exec` closures that apply
+    // them: `seccomp::build_baseline_denylist` allocates, which is unsound to do between
+    // `fork()` and `execve()` — see its own doc comment. `landlock::build` carries the same
+    // constraint (it opens files and allocates a `Vec`), and so does `resource_limits`, whose
+    // parse failures format a message and run the wipe protocol.
     let seccomp_program = crate::seccomp::build_baseline_denylist(fatal_shutdown);
+    let limits = resource_limits();
     #[cfg(feature = "landlock")]
     let landlock_ruleset = crate::landlock::build(
         PAYLOAD_DIR,
@@ -414,7 +446,7 @@ fn spawn_app() -> u32 {
     let ruleset_fd = landlock_ruleset.raw_fd();
     let child = unsafe {
         command
-            .pre_exec(apply_resource_limits)
+            .pre_exec(apply_resource_limits(limits))
             .pre_exec(drop_privileges(uid, gid))
             .pre_exec(set_mdwe);
         #[cfg(feature = "landlock")]
@@ -461,10 +493,17 @@ fn expose_sev_guest_device() {
 ///
 fn watchdog_loop(app_pid: u32) -> ! {
     loop {
+        let wait_result = rustix::process::wait(rustix::process::WaitOptions::empty());
+
+        // Read *after* the wait returns, never before it. The shutdown watcher runs on another
+        // thread and sets this flag while this one is already blocked, so a value sampled before
+        // the wait is stale by however long the guest sat idle — which would make every graceful
+        // stop look like the app exiting on its own, i.e. a compromise, and race a second
+        // kill-and-wipe against the one the watcher thread is already running.
         let shutting_down =
             crate::shutdown::SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst);
 
-        let pid = match rustix::process::wait(rustix::process::WaitOptions::empty()) {
+        let pid = match wait_result {
             Ok(Some((pid, _status))) => pid,
             Err(rustix::io::Errno::CHILD) if !shutting_down => {
                 fatal_shutdown("No supervised processes remain. System integrity compromised.");
@@ -518,7 +557,7 @@ fn main() {
     // graceful-stop request would otherwise land in and be lost.
     let shutdown_triggers = crate::shutdown::arm_shutdown_triggers();
     let (uid, gid) = app_ids();
-    chown_var_for_app(uid, gid, fatal_shutdown);
+    chown_dirs_for_app(uid, gid, fatal_shutdown);
 
     // After /proc is mounted (for /proc/net/pnp) but otherwise placement-insensitive — nothing
     // else reads /etc before the app starts, and nothing after lockdown can write to it anyway.
@@ -527,9 +566,13 @@ fn main() {
     });
 
     let extra_sysctls = parse_pairs(EXTRA_SYSCTLS, "[hardening].extra_sysctls");
-    crate::hardening::apply(&extra_sysctls, |w| {
+    let sysctls = crate::hardening::apply(&extra_sysctls, |w| {
         log(&format!("[WARN] {w}"));
     });
+    log(&format!(
+        "Sysctl hardening applied: {} knobs set, {} absent on this kernel.",
+        sysctls.applied, sysctls.absent
+    ));
 
     crate::entropy::wait_for_entropy(log, fatal_shutdown);
 

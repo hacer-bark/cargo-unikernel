@@ -691,7 +691,9 @@ pub struct RuntimeHardening {
     /// SYN cookies, RFC1337, connection-table/backlog tuning for `DDoS` resilience, and a
     /// throughput tweak (no slow-start reset after idle) for keep-alive-heavy servers.
     pub tcp_hardening: Option<bool>,
-    /// `kptr_restrict`, `dmesg_restrict`, `perf_event_paranoid` — restrict kernel info leaks.
+    /// `kptr_restrict`, `dmesg_restrict`, `perf_event_paranoid`, `sysrq`, `panic_on_oops` and
+    /// `tcp_timestamps` — restrict what the kernel tells anyone watching, whether that is the
+    /// app, a peer on the network, or (on sev-snp) the hypervisor reading the serial console.
     pub info_leak_restriction: Option<bool>,
     /// Disable unprivileged BPF and userfaultfd; lock ptrace down entirely (YAMA scope 3);
     /// harden the (still-enabled, for seccomp's sake) classic-BPF JIT against JIT-spray.

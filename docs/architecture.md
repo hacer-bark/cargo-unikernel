@@ -60,15 +60,18 @@ The app is already embedded at build time, so the sequence is short:
    tmpfs with an explicit `size=`. `/var` is tmpfs unless `[storage].mode = "persistent"`, in
    which case it's the virtio-blk device — formatted ext4 on first use, wiped instead of
    mounted if its superblock lacks this tool's volume label (checked from userspace, before
-   the kernel's ext4 driver ever sees it) — then `chown`'d to the app's uid/gid.
+   the kernel's ext4 driver ever sees it). `/var` and `/run` are then `chown`'d to the app's
+   uid/gid — both are mode 0755, so without that the app (an unprivileged uid) could not write
+   to either; the `1777` scratch mounts need no equivalent.
 3. Bring up loopback + interfaces, apply enabled sysctl hardening. Only `lo`'s IPv4 address is
    set here; the rest comes from DHCP/SLAAC — see [Network addressing](#network-addressing).
 4. Wait (≤30s) for the kernel CRNG to seed — **fatal if it doesn't**, since starting the app
    anyway risks keys generated from an unseeded pool. Then poll (≤30s) for a default route,
    skipped when `[network].mode = "none"`.
-5. Remount `/payload` read-only and `/tmp`/`/run` back to noexec (unless
-   `allow_write_execute`); `/var` is never remounted. This happens before the app exists, so
-   it never sees a writable payload mount.
+5. Remount `/payload` read-only, `/sys` read-only, `/` read-only (best-effort — see
+   `mounts::seal_rootfs`), and `/tmp`/`/run` back to noexec (unless `allow_write_execute`);
+   `/var` is never remounted. This happens before the app exists, so it never sees a writable
+   payload mount.
 6. `exec` the app, unprivileged. Before `execve`, in order: apply `[app.runtime.limits]`
    `setrlimit` ceilings (needs `CAP_SYS_RESOURCE`, so before the capability drop); drop the
    capability bounding set (`PR_CAPBSET_DROP`, needs `CAP_SETPCAP`, so still root); clear

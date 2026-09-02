@@ -158,6 +158,12 @@ const DEV_READ_WRITE: u64 = FS_READ_FILE | FS_WRITE_FILE;
 /// something the app has any reason to do either.
 const DEV_READ: u64 = FS_READ_FILE;
 
+/// A pty pair: read, write, and the `ioctl`s the allocation dance itself needs — `TIOCGPTN`
+/// and `TIOCSPTLCK` on `/dev/ptmx`, then the termios calls on the slave. Landlock governs
+/// device `ioctl`s as one right, so a pty that can be opened but not configured is a pty that
+/// doesn't work; this is the narrowest grant that leaves `openpty()` functional.
+const DEV_PTY: u64 = FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV;
+
 /// `/dev/sev-guest`: read, write, and — the only one that means anything — `ioctl`.
 ///
 /// The driver registers `.unlocked_ioctl` and nothing else: no `.read`, no `.write`. So both
@@ -236,6 +242,13 @@ fn builtin_rules(payload_dir: &'static str) -> Vec<Rule> {
         optional("/dev/full", DEV_READ_WRITE),
         optional("/dev/random", DEV_READ),
         optional("/dev/urandom", DEV_READ),
+        // The devpts mount is best-effort in `mounts.rs`, so both of these are `Optional` for
+        // the same reason: a guest with no pty support is fine, and an app that never allocates
+        // one never notices. Without them, though, `openpty()` fails under this sandbox and
+        // succeeds without it, which is the kind of difference that turns the `landlock` feature
+        // into something an app has to be ported to rather than hardened with.
+        optional("/dev/ptmx", DEV_PTY),
+        optional("/dev/pts", DEV_PTY),
     ];
     #[cfg(feature = "sev-snp")]
     rules.push(optional("/dev/sev-guest", DEV_ATTESTATION));
@@ -311,6 +324,13 @@ pub(crate) fn build(
 
     let attr = RulesetAttr {
         handled_access_fs: handled_access_fs(abi),
+        // Left ungoverned deliberately, unlike `handled_access_fs`. Landlock's network rights
+        // (ABI 4) are `bind`/`connect` on TCP ports, and this module has no idea which ports the
+        // app needs — the image knows its filesystem layout at build time, which is what makes
+        // the FS allowlist knowable, but nothing here knows the app's listeners. Governing the
+        // right without granting any port back would deny every bind and connect the app makes,
+        // i.e. break every server this tool builds. Expressing it properly needs the port list
+        // to come from `[app.runtime.landlock]` first.
         handled_access_net: 0,
         scoped: if abi >= 6 {
             SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
@@ -572,18 +592,30 @@ mod tests {
         assert_eq!(DEV_READ & FS_IOCTL_DEV, 0);
     }
 
-    /// The whole point of pinning ABI 5: `/dev/sev-guest` is an ioctl-only driver, so `ioctl`
-    /// is the only right that does anything — and no other device node gets it.
+    /// The whole point of pinning ABI 5: `ioctl` is a right this ruleset hands out by name, to
+    /// the two device kinds that cannot work without it — the ioctl-only attestation driver, and
+    /// the pty pair — and to nothing else. Every byte-stream device stays ioctl-less.
     #[test]
-    #[cfg(feature = "sev-snp")]
-    fn only_the_attestation_device_may_issue_ioctls() {
+    fn only_the_devices_that_need_ioctls_get_them() {
         let rules = builtin_rules("/payload");
         let with_ioctl: Vec<&str> = rules
             .iter()
             .filter(|r| r.access & FS_IOCTL_DEV != 0)
             .map(|r| r.path)
             .collect();
-        assert_eq!(with_ioctl, vec!["/dev/sev-guest"]);
+
+        #[cfg_attr(not(feature = "sev-snp"), allow(unused_mut))]
+        let mut expected = vec!["/dev/ptmx", "/dev/pts"];
+        #[cfg(feature = "sev-snp")]
+        expected.push("/dev/sev-guest");
+        assert_eq!(with_ioctl, expected);
+
+        for byte_stream in ["/dev/null", "/dev/zero", "/dev/full", "/dev/random"] {
+            assert!(
+                !with_ioctl.contains(&byte_stream),
+                "{byte_stream} has no ioctl interface worth reaching"
+            );
+        }
     }
 
     /// The kernel this crate is built and tested against is far newer than [`MIN_ABI`]; if
