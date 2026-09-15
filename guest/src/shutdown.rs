@@ -63,8 +63,11 @@ extern "C" fn on_sigterm(_: libc::c_int) {
     let fd = SIGTERM_PIPE_WRITE_FD.load(Ordering::SeqCst);
     if fd >= 0 {
         let byte = 1u8;
+        // SAFETY: errno is thread-local; the published pipe stays open for process lifetime.
         unsafe {
+            let saved_errno = *libc::__errno_location();
             libc::write(fd, std::ptr::addr_of!(byte).cast::<libc::c_void>(), 1);
+            *libc::__errno_location() = saved_errno;
         }
     }
 }
@@ -89,21 +92,25 @@ pub(crate) struct ShutdownTriggers {
 /// Turning a function pointer into the raw integer `libc::signal` expects has no stable
 /// non-`as` route on Rust today — there is no `TryFrom`/safe wrapper for a fn-pointer-to-integer
 /// conversion, so the cast lint is allowed here rather than worked around.
-#[must_use]
 #[allow(clippy::as_conversions)]
-pub(crate) fn arm_shutdown_triggers() -> ShutdownTriggers {
+pub(crate) fn arm_shutdown_triggers() -> std::io::Result<ShutdownTriggers> {
     // SAFETY: `on_sigterm`'s signature matches what the C ABI expects for a signal handler.
-    unsafe {
-        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+    let previous =
+        unsafe { libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error());
     }
 
-    ShutdownTriggers {
+    Ok(ShutdownTriggers {
         devices: find_input_event_devices()
             .into_iter()
             .filter_map(|p| std::fs::File::open(p).ok())
-            .inspect(set_nonblocking)
-            .collect(),
-    }
+            .map(|device| {
+                set_nonblocking(&device)?;
+                Ok(device)
+            })
+            .collect::<std::io::Result<_>>()?,
+    })
 }
 
 /// Spawns the watcher thread over already-armed triggers.
@@ -154,8 +161,9 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
     let Ok((sigterm_read, sigterm_write)) = std::io::pipe() else {
         return wait_for_trigger_polling(devices);
     };
-    set_nonblocking(&sigterm_read);
-    set_nonblocking(&sigterm_write);
+    if set_nonblocking(&sigterm_read).is_err() || set_nonblocking(&sigterm_write).is_err() {
+        return wait_for_trigger_polling(devices);
+    }
     let sigterm_read_fd = sigterm_read.as_raw_fd();
 
     // Registered before the fd is published to the handler below, so the one path that can still
@@ -183,7 +191,9 @@ fn wait_for_trigger(devices: &[std::fs::File]) {
     }
 
     for device in devices {
-        let _ = register_for_epoll(&epfd, device);
+        if !register_for_epoll(&epfd, device) {
+            return wait_for_trigger_polling(devices);
+        }
     }
 
     let mut events: Vec<epoll::Event> = Vec::with_capacity(16);
@@ -238,15 +248,16 @@ fn find_input_event_devices() -> Vec<std::path::PathBuf> {
 
 /// Generic over anything holding a raw fd — shared by the evdev devices and the self-pipe ends
 /// in [`wait_for_trigger`], rather than one copy of this fcntl pair per fd type.
-fn set_nonblocking(file: &impl AsRawFd) {
+fn set_nonblocking(file: &impl AsRawFd) -> std::io::Result<()> {
     // SAFETY: reads/sets file status flags on an already-open, valid fd; no pointers involved.
     unsafe {
         let fd = file.as_raw_fd();
         let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
+    Ok(())
 }
 
 /// Drains every currently-queued event on this (non-blocking) device, returning `true` if any
@@ -530,6 +541,29 @@ fn scrub_open_dir(fd: &std::os::fd::OwnedFd, depth: u32) {
             FileType::Symlink => {
                 let _ = unlinkat(fd, name, AtFlags::empty());
             }
+            // Some filesystems do not populate d_type. Probe through the pinned parent fd,
+            // still with NOFOLLOW, rather than silently leaving the entry and its data behind.
+            FileType::Unknown => {
+                if let Ok(child) = openat(
+                    fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    scrub_open_dir(&child, depth.saturating_add(1));
+                    let _ = unlinkat(fd, name, AtFlags::REMOVEDIR);
+                } else if let Ok(child) = openat(
+                    fd,
+                    name,
+                    OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    let mut file = std::fs::File::from(child);
+                    if overwrite_file(&mut file).is_ok() {
+                        let _ = unlinkat(fd, name, AtFlags::empty());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -638,6 +672,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         handle.join().unwrap();
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        set_nonblocking(&writer).unwrap();
+        let mut writer_ref = &writer;
+        while std::io::Write::write(&mut writer_ref, &[0u8; 4096]).is_ok() {}
+        SIGTERM_PIPE_WRITE_FD.store(writer.as_raw_fd(), Ordering::SeqCst);
+        unsafe {
+            *libc::__errno_location() = libc::ENOENT;
+            on_sigterm(libc::SIGTERM);
+            assert_eq!(*libc::__errno_location(), libc::ENOENT);
+        }
+        SIGTERM_PIPE_WRITE_FD.store(-1, Ordering::SeqCst);
+        drop((reader, writer));
 
         // Second scenario, run in the same test (rather than a separate `#[test]`) because both
         // touch the same process-wide statics and Rust's default test harness runs tests in

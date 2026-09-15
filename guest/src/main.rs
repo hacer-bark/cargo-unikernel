@@ -356,11 +356,15 @@ fn resource_limits() -> ResourceLimits {
     ResourceLimits {
         nofile: baked(LIMIT_NOFILE, "CARGO_UNIKERNEL_LIMIT_NOFILE"),
         nproc: baked(LIMIT_NPROC, "CARGO_UNIKERNEL_LIMIT_NPROC"),
-        memlock_bytes: baked::<u64>(LIMIT_MEMLOCK_MB, "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB")
-            .saturating_mul(MIB),
-        address_space_bytes: baked::<u64>(LIMIT_AS_MB, "CARGO_UNIKERNEL_LIMIT_AS_MB")
-            .saturating_mul(MIB),
+        memlock_bytes: limit_mb_bytes(LIMIT_MEMLOCK_MB, "CARGO_UNIKERNEL_LIMIT_MEMLOCK_MB"),
+        address_space_bytes: limit_mb_bytes(LIMIT_AS_MB, "CARGO_UNIKERNEL_LIMIT_AS_MB"),
     }
+}
+
+fn limit_mb_bytes(raw: &str, what: &str) -> u64 {
+    baked::<u64>(raw, what)
+        .checked_mul(MIB)
+        .unwrap_or_else(|| fatal_shutdown(&format!("{what} is too large to express in bytes")))
 }
 
 /// Caps the child's open-file, process/thread, locked-memory and (optionally) address-space
@@ -587,7 +591,8 @@ fn main() {
     // client from the moment it opens the device, and everything between this line and that one
     // (the entropy and network-settle waits alone allow 30s each) is time a hypervisor's
     // graceful-stop request would otherwise land in and be lost.
-    let shutdown_triggers = crate::shutdown::arm_shutdown_triggers();
+    let shutdown_triggers = crate::shutdown::arm_shutdown_triggers()
+        .unwrap_or_else(|e| fatal_shutdown(&format!("Failed to install shutdown triggers: {e}")));
     chown_dirs_for_app(uid, gid, fatal_shutdown);
 
     // After /proc is mounted (for /proc/net/pnp) but otherwise placement-insensitive — nothing

@@ -373,12 +373,12 @@ mod tests {
     /// The guard has to reject before the write, not merely log alongside it.
     #[test]
     fn an_unconfined_key_is_skipped_rather_than_written() {
-        let target = std::env::temp_dir().join("cuk-sysctl-escape-test");
-        let _ = std::fs::remove_file(&target);
+        let temp = crate::TestDir::new().unwrap();
+        let target = temp.0.join("sysctl-escape");
         let path = target.to_str().unwrap().to_string();
 
         let warnings = std::cell::RefCell::new(Vec::new());
-        apply(&[(path.as_str(), "1")], |w| {
+        apply_extra(&[(path.as_str(), "1")], &|w| {
             warnings.borrow_mut().push(w.to_string());
         });
 

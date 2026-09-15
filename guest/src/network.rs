@@ -491,6 +491,7 @@ fn log_interface_addresses(log: &impl Fn(&str)) {
 /// see the end of — so both parsers below check it rather than trusting the destination alone.
 #[cfg(any(feature = "net-ipv4", feature = "net-ipv6"))]
 const RTF_UP: u32 = 0x1;
+const RTF_REJECT: u32 = 0x200;
 
 /// `/proc/net/route` fields: `Iface Destination Gateway Flags …` — a default route has an
 /// all-zero destination and `RTF_UP` set in the hex flags.
@@ -511,10 +512,11 @@ fn route_v4_has_default(routes: &str) -> bool {
             return false;
         }
         // Skip the gateway — the flags follow.
-        fields
+        let usable = fields
             .nth(1)
             .and_then(|flags| u32::from_str_radix(flags, 16).ok())
-            .is_some_and(|flags| flags & RTF_UP != 0)
+            .is_some_and(|flags| flags & (RTF_UP | RTF_REJECT) == RTF_UP);
+        usable && fields.nth(3) == Some("00000000")
     })
 }
 
@@ -543,7 +545,7 @@ fn route_v6_has_default(routes: &str) -> bool {
         fields
             .nth(6)
             .and_then(|flags| u32::from_str_radix(flags, 16).ok())
-            .is_some_and(|flags| flags & RTF_UP != 0)
+            .is_some_and(|flags| flags & (RTF_UP | RTF_REJECT) == RTF_UP)
     })
 }
 
@@ -606,6 +608,9 @@ mod route_tests {
         let on_link = format!("{HEADER}eth0\t000010AC\t00000000\t0001\t0\t0\t0\t00FFFFFF\n");
 
         assert!(route_v4_has_default(&up));
+        assert!(!route_v4_has_default(&up.replace("0003", "0203")));
+        let zero_subnet = format!("{HEADER}eth0 00000000 00000000 0001 0 0 0 000000FF\n");
+        assert!(!route_v4_has_default(&zero_subnet));
         assert!(
             !route_v4_has_default(&down),
             "a route being held down is not a settled one"
@@ -628,6 +633,7 @@ mod route_tests {
         };
 
         assert!(route_v6_has_default(&line("00", "00000003")));
+        assert!(!route_v6_has_default(&line("00", "00000203")));
         assert!(
             !route_v6_has_default(&line("00", "00000002")),
             "RTF_GATEWAY without RTF_UP is a route the kernel is still holding down"

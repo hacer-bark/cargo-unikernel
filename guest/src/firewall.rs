@@ -47,6 +47,7 @@ const NLM_F_APPEND: u16 = 0x0800;
 
 const NLMSG_ERROR: u16 = 0x0002;
 const NLMSG_HDR_LEN: usize = 16;
+const NLMSG_ALIGNTO: usize = 4;
 const NLA_HDR_LEN: usize = 4;
 /// `NLA_F_NESTED` — advisory (the kernel masks it off when reading an attribute's type), set
 /// because every other `nf_tables` producer sets it and a dump that lacks it reads as suspect.
@@ -699,8 +700,20 @@ fn split_message(reply: &[u8]) -> io::Result<Option<(&[u8], &[u8])>> {
     if len < NLMSG_HDR_LEN || len > reply.len() {
         return Err(io::Error::other("malformed netlink reply length"));
     }
-    let (header, rest) = reply.split_at(len.min(reply.len()));
-    Ok(Some((header, rest.get(..).unwrap_or_default())))
+    let aligned_len = len
+        .checked_add(NLMSG_ALIGNTO - 1)
+        .map(|n| n & !(NLMSG_ALIGNTO - 1))
+        .ok_or_else(|| io::Error::other("netlink reply length overflow"))?;
+    if aligned_len > reply.len() && len != reply.len() {
+        return Err(io::Error::other("truncated netlink reply padding"));
+    }
+    let header = reply
+        .get(..len)
+        .ok_or_else(|| io::Error::other("malformed netlink reply length"))?;
+    let rest = reply
+        .get(aligned_len.min(reply.len())..)
+        .unwrap_or_default();
+    Ok(Some((header, rest)))
 }
 
 /// Reads one reply message, returning how many acknowledgements it accounts for (1 for a
@@ -783,6 +796,25 @@ mod tests {
 
     fn no_fatal(message: &str) -> ! {
         panic!("{message}")
+    }
+
+    #[test]
+    fn netlink_messages_advance_past_alignment_padding() {
+        let mut replies = vec![0u8; 20 + NLMSG_HDR_LEN];
+        replies
+            .get_mut(..4)
+            .unwrap()
+            .copy_from_slice(&17u32.to_ne_bytes());
+        replies
+            .get_mut(20..24)
+            .unwrap()
+            .copy_from_slice(&u32::try_from(NLMSG_HDR_LEN).unwrap().to_ne_bytes());
+
+        let (first, rest) = split_message(&replies).unwrap().unwrap();
+        assert_eq!(first.len(), 17);
+        let (second, rest) = split_message(rest).unwrap().unwrap();
+        assert_eq!(second.len(), NLMSG_HDR_LEN);
+        assert!(rest.is_empty());
     }
 
     #[test]
