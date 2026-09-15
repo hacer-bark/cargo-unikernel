@@ -268,9 +268,9 @@ mod tests {
             interface: Some("eth0".to_string()),
         });
         let script = script_guest_init_build(&config);
-        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_STATIC="2001:db8:1:2::1/64""#));
-        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_GATEWAY="fe80::1""#));
-        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_IFACE="eth0""#));
+        assert!(script.contains("CARGO_UNIKERNEL_IPV6_STATIC='2001:db8:1:2::1/64'"));
+        assert!(script.contains("CARGO_UNIKERNEL_IPV6_GATEWAY='fe80::1'"));
+        assert!(script.contains("CARGO_UNIKERNEL_IPV6_IFACE='eth0'"));
     }
 
     /// The guest reads an unset value as "SLAAC only", so the optional halves must stay unset
@@ -292,7 +292,7 @@ mod tests {
             interface: None,
         });
         let script = script_guest_init_build(&config);
-        assert!(script.contains(r#"CARGO_UNIKERNEL_IPV6_STATIC="2001:db8::5/128""#));
+        assert!(script.contains("CARGO_UNIKERNEL_IPV6_STATIC='2001:db8::5/128'"));
         assert!(!script.contains("CARGO_UNIKERNEL_IPV6_GATEWAY"));
         assert!(!script.contains("CARGO_UNIKERNEL_IPV6_IFACE"));
     }
@@ -357,7 +357,7 @@ mod tests {
         let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
         assert!(init_features(&config).contains(&"firewall"));
         let script = script_guest_init_build(&config);
-        assert!(script.contains(r#"CARGO_UNIKERNEL_FIREWALL_RULES="tcp:80;tcp:443;udp:443""#));
+        assert!(script.contains("CARGO_UNIKERNEL_FIREWALL_RULES='tcp:80;tcp:443;udp:443'"));
     }
 
     /// Turning it off must remove the feature *and* the rules: a build that carried the ports
@@ -422,7 +422,7 @@ mod tests {
         let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
         config.app.runtime.landlock.extra_read_paths = vec!["/some/path".to_string()];
         let script = script_guest_init_build(&config);
-        assert!(script.contains(r#"CARGO_UNIKERNEL_LANDLOCK_RO="/some/path""#));
+        assert!(script.contains("CARGO_UNIKERNEL_LANDLOCK_RO='/some/path'"));
 
         config.app.runtime.landlock.enabled = false;
         let script = script_guest_init_build(&config);
@@ -435,15 +435,15 @@ mod tests {
         config.network.nameservers = vec!["9.9.9.9".to_string(), "149.112.112.112".to_string()];
         config.network.search = Some("corp.example".to_string());
         let script = script_guest_init_build(&config);
-        assert!(script.contains(r#"CARGO_UNIKERNEL_NAMESERVERS="9.9.9.9;149.112.112.112""#));
-        assert!(script.contains(r#"CARGO_UNIKERNEL_DNS_SEARCH="corp.example""#));
+        assert!(script.contains("CARGO_UNIKERNEL_NAMESERVERS='9.9.9.9;149.112.112.112'"));
+        assert!(script.contains("CARGO_UNIKERNEL_DNS_SEARCH='corp.example'"));
     }
 
     #[test]
     fn tmpfs_sizes_are_always_exported() {
         let config = casual_config_with_formats(vec![OutputFormat::Cpio]);
         let script = script_guest_init_build(&config);
-        assert!(script.contains(r#"CARGO_UNIKERNEL_TMPFS_TMP_MB="64""#));
-        assert!(script.contains(r#"CARGO_UNIKERNEL_TMPFS_RUN_MB="16""#));
+        assert!(script.contains("CARGO_UNIKERNEL_TMPFS_TMP_MB='64'"));
+        assert!(script.contains("CARGO_UNIKERNEL_TMPFS_RUN_MB='16'"));
     }
 }

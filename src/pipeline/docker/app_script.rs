@@ -98,7 +98,7 @@ pub(super) fn script_build_at(source: &AppSource, package_dir: &str) -> Result<S
                 s,
                 "APP_BIN=$(find /tmp/cargo-target-app/x86_64-unknown-linux-musl/{} \
                  -maxdepth 1 -type f -executable | sort | head -n1)",
-                profile_dir(&source.cargo_profile)
+                shell_quote(profile_dir(&source.cargo_profile))
             );
         }
         Toolchain::Generic => {
@@ -176,6 +176,17 @@ mod tests {
         source.features = vec!["foo".to_string(), "bar".to_string()];
         let script = script_build_at(&source, "/workspace").unwrap();
         assert!(script.contains("--features 'foo,bar'"));
+    }
+
+    #[test]
+    fn rust_profile_is_quoted_everywhere() {
+        let mut source = rust_source();
+        source.cargo_profile = "release'; touch /tmp/injected; '".to_string();
+        let script = script_build_at(&source, "/workspace").unwrap();
+        assert!(script.contains("--profile 'release'\\''; touch /tmp/injected; '\\'''"));
+        assert!(script.contains(
+            "x86_64-unknown-linux-musl/'release'\\''; touch /tmp/injected; '\\''' -maxdepth"
+        ));
     }
 
     #[test]

@@ -1118,6 +1118,11 @@ pub enum ValidationError {
     /// `storage.size_mib` was `0`.
     #[error("`storage.size_mib` must be greater than 0 (got {0})")]
     StorageSizeMustBePositive(u32),
+    /// `[output].dir` was empty, absolute, or escaped the project directory.
+    #[error(
+        "`output.dir` must be a non-empty relative path inside the project directory (got {0:?})"
+    )]
+    UnsafeOutputDir(String),
     /// A key/value pair contained a character the `';'`-joined wire format can't round-trip.
     #[error(
         "`{table}` entry {key:?} contains a `;` (or a `=` in the key) — these reach the guest \
@@ -1476,9 +1481,22 @@ impl Config {
 
     /// `[output]`/`[release]` invariants: `output.formats` non-empty, `release.assets` not an
     /// empty list, and `notes`/`notes_file` mutually exclusive.
-    const fn validate_output_and_release(&self) -> Result<(), ValidationError> {
+    fn validate_output_and_release(&self) -> Result<(), ValidationError> {
         if self.output.formats.is_empty() {
             return Err(ValidationError::EmptyOutputFormats);
+        }
+        let output_dir = std::path::Path::new(&self.output.dir);
+        if self.output.dir.trim().is_empty()
+            || output_dir.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ValidationError::UnsafeOutputDir(self.output.dir.clone()));
         }
 
         if let Some(assets) = &self.release.assets
@@ -1526,6 +1544,18 @@ mod tests {
     #[test]
     fn rust_source_path_is_valid() {
         assert!(base_config().validate().is_ok());
+    }
+
+    #[test]
+    fn output_directory_cannot_escape_the_project() {
+        for dir in ["", "/tmp/output", "../output", "dist/../../output"] {
+            let mut config = base_config();
+            config.output.dir = dir.to_string();
+            assert!(matches!(
+                config.validate(),
+                Err(ValidationError::UnsafeOutputDir(_))
+            ));
+        }
     }
 
     #[test]

@@ -12,14 +12,45 @@ pub mod ovmf;
 pub mod storage;
 
 use crate::schema::{Config, ProfileKind};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 /// `<project_dir>/dist` (or wherever `[output].dir` points) — the host-side directory every
 /// pipeline stage writes/reads its artifacts under.
-#[must_use]
-pub fn host_dist_dir(config: &Config, project_dir: &Path) -> PathBuf {
-    project_dir.join(config.output.dir.trim_end_matches('/'))
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created or resolves outside `project_dir`.
+pub fn host_dist_dir(config: &Config, project_dir: &Path) -> Result<PathBuf> {
+    let project_dir = project_dir
+        .canonicalize()
+        .context("failed to canonicalize project directory")?;
+    if config.output.dir.trim().is_empty() {
+        bail!("output.dir must not be empty");
+    }
+    let mut output_dir = project_dir.clone();
+    for component in Path::new(&config.output.dir).components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => output_dir.push(name),
+            _ => bail!("output.dir must be a relative path inside the project directory"),
+        }
+        match std::fs::create_dir(&output_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create {}", output_dir.display()));
+            }
+        }
+        output_dir = output_dir
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", output_dir.display()))?;
+        if !output_dir.starts_with(&project_dir) {
+            bail!("output.dir resolves outside the project directory");
+        }
+    }
+    Ok(output_dir)
 }
 
 /// Orchestrates a full `cargo unikernel build`.

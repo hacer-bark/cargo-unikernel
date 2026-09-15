@@ -157,11 +157,10 @@ pub(super) fn print_toolchain_overrides(toolchain: &ToolchainPins) {
     );
 }
 
-/// Appends `export NAME="value"\n` to `s` — the shared shape of every env-var export line
-/// the generated build script writes.
+/// Appends a shell-quoted environment export to the generated build script.
 pub(super) fn write_export(s: &mut String, name: &str, value: impl std::fmt::Display) {
     use std::fmt::Write as _;
-    let _ = writeln!(s, "export {name}=\"{value}\"");
+    let _ = writeln!(s, "export {name}={}", shell_quote(&value.to_string()));
 }
 
 /// `RUSTFLAGS` for every Rust build in the pipeline (guest init and Mode A `rust` toolchain
@@ -191,6 +190,13 @@ mod tests {
             build_args_for(&toolchain, StorageMode::Ram).unwrap(),
             vec![("BUILD_E2FSPROGS".to_string(), "0".to_string())]
         );
+    }
+
+    #[test]
+    fn exports_do_not_evaluate_config_values_as_shell() {
+        let mut script = String::new();
+        write_export(&mut script, "VALUE", "$(touch /tmp/injected)'quoted");
+        assert_eq!(script, "export VALUE='$(touch /tmp/injected)'\\''quoted'\n");
     }
 
     #[test]

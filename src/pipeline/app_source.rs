@@ -79,11 +79,29 @@ fn acquire_source(config: &Config, project_dir: &Path) -> Result<AcquiredApp> {
         .path
         .as_ref()
         .context("[app.source] must set `path`")?;
-    let candidate = project_dir.join(path);
-    if !candidate.join("Cargo.toml").exists() {
-        bail!("app.source.path '{path}' has no Cargo.toml — expected a Rust project there");
+    let canonical_project = project_dir
+        .canonicalize()
+        .context("failed to canonicalize project directory")?;
+    let candidate = project_dir.join(path).join(&source.package_path);
+    let canonical_candidate = candidate.canonicalize().with_context(|| {
+        format!(
+            "app source directory '{path}/{}' does not exist",
+            source.package_path
+        )
+    })?;
+    if !canonical_candidate.starts_with(&canonical_project) {
+        bail!("app source directory must live inside the project directory");
     }
-    Ok(AcquiredApp::LocalSource {
-        package_path: source.package_path.clone(),
-    })
+    if !canonical_candidate.join("Cargo.toml").is_file() {
+        bail!(
+            "app source directory '{path}/{}' has no Cargo.toml",
+            source.package_path
+        );
+    }
+    let package_path = canonical_candidate
+        .strip_prefix(&canonical_project)
+        .context("source path confinement check disagreed with strip_prefix")?
+        .to_string_lossy()
+        .into_owned();
+    Ok(AcquiredApp::LocalSource { package_path })
 }

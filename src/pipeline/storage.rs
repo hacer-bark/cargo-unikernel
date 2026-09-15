@@ -20,9 +20,7 @@ pub fn stage(config: &Config, project_dir: &Path) -> Result<()> {
     if config.storage.mode != StorageMode::Persistent {
         return Ok(());
     }
-    let dist_dir = super::host_dist_dir(config, project_dir);
-    std::fs::create_dir_all(&dist_dir)
-        .with_context(|| format!("failed to create {}", dist_dir.display()))?;
+    let dist_dir = super::host_dist_dir(config, project_dir)?;
     let path = host_path(&dist_dir, &config.project.name);
     if path.exists() {
         return Ok(());

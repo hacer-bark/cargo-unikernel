@@ -130,9 +130,7 @@ pub fn run_reproducible_build(
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", project_dir.display()))?;
     let assets_dir = crate::assets::materialize()?;
-    let dist_dir = super::host_dist_dir(config, &project_dir);
-    std::fs::create_dir_all(&dist_dir)
-        .with_context(|| format!("failed to create {}", dist_dir.display()))?;
+    let dist_dir = super::host_dist_dir(config, &project_dir)?;
 
     print_toolchain_overrides(&config.toolchain);
 
