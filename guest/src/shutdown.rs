@@ -1,18 +1,4 @@
 //! Graceful shutdown.
-//!
-//! A hypervisor's "graceful stop" (QEMU's ACPI shutdown) asserts the guest's ACPI power
-//! button rather than signaling any guest process directly, so without something reading
-//! that event it has nowhere to land, and a force-stop skips app cleanup and the scrub below.
-//!
-//! Watches for either trigger (ACPI power button via evdev, or SIGTERM to PID 1), then: asks
-//! the app to exit (`SIGTERM`), gives it a bounded grace period, force-kills anything still
-//! alive, best-effort zeroes writable tmpfs state, and powers off.
-//!
-//! [`wipe_and_power_off`] is the other way in: the same wipe, reached from a fatal error rather
-//! than a shutdown request. It skips the `SIGTERM` grace period (nothing is owed a clean exit at
-//! that point), but it scrubs the same paths — an integrity failure should not leave more behind
-//! than an orderly stop does. Both paths meet in [`kill_wipe_and_power_off`], which is where the
-//! single-entry interlock and the hard deadline on the wipe live, so neither can hang the guest.
 
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
@@ -471,25 +457,16 @@ fn process_alive(pid: u32) -> bool {
 /// 64 MB `/tmp` shouldn't need a 64 MB allocation on the shutdown path.
 const SCRUB_CHUNK: usize = 16 * 1024;
 
-/// Overwrites a regular file's contents in place with zeros.
-///
-/// Not `std::fs::write`: its `O_TRUNC` releases tmpfs's backing pages (contents intact) before
-/// the zeros land in freshly-allocated *different* pages, leaving the original data in the
-/// free pool. Opening without truncation and writing over the existing extent is what actually
-/// overwrites it. `sync_data` before return so the write commits before the caller unlinks.
-///
-/// `O_NOFOLLOW` closes the gap between the caller's `is_file()` check and this open: without
-/// it, an entry swapped for a symlink in that window would redirect these zeros at whatever it
-/// points to — `/dev/vda` in persistent storage mode, for one.
-fn overwrite_file(path: &std::path::Path, len: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(false)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    crate::write_zeros(&mut file, len, &[0u8; SCRUB_CHUNK])?;
+/// Overwrite the opened inode without truncating its existing backing pages.
+fn overwrite_file(file: &mut std::fs::File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "scrub target is not a regular file",
+        ));
+    }
+    crate::write_zeros(file, metadata.len(), &[0u8; SCRUB_CHUNK])?;
     file.sync_data()
 }
 
@@ -502,32 +479,60 @@ fn overwrite_file(path: &std::path::Path, len: u64) -> std::io::Result<()> {
 /// `CONFIG_INIT_ON_FREE_DEFAULT_ON` to zero on reclaim.
 const MAX_SCRUB_DEPTH: u32 = 64;
 
-/// Best-effort: overwrites every regular file under `dir` with zeros before removing it, then
-/// removes now-empty subdirectories bottom-up. `/tmp`, `/run`, `/dev/shm` and (RAM storage
-/// mode) `/var` are tmpfs, so this overwrites the RAM pages backing each file.
-///
-/// Defense in depth, not the primary guarantee — `CONFIG_INIT_ON_FREE_DEFAULT_ON` already
-/// zeroes pages on free, and sev-snp encrypts guest RAM regardless. This just bounds the
-/// window to scrub time instead of whenever the kernel reclaims the page.
-///
-/// Symlinks aren't followed (`DirEntry::metadata` doesn't traverse them) so they fall through
-/// untouched, still removed with their parent directory.
+/// Opens the scrub root without following a symlink, then walks relative to pinned fds.
 fn scrub_dir(dir: &std::path::Path, depth: u32) {
+    use rustix::fs::{Mode, OFlags, open};
+    if let Ok(fd) = open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        scrub_open_dir(&fd, depth);
+    }
+}
+
+/// App-controlled names never resolve through an ancestor replaced during the scrub.
+/// File types are rechecked on the opened inode; nonblocking opens cannot hang on a FIFO.
+fn scrub_open_dir(fd: &std::os::fd::OwnedFd, depth: u32) {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, openat, unlinkat};
     if depth >= MAX_SCRUB_DEPTH {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = Dir::read_from(fd) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.is_dir() {
-            scrub_dir(&path, depth.saturating_add(1));
-            let _ = std::fs::remove_dir(&path);
-        } else if meta.is_file() {
-            let _ = overwrite_file(&path, meta.len());
-            let _ = std::fs::remove_file(&path);
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        match entry.file_type() {
+            FileType::Directory => {
+                if let Ok(child) = openat(
+                    fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    scrub_open_dir(&child, depth.saturating_add(1));
+                    let _ = unlinkat(fd, name, AtFlags::REMOVEDIR);
+                }
+            }
+            FileType::RegularFile => {
+                if let Ok(child) = openat(
+                    fd,
+                    name,
+                    OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    let _ = overwrite_file(&mut std::fs::File::from(child));
+                    let _ = unlinkat(fd, name, AtFlags::empty());
+                }
+            }
+            FileType::Symlink => {
+                let _ = unlinkat(fd, name, AtFlags::empty());
+            }
+            _ => {}
         }
     }
 }
@@ -548,11 +553,13 @@ mod tests {
     /// Preserved length is the proof `O_TRUNC` didn't fire and free the original pages first.
     #[test]
     fn overwrite_file_zeroes_in_place_without_truncating() {
-        let path = std::env::temp_dir().join("cuk-scrub-in-place-test");
+        let temp = crate::TestDir::new().unwrap();
+        let path = temp.0.join("secret");
         let secret = b"secret-bytes-that-must-not-survive".repeat(100);
         std::fs::write(&path, &secret).unwrap();
 
-        overwrite_file(&path, secret.len() as u64).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        overwrite_file(&mut file).unwrap();
 
         let after = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -565,6 +572,41 @@ mod tests {
             "file contents were not zeroed"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scrub_does_not_follow_symlink_roots_or_entries() {
+        let temp = crate::TestDir::new().unwrap();
+        let outside = temp.0.join("outside");
+        let scratch = temp.0.join("scratch");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        let secret = outside.join("secret");
+        std::fs::write(&secret, b"keep").unwrap();
+        std::fs::write(scratch.join("scrub"), b"erase").unwrap();
+        let root_link = temp.0.join("root-link");
+        std::os::unix::fs::symlink(&outside, &root_link).unwrap();
+        std::os::unix::fs::symlink(&outside, scratch.join("directory-link")).unwrap();
+        std::os::unix::fs::symlink(&secret, scratch.join("file-link")).unwrap();
+        scrub_dir(&root_link, 0);
+        scrub_dir(&scratch, 0);
+        assert_eq!(std::fs::read(&secret).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+
+        // Replacing the original pathname must not redirect a walk already holding its fd.
+        std::fs::write(scratch.join("scrub"), b"erase").unwrap();
+        let fd = rustix::fs::open(
+            &scratch,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let moved = temp.0.join("moved");
+        std::fs::rename(&scratch, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &scratch).unwrap();
+        scrub_open_dir(&fd, 0);
+        assert_eq!(std::fs::read(&secret).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
     }
 
     /// `wait_for_trigger` must actually return once `SIGTERM` arrives — this is the one thing

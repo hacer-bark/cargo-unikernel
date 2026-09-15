@@ -1,27 +1,4 @@
 //! Landlock filesystem sandbox for the app process.
-//!
-//! `CONFIG_SECURITY_LANDLOCK` and `CONFIG_LSM=lockdown,yama,landlock` were already compiled in
-//! before this module existed; nothing used them. This is what turns that into an actual
-//! boundary: an unprivileged, inherited, irrevocable allowlist over the guest's (fully
-//! build-time-known) filesystem layout. Everything not named below — all of `/sys` bar the CPU
-//! topology, `/dev/vda`, `/dev/input/event*`, the payload's own directory for writing — is
-//! simply not reachable by the app, whatever the mount flags say.
-//!
-//! Allowlist here, denylist in `seccomp.rs`, on purpose: the seccomp module's own reasoning is
-//! that a wrong syscall allowlist silently breaks every app this tool builds. A *filesystem*
-//! allowlist doesn't have that property — the layout is fixed by the image, so the set is
-//! knowable, and anything an app legitimately needs beyond it is `[app.runtime.landlock]`'s
-//! `extra_read_paths`/`extra_read_write_paths`.
-//!
-//! Hand-rolled against the three raw syscalls rather than taking the `landlock` crate: it is
-//! three syscalls and two structs, and this crate's dependency floor (`libc`, `rustix`,
-//! `seccompiler`) is deliberately low.
-//!
-//! ABI negotiation is deliberately strict. The ruleset is built to whatever the running kernel
-//! reports, but a kernel below ABI 5 (`LANDLOCK_ACCESS_FS_IOCTL_DEV`, Linux 6.10) makes
-//! `fatal` — silently enforcing a weaker sandbox than the one this image claims is worse than
-//! refusing to boot, and the pinned kernel is far newer. Compiling without the `landlock`
-//! feature is the supported way to run without this module at all.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -421,8 +398,19 @@ fn add_rule(ruleset: &OwnedFd, rule: &Rule, log: &impl Fn(&str), fatal: fn(&str)
         ));
     }
 
+    // Keep ownership through fstat and add_rule, including their error paths.
+    // SAFETY: open returned a fresh descriptor owned by this function.
+    let parent = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(parent_fd) };
+    let stat = rustix::fs::fstat(&parent)
+        .unwrap_or_else(|e| fatal(&format!("Landlock: failed to stat {}: {e}", rule.path)));
+    let access =
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory {
+            rule.access
+        } else {
+            rule.access & (FS_EXECUTE | FS_READ_FILE | FS_WRITE_FILE | FS_TRUNCATE | FS_IOCTL_DEV)
+        };
     let attr = PathBeneathAttr {
-        allowed_access: rule.access,
+        allowed_access: access,
         parent_fd,
     };
     // SAFETY: `attr` is a live local whose layout matches the packed uapi struct, and
@@ -436,12 +424,6 @@ fn add_rule(ruleset: &OwnedFd, rule: &Rule, log: &impl Fn(&str), fatal: fn(&str)
             0u32,
         )
     };
-    // SAFETY: closing an fd this function opened and no longer needs — the kernel has already
-    // taken its own reference to the path.
-    unsafe {
-        libc::close(parent_fd);
-    }
-
     if ret != 0 {
         fatal(&format!(
             "landlock_add_rule() failed for {}: {}",
@@ -630,13 +612,14 @@ mod tests {
     }
 
     /// End-to-end against the running kernel, the way `spawn_app` uses it: a ruleset that
-    /// grants nothing under `/etc` must make an `/etc` read fail after `restrict_self`, and
-    /// leave a granted path readable.
+    /// grants one individual file must allow opening it and reject its existing sibling.
     #[test]
     fn an_enforced_ruleset_actually_blocks_an_ungranted_path() {
-        let temp = std::env::temp_dir();
-        let granted = temp.join("cuk-landlock-granted");
+        let temp = crate::TestDir::new().unwrap();
+        let granted = temp.0.join("granted");
         std::fs::write(&granted, b"ok").unwrap();
+        let blocked = temp.0.join("blocked");
+        std::fs::write(&blocked, b"private").unwrap();
 
         let attr = RulesetAttr {
             handled_access_fs: handled_access_fs(abi_version()),
@@ -659,7 +642,7 @@ mod tests {
         add_rule(
             &fd,
             &Rule {
-                path: leak_path(temp.to_str().unwrap()),
+                path: leak_path(granted.to_str().unwrap()),
                 access: READ_WRITE,
                 presence: Presence::Required,
             },
@@ -667,6 +650,8 @@ mod tests {
             |m| panic!("{m}"),
         );
 
+        let granted_path = CString::new(granted.as_os_str().as_encoded_bytes()).unwrap();
+        let blocked_path = CString::new(blocked.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: the child calls only syscalls and `_exit`; the parent only waits on it.
         let status = unsafe {
             let pid = libc::fork();
@@ -675,10 +660,14 @@ mod tests {
                 if restrict_self(fd.as_raw_fd()).is_err() {
                     libc::_exit(97);
                 }
-                if std::fs::read(&granted).is_err() {
+                let allowed = libc::open(granted_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+                if allowed < 0 {
                     libc::_exit(98);
                 }
-                if std::fs::read("/etc/hostname").is_ok() {
+                libc::close(allowed);
+                if libc::open(blocked_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) >= 0
+                    || *libc::__errno_location() != libc::EACCES
+                {
                     libc::_exit(99);
                 }
                 libc::_exit(0);

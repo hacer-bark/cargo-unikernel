@@ -5,7 +5,7 @@
 # pipeline::docker::build_toolchain_image. Layers below are ordered least- to most-volatile
 # (apt/system setup first, version-pinned toolchain installs last) so a bump to
 # RUST_VERSION or E2FSPROGS_VERSION only invalidates the cache from that layer down.
-FROM ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
+FROM ubuntu:26.04@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d
 
 # Avoid tzdata prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -65,7 +65,7 @@ RUN apt-get update && \
 # plugin headers — without it they silently drop during `make olddefconfig` with no error
 # until build_kernel.sh's own verify_config check catches it.
 RUN apt-get update && apt-get install -y --allow-downgrades \
-    build-essential gcc-15-plugin-dev cpio jq python3 python3-pip ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
+    build-essential gcc-15-plugin-dev cpio jq python3 python3-cryptography ccache curl git musl-tools bc rsync golang cmake linux-libc-dev \
     systemd-ukify systemd-boot-efi flex bison libssl-dev libelf-dev wget
 
 # musl-tools no longer symlinks the Linux kernel UAPI headers (linux-libc-dev only provides
@@ -76,16 +76,8 @@ RUN ln -s /usr/include/linux /usr/include/x86_64-linux-musl/linux && \
     ln -s /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
     ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
 
-# `sev-snp-measure` (cloned at build-script runtime — see script_sev_snp_measurement)
-# declares `cryptography` as a dependency but nothing installs it; the module that needs
-# it isn't exercised by this project's `--mode snp` invocation today, but a future
-# sev-snp-measure update could start importing it eagerly. Deliberately unpinned: since
-# it's never on this project's actual call path, it can't affect reproducibility or the
-# measurement either way.
-RUN pip3 install --break-system-packages --no-cache-dir --no-deps cryptography
-
 # Install a specific, fixed version of Rust. Overridable via `[toolchain].rust_version`.
-ARG RUST_VERSION=1.98.0
+ARG RUST_VERSION=1.98.1
 RUN curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_VERSION"
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup target add x86_64-unknown-linux-musl

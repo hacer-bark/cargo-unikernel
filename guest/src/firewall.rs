@@ -115,7 +115,12 @@ const NFT_CT_STATE: u32 = 0;
 const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
 
-const NFPROTO_INET: u8 = 1;
+// The inet table family depends on CONFIG_IPV6. Do not require the IPv6 stack
+// just to enforce a firewall on an IPv4-only image.
+#[cfg(feature = "net-ipv6")]
+const TABLE_FAMILY: u8 = 1; // NFPROTO_INET
+#[cfg(not(feature = "net-ipv6"))]
+const TABLE_FAMILY: u8 = 2; // NFPROTO_IPV4
 const NFPROTO_IPV4: u8 = 2;
 const NFPROTO_IPV6: u8 = 10;
 /// `NF_INET_LOCAL_IN` — the only hook this module registers. Nothing filters `output` or
@@ -452,7 +457,7 @@ impl NlBuf {
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND,
             seq,
         );
-        self.put_nfgenmsg(NFPROTO_INET, 0);
+        self.put_nfgenmsg(TABLE_FAMILY, 0);
         self.put_str(NFTA_RULE_TABLE, TABLE);
         self.put_str(NFTA_RULE_CHAIN, CHAIN);
         let list = self.begin_nested(NFTA_RULE_EXPRESSIONS);
@@ -513,7 +518,7 @@ fn build_batch(rules: &[Rule]) -> io::Result<Batch> {
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
         s,
     );
-    buf.put_nfgenmsg(NFPROTO_INET, 0);
+    buf.put_nfgenmsg(TABLE_FAMILY, 0);
     buf.put_str(NFTA_TABLE_NAME, TABLE);
     buf.end_msg(table);
 
@@ -527,7 +532,7 @@ fn build_batch(rules: &[Rule]) -> io::Result<Batch> {
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
         s,
     );
-    buf.put_nfgenmsg(NFPROTO_INET, 0);
+    buf.put_nfgenmsg(TABLE_FAMILY, 0);
     buf.put_str(NFTA_CHAIN_TABLE, TABLE);
     buf.put_str(NFTA_CHAIN_NAME, CHAIN);
     let hook = buf.begin_nested(NFTA_CHAIN_HOOK);
@@ -850,7 +855,7 @@ mod tests {
         const INSTALLED: i32 = 0;
         const NO_NAMESPACE: i32 = 10;
         const NO_NFTABLES: i32 = 11;
-        const REJECTED: i32 = 12;
+        const REJECTED_BASE: i32 = 64;
 
         let rules = parse_rules("tcp:80;tcp:443;udp:443;tcp:8000-8100", no_fatal);
         let batch = build_batch(&rules).unwrap();
@@ -866,6 +871,9 @@ mod tests {
                 }
                 match send_batch(&batch) {
                     Ok(()) => libc::_exit(INSTALLED),
+                    // Some sandboxes permit creating the namespaces but withhold the
+                    // CAP_NET_ADMIN needed to create an nftables table inside them.
+                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => libc::_exit(NO_NAMESPACE),
                     // A kernel with no nf_tables support at all, rather than one that read the
                     // messages and disagreed with them.
                     Err(e)
@@ -876,7 +884,9 @@ mod tests {
                     {
                         libc::_exit(NO_NFTABLES)
                     }
-                    Err(_) => libc::_exit(REJECTED),
+                    Err(e) => {
+                        libc::_exit(REJECTED_BASE + e.raw_os_error().unwrap_or(0).clamp(0, 191))
+                    }
                 }
             }
             let mut status = 0;
@@ -889,10 +899,12 @@ mod tests {
             INSTALLED => {}
             NO_NAMESPACE => eprintln!("skipped: this host does not allow user namespaces"),
             NO_NFTABLES => eprintln!("skipped: this kernel has no nf_tables support"),
-            _ => panic!(
+            code if code >= REJECTED_BASE => panic!(
                 "the kernel rejected the ruleset — an attribute, register or expression in \
-                 this module does not match what nf_tables expects"
+                 this module does not match what nf_tables expects (errno {})",
+                code - REJECTED_BASE,
             ),
+            code => panic!("the firewall test child returned unexpected status {code}"),
         }
     }
 }

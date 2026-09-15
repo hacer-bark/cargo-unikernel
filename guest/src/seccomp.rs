@@ -217,10 +217,8 @@ fn install_arch_gate() -> io::Result<()> {
 /// `[app.runtime.danger].allow_write_execute` actually gates — see `mounts.rs` for the other
 /// half (the writable mounts themselves).
 ///
-/// Denying these closes the "drop a file and exec it" route, not anonymous executable memory in
-/// general: `mmap`/`mprotect` with `PROT_WRITE|PROT_EXEC` stay allowed, since filtering their
-/// protection argument breaks every JIT and several allocators. Shellcode in an RWX mapping is
-/// out of scope for this filter; running a whole new program image is not.
+/// These entries close anonymous-file execution routes; `main.rs::set_mdwe` separately
+/// rejects writable executable mappings and executable permission gains by default.
 #[cfg(not(feature = "danger-allow-write-execute"))]
 const WRITE_EXECUTE_SYSCALLS: &[i64] = &[libc::SYS_memfd_create, libc::SYS_memfd_secret];
 #[cfg(feature = "danger-allow-write-execute")]
@@ -463,7 +461,7 @@ mod tests {
 
     /// `noexec` mount flags cannot see an anonymous in-memory file, so this is what actually
     /// backs the "no writable+executable paths remain" claim in the default build. Scoped to
-    /// executing a new program image — anonymous RWX memory itself is not denied, see
+    /// executing a new program image — anonymous RWX memory is governed by MDWE, see
     /// [`WRITE_EXECUTE_SYSCALLS`].
     #[test]
     #[cfg(not(feature = "danger-allow-write-execute"))]

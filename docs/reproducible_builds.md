@@ -79,6 +79,33 @@ anywhere, any day.
   question beyond the hash test above. A provider-supplied `path` is your own trust decision —
   always a local file, so verify the provider's published hash against it yourself.
 
+## Kernel cache and audit
+
+`assets/kernel/build_kernel.sh --config-only` downloads/verifies the pinned source,
+resolves Kconfig, and verifies the result without compiling or publishing a cache
+entry. Enabled symbols must resolve to built-in `y`. Every directive must name a symbol
+defined by that kernel source, so typos and renamed options fail; disabled child symbols
+may be omitted from the final config when a disabled parent prunes their Kconfig menu. It
+requires the same explicit version/checksum environment as a normal build.
+
+The kernel cache key includes resolved directives, the build script, installed
+package versions, compiler/linker/build-tool hashes, and the inherited environment
+apart from container identity and shell bookkeeping. Build flags therefore cannot
+reuse an image produced with different flags. Cache entries contain `bzImage`, the
+resolved `config`, and checksums for both, published together after compilation.
+Cache hits verify these and recheck the requested directives. This detects incomplete
+or corrupted cache entries; it does not authenticate a cache writable by an attacker.
+
+The fixed public randstruct seed is a reproducibility choice, not a secret
+per-build layout. The fixed latent-entropy compiler seed must not be counted as
+independent secret entropy. SEV-SNP does not compile virtio-rng: the hostile host
+must not supply the entropy that establishes guest CRNG readiness.
+
+Python `cryptography` now comes from the frozen Ubuntu snapshot, not an unpinned
+PyPI install. The Rust installer bootstrap still comes from the live HTTPS
+`sh.rustup.rs` endpoint: pinning the selected Rust version does not authenticate or
+freeze that bootstrap script. This remains a build-time trust dependency.
+
 ## Per-format determinism notes
 
 - **cpio+bzImage** — fully deterministic given the pinned toolchain and the

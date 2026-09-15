@@ -35,6 +35,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
+      - name: kernel build failure-path tests
+        run: python3 -B -m unittest discover -s assets/kernel/tests -v
       - name: rustfmt (host)
         run: cargo fmt --all --check
       - name: rustfmt (guest)

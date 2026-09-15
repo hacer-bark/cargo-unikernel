@@ -55,19 +55,18 @@ const SUPERBLOCK_PREFIX_LEN: usize = SB_LABEL_OFFSET + SB_LABEL_LEN;
 /// host-writable, so this stops accidents and unrelated data, not a host that means it. See the
 /// module doc.
 ///
-/// Any read error, short device, or bad magic means "not ours"; the caller wipes and reformats.
-fn device_carries_our_marker() -> bool {
-    let Ok(mut dev) = std::fs::File::open(DEVICE_PATH) else {
-        return false;
-    };
-    if dev.seek(SeekFrom::Start(SUPERBLOCK_OFFSET)).is_err() {
-        return false;
-    }
+/// Read failures are fatal: an I/O error is not evidence that existing data is disposable.
+fn device_carries_our_marker() -> std::io::Result<bool> {
+    let mut dev = std::fs::File::open(DEVICE_PATH)?;
+    read_marker(&mut dev)
+}
+
+/// Separate I/O failure from a successfully read foreign volume.
+fn read_marker(dev: &mut (impl Read + Seek)) -> std::io::Result<bool> {
+    dev.seek(SeekFrom::Start(SUPERBLOCK_OFFSET))?;
     let mut sb = [0u8; SUPERBLOCK_PREFIX_LEN];
-    if dev.read_exact(&mut sb).is_err() {
-        return false;
-    }
-    superblock_is_ours(&sb)
+    dev.read_exact(&mut sb)?;
+    Ok(superblock_is_ours(&sb))
 }
 
 /// The pure half of [`device_carries_our_marker`], split out so the offsets and the
@@ -110,8 +109,16 @@ fn wipe_and_format(fatal: fn(&str) -> !) {
     // Shares VOLUME_LABEL with device_carries_our_marker rather than a second literal.
     let label = std::str::from_utf8(VOLUME_LABEL)
         .unwrap_or_else(|_| fatal("VOLUME_LABEL must be valid UTF-8"));
-    let status = Command::new(MKE2FS_PATH)
-        .args(["-q", "-F", "-t", "ext4", "-L", label, DEVICE_PATH])
+    let mut command = Command::new(MKE2FS_PATH);
+    command
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .args(["-q", "-F", "-t", "ext4", "-L", label, DEVICE_PATH]);
+    #[cfg(not(feature = "logging"))]
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status = command
         .status()
         .unwrap_or_else(|e| fatal(&format!("Failed to run {MKE2FS_PATH}: {e}")));
     if !status.success() {
@@ -124,7 +131,9 @@ fn wipe_and_format(fatal: fn(&str) -> !) {
 /// Fatal on any failure — `[storage].mode = "persistent"` is an explicit promise, so silently
 /// falling back to RAM would violate it invisibly.
 pub(crate) fn mount_persistent_var(log: &impl Fn(&str), fatal: fn(&str) -> !) {
-    if device_carries_our_marker() {
+    if device_carries_our_marker()
+        .unwrap_or_else(|e| fatal(&format!("Failed to inspect {DEVICE_PATH}: {e}")))
+    {
         log("[storage] /dev/vda carries this image's volume label — reusing existing /var.");
     } else {
         log(
@@ -180,6 +189,14 @@ mod tests {
         sb[SB_MAGIC_OFFSET..SB_MAGIC_OFFSET + 2].copy_from_slice(&magic.to_le_bytes());
         sb[SB_LABEL_OFFSET..SB_LABEL_OFFSET + label.len()].copy_from_slice(label);
         sb
+    }
+
+    #[test]
+    fn an_unreadable_marker_is_not_a_foreign_volume() {
+        assert!(read_marker(&mut std::io::Cursor::new(Vec::<u8>::new())).is_err());
+        let mut bytes = vec![0u8; usize::try_from(SUPERBLOCK_OFFSET).unwrap()];
+        bytes.extend_from_slice(&superblock_with(EXT4_MAGIC, VOLUME_LABEL));
+        assert!(read_marker(&mut std::io::Cursor::new(bytes)).unwrap());
     }
 
     #[test]

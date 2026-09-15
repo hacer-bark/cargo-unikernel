@@ -52,8 +52,55 @@ fn apply_network_spoofing_protection(warn: &impl Fn(&str)) {
     apply_redirect_and_forwarding_protection(warn);
     apply_source_routing_protection(warn);
     apply_arp_hardening(warn);
+    apply_existing_interface_protection(warn);
     write_sysctl("/proc/sys/net/ipv4/conf/all/log_martians", b"1", warn);
     write_sysctl("/proc/sys/net/ipv4/conf/default/log_martians", b"1", warn);
+}
+
+/// `default` only affects newly created interfaces. Several `all` knobs are combined
+/// with interface values using OR, or are not consulted for IPv6 redirects at all.
+/// NICs already exist by this point, so explicitly close their redirect/source-route paths.
+#[cfg(feature = "hardening-net-spoofing")]
+fn apply_existing_interface_protection(warn: &impl Fn(&str)) {
+    for (family, knobs) in [
+        (
+            "ipv4",
+            &[
+                "accept_redirects",
+                "send_redirects",
+                "secure_redirects",
+                "shared_media",
+            ][..],
+        ),
+        ("ipv6", &["accept_redirects", "accept_source_route"][..]),
+    ] {
+        let path = format!("/proc/sys/net/{family}/conf");
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn(&format!("Failed to enumerate {path}: {e}"));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warn(&format!("Failed to enumerate interface in {path}: {e}"));
+                    continue;
+                }
+            };
+            if entry.file_name() == "all" || entry.file_name() == "default" {
+                continue;
+            }
+            for knob in knobs {
+                if let Some(path) = entry.path().join(knob).to_str() {
+                    write_sysctl(path, b"0", warn);
+                }
+            }
+        }
+    }
 }
 
 /// `rp_filter`, ICMP redirect accept/send/secure (v4 and v6), and forwarding — refuses to

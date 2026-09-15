@@ -25,12 +25,45 @@ if [ -z "${CARGO_UNIKERNEL_ASLR_DISABLED:-}" ]; then
     exec setarch "$(uname -m)" -R bash "$0" "$@"
 fi
 
-KERNEL_VER="${CARGO_UNIKERNEL_KERNEL_VERSION:-6.18.33}"
+KERNEL_VER="${CARGO_UNIKERNEL_KERNEL_VERSION:?Set CARGO_UNIKERNEL_KERNEL_VERSION to the pinned kernel version}"
 KERNEL_SHA256="${CARGO_UNIKERNEL_KERNEL_SHA256:-}"
 CARGO_UNIKERNEL_PROFILE="${CARGO_UNIKERNEL_PROFILE:-casual}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE_DIR="${CARGO_UNIKERNEL_KERNEL_CACHE_DIR:-/build/cache}"
 EXTRA_KCONFIG_FILE="${CARGO_UNIKERNEL_EXTRA_KCONFIG_FILE:-}"
+CONFIG_ONLY=0
+case "${1:-}" in
+    "") ;;
+    --config-only) CONFIG_ONLY=1 ;;
+    *) echo "Usage: $0 [--config-only]" >&2; exit 1 ;;
+esac
+[[ $# -le 1 ]] || { echo "Too many arguments" >&2; exit 1; }
+[[ "$KERNEL_VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
+    echo "Invalid kernel version: $KERNEL_VER" >&2; exit 1;
+}
+[[ "$KERNEL_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || {
+    echo "Kernel SHA-256 must contain exactly 64 hexadecimal characters" >&2; exit 1;
+}
+KERNEL_SHA256="${KERNEL_SHA256,,}"
+export LC_ALL=C
+export KBUILD_BUILD_TIMESTAMP="1970-01-01 00:00:00"
+export KBUILD_BUILD_USER="builder"
+export KBUILD_BUILD_HOST="buildhost"
+export KBUILD_BUILD_VERSION=1
+export SOURCE_DATE_EPOCH=0
+export KCFLAGS="${KCFLAGS:-} -frandom-seed=unikarnel-fixed-latent-entropy-seed"
+# These inputs could redirect Kbuild away from the tree/config we verify.
+for name in KBUILD_OUTPUT KCONFIG_CONFIG KBUILD_KCONFIG MAKEFLAGS MFLAGS MAKEFILES; do
+    if [[ -n "${!name:-}" ]]; then
+        echo "$name is not supported by this kernel build" >&2; exit 1
+    fi
+done
+MAKE=(make ARCH=x86_64 CC=gcc HOSTCC=gcc LD=ld)
+mkdir -p "$CACHE_DIR"
+CACHE_DIR="$(cd "$CACHE_DIR" && pwd)"
+# Serialize shared source/output/cache mutation across builds.
+exec 9>"$CACHE_DIR/kernel-build.lock"
+flock 9
 
 # An absent checksum is a hard failure, not a warning — the host CLI already resolves
 # `[kernel].sha256` (or its baked-in default) before generating this script.
@@ -76,6 +109,9 @@ FRAGMENTS=("$SCRIPT_DIR/kconfig/base.config" "$SCRIPT_DIR/kconfig/$PROFILE_FRAGM
 # vars default to "0" (the host CLI always sets them explicitly; this is just the fallback).
 NET_IPV4="${CARGO_UNIKERNEL_NET_IPV4:-0}"
 NET_IPV6="${CARGO_UNIKERNEL_NET_IPV6:-0}"
+if [ "$NET_IPV4" = "1" ] || [ "$NET_IPV6" = "1" ]; then
+    FRAGMENTS+=("$SCRIPT_DIR/kconfig/network/common.config")
+fi
 if [ "$NET_IPV4" = "1" ]; then
     FRAGMENTS+=("$SCRIPT_DIR/kconfig/network/ipv4.config")
 fi
@@ -108,9 +144,15 @@ fi
 # is the one thing that needs it back, and "last write wins" is what lets it say so.
 if [ "${CARGO_UNIKERNEL_FIREWALL:-0}" = "1" ]; then
     FRAGMENTS+=("$SCRIPT_DIR/kconfig/network/firewall.config")
+    if [ "$NET_IPV6" = "1" ]; then
+        FRAGMENTS+=("$SCRIPT_DIR/kconfig/network/firewall-inet.config")
+    fi
 fi
 
-if [ -n "$EXTRA_KCONFIG_FILE" ] && [ -f "$EXTRA_KCONFIG_FILE" ]; then
+if [ -n "$EXTRA_KCONFIG_FILE" ]; then
+    [[ -f "$EXTRA_KCONFIG_FILE" && -r "$EXTRA_KCONFIG_FILE" ]] || {
+        echo "Extra Kconfig file is missing or unreadable: $EXTRA_KCONFIG_FILE" >&2; exit 1;
+    }
     FRAGMENTS+=("$EXTRA_KCONFIG_FILE")
 fi
 
@@ -133,6 +175,9 @@ parse_fragment() {
             exit 1
         fi
         key="${line%%=*}"
+        [[ "$key" =~ ^CONFIG_[A-Z0-9_]+$ ]] || {
+            echo "Invalid Kconfig key in $fragment_path: $key" >&2; exit 1;
+        }
         directive="${line#*=}"
         case "$directive" in
             enable|disable|set-str:*|set-val:*) ;;
@@ -160,78 +205,20 @@ fingerprint_input() {
     echo "$KERNEL_VER"
     echo "$KERNEL_SHA256"
     sha256sum "${BASH_SOURCE[0]}"
-    gcc --version 2>/dev/null | head -1 || echo "gcc unknown"
-    ld --version 2>/dev/null | head -1 || echo "ld unknown"
-    make --version 2>/dev/null | head -1 || echo "make unknown"
+    # Package versions include compiler plugins, headers, assembler and host build tools.
+    dpkg-query -W -f='${Package}=${Version}\n' | sort
+    for tool in gcc ld make; do
+        sha256sum "$(readlink -f "$(command -v "$tool")")"
+    done
+    # Compiler/Kbuild/ccache overrides are inputs too. Container identity and shell
+    # bookkeeping vary per invocation without changing compiler behavior.
+    env | sort | sed '/^HOSTNAME=/d; /^PWD=/d; /^OLDPWD=/d; /^SHLVL=/d; /^_=/d'
     for key in "${DIRECTIVE_ORDER[@]}"; do
         echo "$key=${DIRECTIVES[$key]}"
     done
 }
 FINGERPRINT=$(fingerprint_input | sha256sum | cut -d' ' -f1)
 CACHED_BZIMAGE="$CACHE_DIR/bzimage/$FINGERPRINT/bzImage"
-
-mkdir -p "$CACHE_DIR/src" "$CACHE_DIR/bzimage" linux-kernel/arch/x86/boot
-if [ -f "$CACHED_BZIMAGE" ]; then
-    echo "Kernel config fingerprint $FINGERPRINT matches a cached build — skipping download/compile."
-    cp "$CACHED_BZIMAGE" linux-kernel/arch/x86/boot/bzImage
-    echo "Done! Kernel is at: linux-kernel/arch/x86/boot/bzImage (from cache)"
-    exit 0
-fi
-
-# --- Download (cached by version, always sha256-verified) ---
-TARBALL="$CACHE_DIR/src/linux-${KERNEL_VER}.tar.xz"
-if [ -f "$TARBALL" ]; then
-    echo "Using cached kernel source tarball: $TARBALL"
-else
-    echo "Downloading Linux kernel source v$KERNEL_VER..."
-    wget -qO "$TARBALL.partial" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VER}.tar.xz"
-    mv "$TARBALL.partial" "$TARBALL"
-fi
-# Verified on the cached path too — otherwise one poisoned cache entry is trusted forever.
-echo "$KERNEL_SHA256  $TARBALL" | sha256sum -c - || {
-    echo "Kernel tarball sha256 mismatch for v$KERNEL_VER — refusing to build" >&2
-    rm -f "$TARBALL"
-    exit 1
-}
-
-rm -rf linux-kernel
-tar -xf "$TARBALL"
-mv "linux-${KERNEL_VER}" linux-kernel
-cd linux-kernel
-
-# CONFIG_GCC_PLUGIN_RANDSTRUCT (self-protection.config) otherwise draws a fresh seed from
-# /dev/urandom on every from-scratch build, breaking every measurement comparison. Replace
-# the seed generator with a fixed, public one instead (same trade-off Debian's
-# reproducible-builds project makes for this plugin). Must land before the first `make`
-# below — the seed file is generated lazily, not necessarily during the final bzImage build.
-cat > scripts/gen-randstruct-seed.sh <<'RANDSTRUCT_SEED_EOF'
-#!/bin/sh
-# SPDX-License-Identifier: GPL-2.0
-# Fixed, public seed — not a secret, just needed constant for reproducible builds.
-# randomize_layout_plugin.c expects exactly 64 hex chars (sha256 output fits that shape).
-SEED=$(echo -n "unikarnel-fixed-randstruct-seed" | sha256sum | cut -d" " -f1)
-echo "$SEED" > "$1"
-HASH=$(echo -n "$SEED" | sha256sum | cut -d" " -f1)
-echo "#define RANDSTRUCT_HASHED_SEED \"$HASH\"" > "$2"
-RANDSTRUCT_SEED_EOF
-
-echo "Configuring minimal KVM guest kernel..."
-make defconfig
-make kvm_guest.config
-
-echo "Applying ${#DIRECTIVE_ORDER[@]} kconfig directives from: ${FRAGMENTS[*]}"
-for key in "${DIRECTIVE_ORDER[@]}"; do
-    directive="${DIRECTIVES[$key]}"
-    case "$directive" in
-        enable) scripts/config --enable "$key" ;;
-        disable) scripts/config --disable "$key" ;;
-        set-str:*) scripts/config --set-str "$key" "${directive#set-str:}" ;;
-        set-val:*) scripts/config --set-val "$key" "${directive#set-val:}" ;;
-    esac
-done
-
-echo "Resolving dependencies and finalizing configuration..."
-make olddefconfig
 
 # --- Verify every directive actually took ---
 #
@@ -240,20 +227,25 @@ make olddefconfig
 # rather than warn: these are security options.
 verify_config() {
     local key directive expected actual failures=0
+    local config_file="$1"
+    local symbols_file="$2"
     for key in "${DIRECTIVE_ORDER[@]}"; do
         directive="${DIRECTIVES[$key]}"
-        actual="$(grep -E "^($key=|# $key is not set)" .config || true)"
+        actual="$(grep -E "^($key=|# $key is not set)" "$config_file" || true)"
+        if ! grep -Fqx "$key" "$symbols_file"; then
+            echo "  $key: no such symbol in Linux $KERNEL_VER" >&2
+            failures=$((failures + 1))
+            continue
+        fi
         case "$directive" in
             enable)
-                # `y` or `m` both count. CONFIG_MODULES=n means nothing ends up `m` in
-                # practice, but that distinction isn't this check's to enforce.
-                expected="$key=y or $key=m"
-                [[ "$actual" == "$key=y" || "$actual" == "$key=m" ]] && continue
+                expected="$key=y"
+                [[ "$actual" == "$key=y" ]] && continue
                 ;;
             disable)
-                # Absent counts as disabled — a symbol removed upstream is dead weight, not a
-                # security hole.
-                expected="# $key is not set (or absent)"
+                # Kconfig omits child symbols when a disabled parent makes their menu
+                # unreachable. The source-symbol check above distinguishes that from a typo.
+                expected="# $key is not set (or dependency-elided)"
                 [[ -z "$actual" || "$actual" == "# $key is not set" ]] && continue
                 ;;
             set-val:*)
@@ -281,28 +273,109 @@ the built kernel would NOT have had it. Usual causes, in rough order of likeliho
   - the symbol has no prompt in this configuration (CONFIG_EXPERT in base.config unlocks many)
   - it is 'select'ed by something else and not directly settable
 VERIFY_EOF
-        exit 1
+        return 1
     fi
-    echo "All ${#DIRECTIVE_ORDER[@]} requested kconfig options verified present in .config."
+    echo "All ${#DIRECTIVE_ORDER[@]} requested Kconfig directives verified."
 }
-verify_config
+
+mkdir -p "$CACHE_DIR/src" "$CACHE_DIR/bzimage" linux-kernel/arch/x86/boot
+if [ "$CONFIG_ONLY" = 0 ] && [ -f "$CACHED_BZIMAGE" ]; then
+    cached_dir="$(dirname "$CACHED_BZIMAGE")"
+    if [[ -f "$cached_dir/config" && -f "$cached_dir/symbols" && -f "$cached_dir/SHA256SUMS" ]] &&
+        [[ "$(cd "$cached_dir" && sha256sum bzImage config symbols)" == "$(cat "$cached_dir/SHA256SUMS")" ]] &&
+        verify_config "$cached_dir/config" "$cached_dir/symbols"; then
+        cp "$CACHED_BZIMAGE" linux-kernel/arch/x86/boot/bzImage
+        cp "$cached_dir/config" linux-kernel/.config
+        echo "Verified cached kernel: $FINGERPRINT"
+        exit 0
+    fi
+    echo "Incomplete or invalid kernel cache entry — rebuilding." >&2
+    rm -rf -- "$cached_dir"
+fi
+
+# --- Download (cached by version, always sha256-verified) ---
+TARBALL="$CACHE_DIR/src/linux-${KERNEL_VER}.tar.xz"
+if [ -f "$TARBALL" ]; then
+    echo "Using cached kernel source tarball: $TARBALL"
+else
+    echo "Downloading Linux kernel source v$KERNEL_VER..."
+    wget -qO "$TARBALL.partial" "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VER%%.*}.x/linux-${KERNEL_VER}.tar.xz"
+    mv "$TARBALL.partial" "$TARBALL"
+fi
+# Verified on the cached path too — otherwise one poisoned cache entry is trusted forever.
+echo "$KERNEL_SHA256  $TARBALL" | sha256sum -c - || {
+    echo "Kernel tarball sha256 mismatch for v$KERNEL_VER — refusing to build" >&2
+    rm -f "$TARBALL"
+    exit 1
+}
+
+rm -rf linux-kernel
+mkdir linux-kernel
+tar -xf "$TARBALL" -C linux-kernel --strip-components=1
+cd linux-kernel
+
+# Index source-defined symbols once. This lets verification distinguish a dependency-elided
+# disabled option from a misspelled or removed option without repeatedly scanning the tree.
+shopt -s globstar nullglob
+kconfig_files=(**/Kconfig **/Kconfig.*)
+awk '/^[[:space:]]*(menu)?config[[:space:]]+[A-Z0-9_]+$/ { \
+        for (i = 1; i <= NF; i++) if ($i == "config" || $i == "menuconfig") { \
+            print "CONFIG_" $(i + 1); break \
+        } \
+    }' "${kconfig_files[@]}" \
+    | sort -u > .kconfig-symbols
+shopt -u globstar nullglob
+
+# CONFIG_GCC_PLUGIN_RANDSTRUCT (self-protection.config) otherwise draws a fresh seed from
+# /dev/urandom on every from-scratch build, breaking every measurement comparison. Replace
+# the seed generator with a fixed, public one instead (same trade-off Debian's
+# reproducible-builds project makes for this plugin). Must land before the first `make`
+# below — the seed file is generated lazily, not necessarily during the final bzImage build.
+cat > scripts/gen-randstruct-seed.sh <<'RANDSTRUCT_SEED_EOF'
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Fixed, public seed — not a secret, just needed constant for reproducible builds.
+# randomize_layout_plugin.c expects exactly 64 hex chars (sha256 output fits that shape).
+SEED=$(echo -n "unikarnel-fixed-randstruct-seed" | sha256sum | cut -d" " -f1)
+echo "$SEED" > "$1"
+HASH=$(echo -n "$SEED" | sha256sum | cut -d" " -f1)
+echo "#define RANDSTRUCT_HASHED_SEED \"$HASH\"" > "$2"
+RANDSTRUCT_SEED_EOF
+
+echo "Configuring minimal KVM guest kernel..."
+"${MAKE[@]}" defconfig
+"${MAKE[@]}" kvm_guest.config
+
+echo "Applying ${#DIRECTIVE_ORDER[@]} kconfig directives from: ${FRAGMENTS[*]}"
+for key in "${DIRECTIVE_ORDER[@]}"; do
+    directive="${DIRECTIVES[$key]}"
+    case "$directive" in
+        enable) scripts/config --enable "$key" ;;
+        disable) scripts/config --disable "$key" ;;
+        set-str:*) scripts/config --set-str "$key" "${directive#set-str:}" ;;
+        set-val:*) scripts/config --set-val "$key" "${directive#set-val:}" ;;
+    esac
+done
+
+echo "Resolving dependencies and finalizing configuration..."
+"${MAKE[@]}" olddefconfig
+
+verify_config .config .kconfig-symbols
+if [ "$CONFIG_ONLY" = 1 ]; then
+    echo "Configuration verified; --config-only requested, no kernel compiled or cached."
+    exit 0
+fi
 
 echo "Compiling the kernel (this will take a few minutes; ccache speeds up repeat builds)..."
-export KBUILD_BUILD_TIMESTAMP="1970-01-01 00:00:00"
-export KBUILD_BUILD_USER="builder"
-export KBUILD_BUILD_HOST="buildhost"
-export KBUILD_BUILD_VERSION="1"
-export SOURCE_DATE_EPOCH=0
+"${MAKE[@]}" -j"$(nproc)" bzImage
+verify_config .config .kconfig-symbols
 
-# CONFIG_GCC_PLUGIN_LATENT_ENTROPY reads /dev/urandom directly at compile time unless GCC
-# gets `-frandom-seed` — a separate mechanism from the randstruct seed file above, and the
-# ASLR re-exec doesn't help it either. This pins it to a fixed, deterministic value instead.
-export KCFLAGS="${KCFLAGS:-} -frandom-seed=unikarnel-fixed-latent-entropy-seed"
-make -j"$(nproc)" bzImage
-ccache -s || true
-
-mkdir -p "$(dirname "$CACHED_BZIMAGE")"
-cp arch/x86/boot/bzImage "$CACHED_BZIMAGE"
+cache_stage=$(mktemp -d "$CACHE_DIR/bzimage/.partial.XXXXXXXX")
+cp arch/x86/boot/bzImage "$cache_stage/bzImage"
+cp .config "$cache_stage/config"
+cp .kconfig-symbols "$cache_stage/symbols"
+(cd "$cache_stage" && sha256sum bzImage config symbols > SHA256SUMS)
+mv "$cache_stage" "$(dirname "$CACHED_BZIMAGE")"
 
 echo ""
 echo "Done! Kernel is at: linux-kernel/arch/x86/boot/bzImage (cached as $FINGERPRINT for next time)"

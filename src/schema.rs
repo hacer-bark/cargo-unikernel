@@ -638,7 +638,7 @@ pub struct Kernel {
 }
 
 fn default_kernel_version() -> String {
-    "6.18.49".to_string()
+    "6.18.51".to_string()
 }
 
 /// sha256 of the `linux-<version>.tar.xz` for [`default_kernel_version`], verified against
@@ -647,7 +647,7 @@ fn default_kernel_version() -> String {
 /// without requiring a config file just to pin a hash for the version this tool already
 /// defaults to.
 const DEFAULT_KERNEL_SHA256: &str =
-    "ae826f33111fea6f1d279dde7299d7463c8dfd204aeb75a8fb5432bc60a28191";
+    "ba2f60f858bf4d1f929101faa356c93dc8b925b17aaa9f95eabd4627758df613";
 
 impl Default for Kernel {
     fn default() -> Self {

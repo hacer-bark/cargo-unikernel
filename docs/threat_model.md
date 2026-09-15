@@ -54,7 +54,7 @@ what gets measured.
 | Read VM memory | Hardware per-VM encryption key |
 | Modify boot image | Secure Processor measures kernel+initramfs+app; any change alters the measurement |
 | DMA injection | Reverse Map Table blocks host DMA into encrypted pages |
-| Replay old VM state | Attestation includes a version counter |
+| Boot an old image or replay persistent state | The verifier must reject stale measurements/guest versions; persistent-state freshness needs an external protocol. Report version/TCB fields are not an application-state rollback counter |
 
 ### Build-time supply chain
 
@@ -70,7 +70,7 @@ what gets measured.
 
 | Attack | Mitigation |
 |:---|:---|
-| Port-scan the guest to find what it runs | `[network.firewall]` (on by default): an nftables `input` chain with `policy drop`, so an unlisted port produces no `RST` and no ICMP unreachable — a scanner sees `filtered`, the same answer a dark address gives. Only the ports in `inbound` reach the stack at all |
+| Port-scan the guest to find what it runs | `[network.firewall]` (on by default): an nftables `input` chain with `policy drop` (`ip` family for IPv4-only builds, `inet` when IPv6 is enabled), so an unlisted port produces no `RST` and no ICMP unreachable — a scanner sees `filtered`, the same answer a dark address gives. Only the ports in `inbound` pass this input filter; packet parsing and connection tracking happen before it |
 | Ping/ICMP-probe for liveness | Echo request is not in the admitted ICMP set, so nothing replies. `icmp_echo_ignore_all=1` (`[hardening.runtime].icmp_hardening`) is the second answer to the same question |
 | Reach a port the app opened that the config never mentioned | The filter is an allowlist over ports, not over the app's behaviour: a listener the config doesn't name is unreachable from off-box regardless of what bound it |
 | Change the port policy from the host | On sev-snp the policy is baked into the guest image and covered by the launch measurement, so a peer verifying an attestation report verifies the port policy with it — unlike a host-side security group, which the host can edit |
@@ -92,11 +92,11 @@ so that one exchange predates the filter; nothing is listening yet, but it is no
 | Drop and run a new binary | Every writable mount is `noexec`; `memfd_create`/`memfd_secret` also denied so a file can't dodge the mount flags via `execveat`. Both lift with `[app.runtime.danger].allow_write_execute` |
 | Shellcode from `PROT_WRITE\|PROT_EXEC` memory | `PR_SET_MDWE` (`PR_MDWE_REFUSE_EXEC_GAIN`) refuses any `mmap`/`mprotect` that turns a writable mapping executable — closes the anonymous-memory gap the mount-flag/seccomp row above leaves open. Lifts with the same `[app.runtime.danger].allow_write_execute`, since both gate "no writable+executable memory" as one guarantee. Does not affect `execve` itself (the ELF loader maps a new image's text `PROT_EXEC` directly, never via a writable transition) |
 | Read files/devices outside the app's own footprint | Landlock (`[app.runtime.landlock]`, on by default): an allowlist over the payload dir, the scratch mounts, `/proc`, the CPU-topology slice of `/sys`, and the basic character devices — everything else, including most of `/sys` and `/dev/vda`, is unreachable regardless of uid or mount flags |
-| `ioctl` a device the app has no business touching (sev-snp: `/dev/sev-guest`) | Landlock ABI 5's `IOCTL_DEV` right is granted only on `/dev/sev-guest`, which the driver exposes as `ioctl`-only (no `.read`/`.write`) — no other device node in the ruleset can `ioctl` at all |
+| `ioctl` a device the app has no business touching (sev-snp: `/dev/sev-guest`) | Landlock ABI 5's `IOCTL_DEV` right is granted on `/dev/sev-guest` for attestation and on PTY devices for terminal setup; byte-stream devices do not receive it |
 | Bypass seccomp via x32 ABI | Filter checks `AUDIT_ARCH_X86_64` and rejects `__X32_SYSCALL_BIT`; `CONFIG_X86_X32_ABI` is off by default too |
 | Read PID 1's `/proc` (cmdline = host's kernel cmdline) | `/proc` mounted `hidepid=2`, optionally `subset=pid` (`[hardening.runtime].proc_subset_pid`); PID 1 is `PR_SET_DUMPABLE 0` |
 | Exhaust RAM via writable tmpfs | `/tmp`, `/var/tmp`, `/dev/shm` capped at 64 MB, `/run` at 16 MB (not the tmpfs default of half of RAM) |
-| Weak keys from an unseeded CRNG | Boot waits up to 30s for seeding, then **powers off** rather than starting unseeded |
+| Weak keys from an unseeded CRNG | Boot waits up to 30s for seeding, then **powers off** rather than starting unseeded. SEV-SNP removes virtio-rng; its measured command line sets `random.trust_bootloader=off`, so host-supplied RNG bytes cannot satisfy that wait |
 | Escape into a new namespace | `CONFIG_NAMESPACES=n` — every `CLONE_NEW*` fails. Seccomp also denies `unshare`/`setns` |
 | Read another process's memory sans `ptrace` | `yama ptrace_scope=3`, seccomp denies `process_vm_readv`/`writev`, `CONFIG_PROC_MEM_NO_FORCE=y` |
 | Move the clock to revive an expired cert | Seccomp denies clock-setting syscalls — mitigated against the guest; the host still supplies the initial clock, see below |
@@ -164,3 +164,34 @@ untrusted, host-visible scratch space; keep secrets in RAM.
   (`app-console`/`logging` features), not runtime flags. On sev-snp the serial console is read
   by the hypervisor, outside the trust boundary — enabling either means accepting that
   whatever it prints reaches an untrusted party.
+
+## Kernel build assurance and its limits
+
+The build checks the kernel.org tarball against the configured SHA-256, resolves
+Kconfig, then checks every requested directive. `enable` must resolve to built-in
+`y`, never a module. Config and image checksums accompany cached kernels; both are
+checked on reuse, and the config is checked against the current directives again.
+Cache publication is atomic and shared kernel builds are serialized.
+
+The cache is still inside the build trust boundary. An attacker who can rewrite
+both a cached image and its checksum manifest can forge that local evidence.
+Independently reproduce the image from a trusted toolchain and empty caches before
+approving a new attestation measurement. A matching measurement identifies bytes;
+it does not certify those bytes as safe.
+
+Network modes select drivers and addressing behavior. IPv4-only builds remove
+IPv6; IPv6 builds still require Linux's shared `CONFIG_INET` TCP/IP infrastructure
+and do not remove every IPv4 code path. RAM storage removes virtio-blk, SCSI/NVMe,
+and ext4 by default. Extra Kconfig directives and disabled hardening categories can
+weaken these defaults and change the resulting measurement.
+
+SEV-SNP kernels disable `CONFIG_PRINTK` by default, independently of app/init
+logging, to suppress kernel diagnostics and register dumps to the host console.
+A debug override enabling printk changes the measured image and should not be
+approved as equivalent to the confidential production build. CPU entropy, AMD
+firmware/microcode, launch policy, and the verifier's minimum TCB requirements remain
+part of the trust model. In particular, the verifier must check that debug and
+other unacceptable launch-policy options are disabled, not just compare a hash.
+
+See [AMD's attestation field descriptions](https://www.amd.com/content/dam/amd/en/documents/developer/lss-snp-attestation.pdf)
+for the distinction between platform TCB versions and application freshness.

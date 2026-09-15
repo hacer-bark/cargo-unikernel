@@ -39,6 +39,12 @@ use std::process::Command;
 /// allocating per call — both callers (scrubbing a tmpfs file, wiping a whole block device)
 /// are on paths where an allocation sized to the target would be absurd.
 fn write_zeros(sink: &mut impl std::io::Write, len: u64, zeros: &[u8]) -> std::io::Result<()> {
+    if len > 0 && zeros.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "zero buffer must not be empty",
+        ));
+    }
     let mut remaining = len;
     while remaining > 0 {
         let n = usize::try_from(remaining)
@@ -125,10 +131,21 @@ fn baked<T: std::str::FromStr>(raw: &str, what: &str) -> T {
 }
 
 fn app_ids() -> (u32, u32) {
-    (
-        baked(APP_UID, "CARGO_UNIKERNEL_APP_UID"),
-        baked(APP_GID, "CARGO_UNIKERNEL_APP_GID"),
-    )
+    let uid = baked(APP_UID, "CARGO_UNIKERNEL_APP_UID");
+    let gid = baked(APP_GID, "CARGO_UNIKERNEL_APP_GID");
+    validate_app_ids(uid, gid).unwrap_or_else(|e| fatal_shutdown(&e.to_string()));
+    (uid, gid)
+}
+
+/// Reject root and the reserved all-ones ID before chown or privilege dropping.
+fn validate_app_ids(uid: u32, gid: u32) -> std::io::Result<()> {
+    if [uid, gid].into_iter().any(|id| id == 0 || id == u32::MAX) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "app UID and GID must be nonzero and must not be u32::MAX",
+        ));
+    }
+    Ok(())
 }
 
 /// Boot-progress and `[WARN]` output. Compiled to a true no-op — no `println!`, no write
@@ -551,6 +568,7 @@ fn main() {
         non_pid1_fatal_exit("This binary is the guest's init and only runs as PID 1");
     }
 
+    let (uid, gid) = app_ids();
     log("cargo-unikernel guest init starting (PID 1)...");
     set_self_non_dumpable(|w| log(&format!("[WARN] {w}")));
 
@@ -570,7 +588,6 @@ fn main() {
     // (the entropy and network-settle waits alone allow 30s each) is time a hypervisor's
     // graceful-stop request would otherwise land in and be lost.
     let shutdown_triggers = crate::shutdown::arm_shutdown_triggers();
-    let (uid, gid) = app_ids();
     chown_dirs_for_app(uid, gid, fatal_shutdown);
 
     // After /proc is mounted (for /proc/net/pnp) but otherwise placement-insensitive — nothing
@@ -620,4 +637,47 @@ fn main() {
 
     log("Boot sequence complete. System operational. PID 1 entering watchdog mode.");
     watchdog_loop(app_pid);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rejects_privileged_and_reserved_app_ids() {
+        for (uid, gid) in [(0, 65534), (65534, 0), (u32::MAX, 1), (1, u32::MAX)] {
+            assert!(super::validate_app_ids(uid, gid).is_err());
+        }
+        assert!(super::validate_app_ids(65534, 65534).is_ok());
+    }
+
+    #[test]
+    fn zero_writer_rejects_an_empty_buffer() {
+        assert!(super::write_zeros(&mut std::io::sink(), 1, &[]).is_err());
+        assert!(super::write_zeros(&mut std::io::sink(), 0, &[]).is_ok());
+    }
+}
+
+/// Private random directory for filesystem regression tests, removed on scope exit.
+#[cfg(test)]
+#[derive(Debug)]
+struct TestDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    fn new() -> std::io::Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut bytes = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let path =
+            std::env::temp_dir().join(format!("cuk-test-{:032x}", u128::from_ne_bytes(bytes)));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

@@ -12,6 +12,7 @@
 
 use rustix::mount::MountFlags;
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 
 /// tmpfs sizes in MiB, baked in by `build.rs` from `[storage.tmpfs]`. Plain per-deployment
 /// data, not a toggle — see `Cargo.toml`'s feature list for the actual on/off switches.
@@ -206,7 +207,9 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     )
     .unwrap_or_else(|e| fatal(&format!("Failed to mount /var: {e}")));
 
-    let _ = std::fs::create_dir_all("/var/tmp");
+    let var_tmp = prepare_mount_directory("/var/tmp")
+        .unwrap_or_else(|e| fatal(&format!("Unsafe /var/tmp mount point: {e}")));
+    // Pin the checked directory so mount cannot follow an untrusted symlink on /var.
     let var_tmp_data = tmpfs_data(
         TMPFS_VAR_TMP_MB,
         "CARGO_UNIKERNEL_TMPFS_VAR_TMP_MB",
@@ -214,7 +217,7 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     );
     mount(
         "tmpfs",
-        "/var/tmp",
+        &format!("/proc/self/fd/{}", var_tmp.as_raw_fd()),
         "tmpfs",
         NOSUID_NODEV_NOEXEC,
         Some(&var_tmp_data),
@@ -244,6 +247,21 @@ pub(crate) fn prepare_system_env(payload_dir: &str, log: impl Fn(&str), fatal: f
     log("Filesystem environment ready.");
 }
 
+/// Creates or opens a mount point without following its final component as a symlink.
+/// Its parent must already be a trusted mount point; used before the app starts.
+fn prepare_mount_directory(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
 /// `/tmp`'s remount flags for [`lockdown_filesystem`] — mirrors [`writable_exec_mount_flags`],
 /// minus the initial mount-only flags. `/var` needs no equivalent remount: it's never
 /// remounted read-only or noexec after its initial mount, so whatever
@@ -253,12 +271,8 @@ const fn tmp_remount_flags() -> MountFlags {
     writable_exec_mount_flags()
 }
 
-/// The claim is about *paths*, deliberately: this seals the file-backed routes to executing new
-/// code (every writable mount is `noexec`, and `seccomp.rs` denies `memfd_create`/`memfd_secret`
-/// so an anonymous file can't be `execveat`'d past those flags). It is not W^X — an app can
-/// still `mmap`/`mprotect` anonymous `PROT_WRITE|PROT_EXEC` memory and run whatever it puts
-/// there, which no mount flag can see. Filtering `mmap`'s protection argument is the only thing
-/// that would close it, and doing so breaks every JIT and several allocators, so it isn't done.
+/// Mount flags seal writable file-backed execution paths. Anonymous executable mappings
+/// are restricted separately by `main.rs::set_mdwe` unless the danger feature is enabled.
 fn log_lockdown_complete(log: &impl Fn(&str)) {
     if ALLOW_WRITE_EXECUTE {
         log(
@@ -361,5 +375,30 @@ fn seal_rootfs(log: &impl Fn(&str)) {
             "[WARN] Failed to remount / read-only: {e}. Paths on the root filesystem (/etc among \
              them) stay writable to root for the rest of this boot."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mount_directory_rejects_symlinks_and_files() -> std::io::Result<()> {
+        let temp = crate::TestDir::new()?;
+        let target = temp.0.join("target");
+        let link = temp.0.join("link");
+        let file = temp.0.join("file");
+        let target = target
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("non-UTF8 path"))?;
+        super::prepare_mount_directory(target)?;
+        super::prepare_mount_directory(target)?;
+        std::os::unix::fs::symlink(target, &link)?;
+        std::fs::write(&file, b"data")?;
+        for path in [&link, &file] {
+            let path = path
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("non-UTF8 path"))?;
+            assert!(super::prepare_mount_directory(path).is_err());
+        }
+        Ok(())
     }
 }
