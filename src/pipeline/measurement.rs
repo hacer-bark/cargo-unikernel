@@ -37,6 +37,12 @@ pub fn compute(
         .with_context(|| format!("failed to read {}", path.display()))?
         .trim()
         .to_string();
+    if hex.len() != 96 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "{} does not contain a 96-character SHA-384 measurement",
+            path.display()
+        );
+    }
 
     let Some(sev) = &config.sev_snp else {
         bail!("measurement computed but config has no [sev_snp] section");
@@ -142,7 +148,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cu-measurement-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("dist")).unwrap();
         let measurement_path = dir.join("dist/sev_measurement.txt");
-        std::fs::write(&measurement_path, "  abcd1234  \n").unwrap();
+        let expected = "ab".repeat(48);
+        std::fs::write(&measurement_path, format!("  {expected}  \n")).unwrap();
 
         let artifacts = BuildArtifacts {
             bzimage: PathBuf::from("/build/bzImage"),
@@ -159,13 +166,13 @@ mod tests {
             },
         };
         let m = compute(&sev_snp_config(), &dir, &artifacts).unwrap();
-        assert_eq!(m.hex, "abcd1234");
+        assert_eq!(m.hex, expected);
 
         let sidecar: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("dist/sev_measurement.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(sidecar["measurement_sha384"], "abcd1234");
+        assert_eq!(sidecar["measurement_sha384"], expected);
         assert_eq!(sidecar["vcpus"], 2);
         assert_eq!(sidecar["vcpu_type"], "EPYC-v3");
         assert_eq!(sidecar["ovmf_source"], "builtin");
@@ -185,7 +192,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("cu-measurement-test-ovmf-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("dist")).unwrap();
-        std::fs::write(dir.join("dist/sev_measurement.txt"), "abcd1234").unwrap();
+        std::fs::write(dir.join("dist/sev_measurement.txt"), "ab".repeat(48)).unwrap();
         let artifacts = BuildArtifacts {
             bzimage: PathBuf::from("/build/bzImage"),
             cpio: PathBuf::from("/build/initrd.cpio"),
@@ -227,6 +234,28 @@ mod tests {
         };
         let err = compute(&sev_snp_config(), &dir, &artifacts).unwrap_err();
         assert!(err.to_string().contains("requires a measurement"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_malformed_measurement() {
+        let dir = std::env::temp_dir().join(format!(
+            "cu-measurement-test-malformed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        let path = dir.join("dist/sev_measurement.txt");
+        std::fs::write(&path, "not-a-sha384").unwrap();
+        let artifacts = BuildArtifacts {
+            bzimage: PathBuf::new(),
+            cpio: PathBuf::new(),
+            uki: None,
+            binary: None,
+            sev_measurement: Some(path),
+            component_hashes: crate::pipeline::docker::ComponentHashes::default(),
+        };
+
+        assert!(compute(&sev_snp_config(), &dir, &artifacts).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

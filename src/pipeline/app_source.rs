@@ -5,7 +5,7 @@
 //! wire. Mode A (compile from source) just confirms the project directory looks buildable —
 //! the actual build happens inside the pinned container in `pipeline::docker`.
 
-use crate::schema::{AppMode, Config};
+use crate::schema::{AppMode, Config, Toolchain};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -92,7 +92,7 @@ fn acquire_source(config: &Config, project_dir: &Path) -> Result<AcquiredApp> {
     if !canonical_candidate.starts_with(&canonical_project) {
         bail!("app source directory must live inside the project directory");
     }
-    if !canonical_candidate.join("Cargo.toml").is_file() {
+    if source.toolchain == Toolchain::Rust && !canonical_candidate.join("Cargo.toml").is_file() {
         bail!(
             "app source directory '{path}/{}' has no Cargo.toml",
             source.package_path
@@ -104,4 +104,26 @@ fn acquire_source(config: &Config, project_dir: &Path) -> Result<AcquiredApp> {
         .to_string_lossy()
         .into_owned();
     Ok(AcquiredApp::LocalSource { package_path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::docker::test_fixtures::{casual_config_with_formats, generic_source};
+    use crate::schema::OutputFormat;
+
+    #[test]
+    fn generic_source_does_not_require_a_cargo_manifest() -> Result<()> {
+        let project_dir =
+            std::env::temp_dir().join(format!("cu-generic-source-test-{}", std::process::id()));
+        std::fs::create_dir_all(&project_dir)?;
+
+        let mut config = casual_config_with_formats(vec![OutputFormat::Cpio]);
+        config.app.source = Some(generic_source());
+        let acquired = acquire(&config, &project_dir);
+
+        std::fs::remove_dir(&project_dir)?;
+        assert!(matches!(acquired, Ok(AcquiredApp::LocalSource { .. })));
+        Ok(())
+    }
 }

@@ -162,20 +162,20 @@ enum Presence {
 
 /// One `LANDLOCK_RULE_PATH_BENEATH` rule: `access` granted on everything at or beneath `path`.
 #[derive(Debug)]
-struct Rule {
-    path: &'static str,
+struct Rule<'a> {
+    path: &'a str,
     access: u64,
     presence: Presence,
 }
 
-const fn required(path: &'static str, access: u64) -> Rule {
+const fn required(path: &str, access: u64) -> Rule<'_> {
     Rule {
         path,
         access,
         presence: Presence::Required,
     }
 }
-const fn optional(path: &'static str, access: u64) -> Rule {
+const fn optional(path: &str, access: u64) -> Rule<'_> {
     Rule {
         path,
         access,
@@ -202,7 +202,7 @@ const SCRATCH: u64 = READ_WRITE;
 /// `/sys` is the opposite call: nothing here legitimately browses it, so only the CPU topology
 /// — the one part Go's runtime, jemalloc and friends actually read — is granted, and the rest
 /// of the enumeration surface is gone.
-fn builtin_rules(payload_dir: &'static str) -> Vec<Rule> {
+fn builtin_rules(payload_dir: &str) -> Vec<Rule<'_>> {
     #[cfg_attr(not(feature = "sev-snp"), allow(unused_mut))]
     let mut rules = vec![
         required(payload_dir, READ_EXEC),
@@ -339,12 +339,12 @@ pub(crate) fn build(
 
     let mut rules = builtin_rules(payload_dir);
     rules.extend(extra_read.iter().map(|p| Rule {
-        path: leak_path(p),
+        path: p,
         access: READ,
         presence: Presence::Required,
     }));
     rules.extend(extra_read_write.iter().map(|p| Rule {
-        path: leak_path(p),
+        path: p,
         access: READ_WRITE,
         presence: Presence::Required,
     }));
@@ -361,18 +361,11 @@ pub(crate) fn build(
     Ruleset { fd }
 }
 
-/// `[app.runtime.landlock]`'s extra paths arrive as borrows of a baked-in `&'static str` that
-/// was already split at runtime, so their lifetime is `'static` in fact but not in type. One
-/// leak per configured path, once, in a process that never adds more.
-fn leak_path(path: &str) -> &'static str {
-    Box::leak(path.to_string().into_boxed_str())
-}
-
 /// Adds one `LANDLOCK_RULE_PATH_BENEATH` rule, opening its path `O_PATH` (no read permission
 /// needed, and no side effect on a device node — which is why this can safely "open"
 /// `/dev/sev-guest` without disturbing it).
 #[allow(clippy::as_conversions)]
-fn add_rule(ruleset: &OwnedFd, rule: &Rule, log: &impl Fn(&str), fatal: fn(&str) -> !) {
+fn add_rule(ruleset: &OwnedFd, rule: &Rule<'_>, log: &impl Fn(&str), fatal: fn(&str) -> !) {
     let Ok(cpath) = CString::new(rule.path) else {
         fatal(&format!(
             "Landlock path {:?} contains a NUL byte",
@@ -642,7 +635,7 @@ mod tests {
         add_rule(
             &fd,
             &Rule {
-                path: leak_path(granted.to_str().unwrap()),
+                path: granted.to_str().unwrap(),
                 access: READ_WRITE,
                 presence: Presence::Required,
             },

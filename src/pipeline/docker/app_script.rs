@@ -89,15 +89,17 @@ pub(super) fn script_build_at(source: &AppSource, package_dir: &str) -> Result<S
                  --manifest-path {package_dir_q}/Cargo.toml",
                 shell_quote(&source.cargo_profile)
             );
-            // `sort` before `head -n1`: if the crate happens to define more than one
-            // `[[bin]]` target, `find`'s own enumeration order is filesystem/directory-
-            // entry order, not anything stable — sorting at least makes "which one we pick"
-            // a function of the names involved, not of the build environment's directory
-            // iteration order.
             let _ = writeln!(
                 s,
-                "APP_BIN=$(find /tmp/cargo-target-app/x86_64-unknown-linux-musl/{} \
-                 -maxdepth 1 -type f -executable | sort | head -n1)",
+                "mapfile -t APP_CANDIDATES < <(find \
+                 /tmp/cargo-target-app/x86_64-unknown-linux-musl/{} \
+                 -maxdepth 1 -type f -executable -print | sort)\n\
+                 if [ \"${{#APP_CANDIDATES[@]}}\" -ne 1 ]; then\n\
+                 \x20   echo \"Expected exactly one app binary, found ${{#APP_CANDIDATES[@]}}\" >&2\n\
+                 \x20   printf '  %s\\n' \"${{APP_CANDIDATES[@]}}\" >&2\n\
+                 \x20   exit 1\n\
+                 fi\n\
+                 APP_BIN=${{APP_CANDIDATES[0]}}",
                 shell_quote(profile_dir(&source.cargo_profile))
             );
         }
@@ -153,6 +155,7 @@ mod tests {
         assert!(script.contains("cargo build --locked --profile 'release'"));
         assert!(script.contains("--manifest-path '/workspace'/Cargo.toml"));
         assert!(!script.contains("apt-get"));
+        assert!(script.contains("Expected exactly one app binary"));
     }
 
     #[test]

@@ -112,7 +112,9 @@ mod tests {
     /// the crate-wide `TEST_CWD_LOCK` (shared with every other module that does this) so cwd
     /// changes across modules serialize under `cargo test`'s multi-threaded runner too.
     fn in_temp_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _guard = crate::TEST_CWD_LOCK.lock().unwrap();
+        let _guard = crate::TEST_CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("cu-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::current_dir().unwrap();

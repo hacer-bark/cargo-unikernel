@@ -107,20 +107,18 @@ pub(crate) fn arm_shutdown_triggers() -> ShutdownTriggers {
 }
 
 /// Spawns the watcher thread over already-armed triggers.
-///
-/// `app_pid` is the process this init asks to exit first, before the blanket kill that follows
-/// it. `log` is called from the watcher thread, so it must be `Send`.
 pub(crate) fn spawn_watcher(
     triggers: ShutdownTriggers,
     app_pid: u32,
     log: impl Fn(&str) + Send + 'static,
-) {
-    std::thread::spawn(move || {
+) -> std::io::Result<()> {
+    std::thread::Builder::new().spawn(move || {
         wait_for_trigger(&triggers.devices);
         SHUTDOWN_IN_PROGRESS.store(true, Ordering::SeqCst);
         log("Graceful shutdown requested — signaling the app...");
         run_graceful_shutdown(app_pid, &log);
-    });
+    })?;
+    Ok(())
 }
 
 /// Registers `fd` for readability on `epfd`, tagging the event with `fd`'s own number so the

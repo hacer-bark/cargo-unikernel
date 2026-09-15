@@ -630,10 +630,9 @@ fn main() {
 
     let app_pid = spawn_app();
 
-    // Spawned only now that the app exists: `Command::pre_exec` runs between `fork()` and
-    // `execve()`, where only async-signal-safe work is sound, and forking a process that
-    // already has other threads is what makes that a real constraint rather than a formality.
-    crate::shutdown::spawn_watcher(shutdown_triggers, app_pid, log);
+    // Keep the process single-threaded until after the pre-exec hooks have run.
+    crate::shutdown::spawn_watcher(shutdown_triggers, app_pid, log)
+        .unwrap_or_else(|e| fatal_shutdown(&format!("Failed to start shutdown watcher: {e}")));
 
     log("Boot sequence complete. System operational. PID 1 entering watchdog mode.");
     watchdog_loop(app_pid);
